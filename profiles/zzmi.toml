@@ -1,0 +1,12 @@
+id = "zzmi"
+name = "Zenless Zone Zero"
+
+[sources]
+nexus = "zenlesszonezero"
+gamebanana = "19567"
+
+[installation]
+required_file = ".ini"
+
+[launch]
+arguments = ["--nogui", "--xxmi", "ZZMI"]

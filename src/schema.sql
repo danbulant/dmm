@@ -1,0 +1,40 @@
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS instances (
+    name TEXT PRIMARY KEY NOT NULL,
+    data TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS mods (
+    instance TEXT NOT NULL REFERENCES instances(name),
+    slug TEXT NOT NULL,
+    data TEXT NOT NULL,
+    PRIMARY KEY (instance, slug)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS pending (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    data TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS favorites (data TEXT PRIMARY KEY NOT NULL) STRICT;
+
+CREATE TABLE IF NOT EXISTS searches (
+    name TEXT PRIMARY KEY NOT NULL,
+    data TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS downloads (
+    key TEXT PRIMARY KEY NOT NULL,
+    data TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS active_installations (
+    kind TEXT PRIMARY KEY NOT NULL,
+    instance TEXT NOT NULL REFERENCES instances(name)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS launch_settings (
+    instance TEXT PRIMARY KEY NOT NULL REFERENCES instances(name),
+    data TEXT NOT NULL
+) STRICT;
