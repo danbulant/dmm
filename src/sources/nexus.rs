@@ -185,12 +185,13 @@ pub(super) fn details(client: &Client, key: Option<&str>, id: &RemoteMod) -> Res
     let game_id = get_game_id(client, &id.game)?;
     let response = graphql(
         client,
-        "query($modId: ID!, $gameId: ID!) { mod(modId: $modId, gameId: $gameId) { modId name author category summary description version updatedAt createdAt pictureUrl thumbnailUrl thumbnailLargeUrl adultContent modRequirements(skipDisabledRequirements: true) { nexusRequirements { nodes { modName notes url gameId modId externalRequirement } } } } modFiles(modId: $modId, gameId: $gameId) { fileId name version date sizeInBytes totalDownloads primary category description detectedFileExtension } }",
+        "query($modId: ID!, $gameId: ID!) { mod(modId: $modId, gameId: $gameId) { modId name author category summary description version updatedAt createdAt pictureUrl thumbnailUrl thumbnailLargeUrl adultContent tags { name } modRequirements(skipDisabledRequirements: true) { nexusRequirements { nodes { modName notes url gameId modId externalRequirement } } } } modFiles(modId: $modId, gameId: $gameId) { fileId name version date sizeInBytes totalDownloads primary category description detectedFileExtension } }",
         json!({"modId": id.id.to_string(), "gameId": game_id.to_string()}),
     )?;
     let detail = response
         .get("mod")
         .ok_or_else(|| anyhow!("Nexus GraphQL response has no mod"))?;
+    let tags = detail_tags(detail);
     let mut files = response
         .get("modFiles")
         .and_then(Value::as_array)
@@ -220,6 +221,7 @@ pub(super) fn details(client: &Client, key: Option<&str>, id: &RemoteMod) -> Res
         id: id.clone(),
         name: text(detail, &["name"]).unwrap_or_else(|| format!("Mod {}", id.id)),
         author: text(detail, &["author"]),
+        tags,
         category: text(detail, &["category"]),
         summary: text(detail, &["summary"]),
         description: text(detail, &["description"]),
@@ -232,6 +234,18 @@ pub(super) fn details(client: &Client, key: Option<&str>, id: &RemoteMod) -> Res
         requirements,
         files,
     })
+}
+
+fn detail_tags(detail: &Value) -> Vec<String> {
+    detail
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tag| text(tag, &["name"]))
+        .map(|tag| tag.trim().to_owned())
+        .filter(|tag| !tag.is_empty())
+        .collect()
 }
 
 fn mod_requirements(
@@ -511,6 +525,17 @@ fn parse_nxm(uri: &str) -> Result<Nxm> {
         user_id: query.get("user_id").map(ToString::to_string),
     })
 }
+pub(super) fn identity(uri: &str) -> Result<(RemoteMod, u64)> {
+    let parsed = parse_nxm(uri)?;
+    Ok((
+        RemoteMod {
+            source: Source::Nexus,
+            game: parsed.game,
+            id: parsed.mod_id,
+        },
+        parsed.file_id,
+    ))
+}
 
 pub(super) fn categories(client: &Client, _key: Option<&str>, game: &str) -> Result<Vec<Category>> {
     let game_id = get_game_id(client, game)?;
@@ -562,9 +587,18 @@ fn browser_file_url(game: &str, id: u64, file: u64) -> Result<Url> {
 
 #[cfg(test)]
 mod tests {
-    use super::{created_at_filter, parse_file, parse_nxm};
+    use super::{created_at_filter, detail_tags, parse_file, parse_nxm};
     use crate::sources::TimeWindow;
     use serde_json::json;
+
+    #[test]
+    fn nexus_detail_tags_use_tag_names_and_missing_tags_are_empty() {
+        assert_eq!(
+            detail_tags(&json!({"tags": [{"name": "Gameplay"}, {"name": "UI"}, {"name": ""}]})),
+            ["Gameplay", "UI"]
+        );
+        assert!(detail_tags(&json!({})).is_empty());
+    }
 
     #[test]
     fn published_window_uses_created_at_gte_cutoff() {

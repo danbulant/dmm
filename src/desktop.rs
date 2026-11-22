@@ -1,6 +1,10 @@
 mod browse;
+mod download_queue;
+mod download_recovery;
 mod game_setup;
+mod inputs;
 mod installations;
+mod preferences;
 mod previews;
 mod workbench;
 
@@ -8,14 +12,18 @@ mod workbench;
 mod tests;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 
 use anyhow::Result;
-use dmm::acquisition::source_client;
-use dmm::games::{GameKind, GameProfile, detect, detect_zzz_game, launch_profile, profile};
-use dmm::library::{Inspection, Instance, LaunchSettings, Library, ManagedMod};
+use dmm::acquisition::{pending_pages, source_client};
+#[cfg(target_os = "linux")]
+use dmm::games::steam_xxmi::{self, InstallStage, Protontricks, SteamXxmi};
+use dmm::games::{
+    GameKind, GameProfile, detect, detect_zzz_game, launch_profile, profile, start_xxmi,
+};
+use dmm::library::{Inspection, Instance, LaunchSettings, Library, ManagedMod, SavedFavorite};
 use dmm::sources::{
     FilterCatalog, ModDetails, RemoteMod, SearchPage, SearchQuery, Source, SourceClient,
 };
@@ -29,7 +37,11 @@ use rune_kit::{Kit, Menu, MenuItem};
 use url::Url;
 
 use browse::Browser;
+use download_queue::Queue;
 use game_setup::SetupForm;
+#[cfg(target_os = "linux")]
+use game_setup::SteamDialog;
+use preferences::Preferences;
 use previews::{Previews, Size};
 use workbench::LocalForm;
 
@@ -57,6 +69,7 @@ enum Screen {
     Explore,
     Local,
     Setup,
+    Downloads,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -80,6 +93,10 @@ struct DetectedGame {
 struct Discovery {
     games: Vec<DetectedGame>,
     zzz_steam_roots: Vec<PathBuf>,
+    #[cfg(target_os = "linux")]
+    steam_xxmi: Vec<SteamXxmi>,
+    #[cfg(target_os = "linux")]
+    protontricks: Option<Protontricks>,
     notices: Vec<(GameKind, String)>,
 }
 
@@ -107,6 +124,18 @@ fn discover() -> Discovery {
             .notices
             .push((GameKind::Zzmi, format!("Steam: {error:#}"))),
     }
+    #[cfg(target_os = "linux")]
+    if !found.zzz_steam_roots.is_empty() {
+        match steam_xxmi::discover() {
+            Ok(targets) => found.steam_xxmi = targets,
+            Err(error) => found
+                .notices
+                .push((GameKind::Zzmi, format!("Steam Proton: {error:#}"))),
+        }
+        if !found.steam_xxmi.is_empty() {
+            found.protontricks = Protontricks::find();
+        }
+    }
     found
 }
 #[derive(Default)]
@@ -115,7 +144,8 @@ struct Snapshot {
     selected: Option<Instance>,
     profiles: BTreeMap<String, Result<GameProfile, String>>,
     mods: Vec<ManagedMod>,
-    favorites: Vec<RemoteMod>,
+    favorites: Vec<SavedFavorite>,
+    nexus_pages: Vec<Url>,
     sources: Vec<Origin>,
     profile_issue: Option<String>,
     launch: LaunchSettings,
@@ -146,6 +176,11 @@ impl Snapshot {
             .map(|i| library.launch_settings(&i.name))
             .transpose()?
             .unwrap_or_default();
+        let nexus_pages = if let Some(instance) = &selected {
+            pending_pages(library, &instance.name)?
+        } else {
+            Vec::new()
+        };
         let (sources, profile_issue) = match selected.as_ref().and_then(|i| profiles.get(&i.name)) {
             Some(Ok(game)) => (origins(game), None),
             Some(Err(error)) => (Vec::new(), Some(format!("Game profile: {error}"))),
@@ -156,11 +191,16 @@ impl Snapshot {
             selected,
             profiles,
             mods,
-            favorites: library.favorites()?,
+            favorites: library.saved_favorites()?,
+            nexus_pages,
             sources,
             profile_issue,
             launch,
         })
+    }
+
+    fn is_saved(&self, id: &RemoteMod) -> bool {
+        self.favorites.iter().any(|saved| &saved.item == id)
     }
 }
 
@@ -184,8 +224,14 @@ struct State {
     state_dir: PathBuf,
     worker: Option<Worker>,
     catalog_worker: Option<Worker>,
+    details_worker: Option<Worker>,
+    details_busy: Option<&'static str>,
+    detail_revision: u64,
     previews: Option<Previews>,
     busy: Option<&'static str>,
+    queue: Queue,
+    handoff_open: bool,
+    preferences: Preferences,
     catalog_busy: Option<&'static str>,
     notice: String,
     screen: Screen,
@@ -195,6 +241,10 @@ struct State {
     sidebar: PaneState,
     detected: Vec<DetectedGame>,
     zzz_steam_roots: Vec<PathBuf>,
+    #[cfg(target_os = "linux")]
+    steam_xxmi: Vec<SteamXxmi>,
+    #[cfg(target_os = "linux")]
+    protontricks: Option<Protontricks>,
     discovery_notices: Vec<(GameKind, String)>,
     cyberpunk_icon: Option<Pixels>,
     zzmi_icon: Option<Pixels>,
@@ -204,6 +254,7 @@ struct State {
     public_sources: Vec<Origin>,
     browser: Browser,
     local: LocalForm,
+    local_detail: Option<String>,
     setup: SetupForm,
 }
 
@@ -211,13 +262,13 @@ enum Update {
     Library(Snapshot),
     LocalPlan(Inspection),
     Discovered(Snapshot, Discovery),
+    #[cfg(target_os = "linux")]
+    SteamXxmiInstalled(Result<SteamXxmi>),
     GameChanged(GameKind, Snapshot),
     Message(String),
     Search(u64, SearchQuery, Result<SearchPage>),
     Filters(Origin, Result<FilterCatalog>),
-    Details(Option<u64>, bool, Result<ModDetails>),
-    Handoff(Url),
-    RemoteInstalled(Snapshot),
+    Details(Screen, u64, u64, Option<String>, bool, Result<ModDetails>),
 }
 
 type Job = Box<dyn FnOnce(&mut Backend) -> Result<Update> + Send>;
@@ -281,8 +332,14 @@ impl State {
             state_dir,
             worker: None,
             catalog_worker: None,
+            details_worker: None,
+            details_busy: None,
+            detail_revision: 0,
             previews: None,
             busy: None,
+            queue: Queue::default(),
+            handoff_open: false,
+            preferences: Preferences::default(),
             catalog_busy: None,
             notice: String::new(),
             screen: Screen::Explore,
@@ -292,6 +349,10 @@ impl State {
             sidebar: PaneState::new(245.0).range(180.0, 340.0),
             detected: Vec::new(),
             zzz_steam_roots: Vec::new(),
+            #[cfg(target_os = "linux")]
+            steam_xxmi: Vec::new(),
+            #[cfg(target_os = "linux")]
+            protontricks: None,
             discovery_notices: Vec::new(),
             cyberpunk_icon: icon(include_bytes!("desktop/icons/cyberpunk.png")),
             zzmi_icon: icon(include_bytes!("desktop/icons/zzmi.png")),
@@ -301,6 +362,7 @@ impl State {
             public_sources: public_origins(GameKind::Cyberpunk),
             browser: Browser::default(),
             local: LocalForm::default(),
+            local_detail: None,
             setup: SetupForm::default(),
         }
     }
@@ -320,8 +382,32 @@ impl State {
                 return;
             }
         }
-        self.previews = Previews::start(wake).ok();
-        self.detect_games();
+        match Worker::start("dmm-details", self.state_dir.clone(), wake.clone()) {
+            Ok(worker) => self.details_worker = Some(worker),
+            Err(error) => self.notice = format!("Cannot start mod details worker: {error:#}"),
+        }
+        match Preferences::load(&self.state_dir) {
+            Ok(preferences) => {
+                self.preferences = preferences;
+                self.public_game = preferences.game;
+                self.public_sources = public_origins(preferences.game);
+                self.browser.source = if preferences.game == GameKind::Zzmi {
+                    Source::GameBanana
+                } else {
+                    Source::Nexus
+                };
+                self.browser.reset_origin();
+            }
+            Err(error) => self.notice = format!("{error:#}"),
+        }
+        self.previews = Previews::start(&self.state_dir, wake.clone()).ok();
+        match self.queue.start(&self.state_dir, wake) {
+            Ok(paths) => self.discover_games(paths),
+            Err(error) => {
+                self.detect_games();
+                self.notice = format!("Cannot start downloads: {error:#}");
+            }
+        }
     }
 
     fn submit(
@@ -332,15 +418,23 @@ impl State {
         self.submit_job(label, move |worker| job(worker.state_dir.clone()));
     }
 
-    fn submit_online(
+    fn submit_details(
         &mut self,
-        label: &'static str,
-        job: impl FnOnce(PathBuf, &SourceClient) -> Result<Update> + Send + 'static,
+        job: impl FnOnce(&mut Backend) -> Result<Update> + Send + 'static,
     ) {
-        self.submit_job(label, move |worker| {
-            let dir = worker.state_dir.clone();
-            job(dir, worker.online()?)
-        });
+        if self.details_busy.is_some() {
+            return;
+        }
+        if self
+            .details_worker
+            .as_ref()
+            .is_some_and(|worker| worker.jobs.send(Box::new(job)).is_ok())
+        {
+            self.details_busy = Some("Loading mod details…");
+            self.notice.clear();
+        } else {
+            self.notice = "The mod details worker is unavailable.".into();
+        }
     }
 
     fn submit_job(
@@ -388,10 +482,19 @@ impl State {
     }
 
     fn detect_games(&mut self) {
+        self.discover_games(Vec::new());
+    }
+
+    fn discover_games(&mut self, recovery_paths: Vec<PathBuf>) {
         let kind = self.game_kind();
         self.submit("Detecting game installations…", move |dir| {
-            let library = Library::open(&dir)?;
             let mut discovery = discover();
+            let library = open_library(&dir)?;
+            if let Err(error) = download_recovery::save(&library, &recovery_paths) {
+                discovery
+                    .notices
+                    .push((kind, format!("Recovering unfinished downloads: {error:#}")));
+            }
             let active = match installations::resolve(&library, &discovery.games, kind) {
                 Ok(name) => name,
                 Err(error) => {
@@ -412,12 +515,17 @@ impl State {
         self.detected = discovery.games;
         self.zzz_steam_roots = discovery.zzz_steam_roots;
         self.discovery_notices = discovery.notices;
+        #[cfg(target_os = "linux")]
+        {
+            self.steam_xxmi = discovery.steam_xxmi;
+            self.protontricks = discovery.protontricks;
+        }
     }
 
     fn use_installation(&mut self, path: PathBuf) {
         let kind = self.game_kind();
         self.submit("Selecting installation…", move |dir| {
-            let library = Library::open(&dir)?;
+            let library = open_library(&dir)?;
             let name = installations::select(&library, kind, &path)?;
             Ok(Update::Library(Snapshot::load(&library, Some(&name))?))
         });
@@ -443,12 +551,72 @@ impl State {
         });
     }
 
+    fn open_xxmi(&mut self) {
+        let root = self
+            .snapshot
+            .selected
+            .as_ref()
+            .map(|instance| instance.root.clone());
+        let LaunchSettings { xxmi, wine_prefix } = self.snapshot.launch.clone();
+        self.submit("Starting XXMI…", move |_| {
+            start_xxmi(root.as_deref(), xxmi.as_deref(), wine_prefix.as_deref())?.spawn()?;
+            Ok(Update::Message("XXMI launch requested".into()))
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_steam_xxmi(&mut self, mut target: SteamXxmi) {
+        let Some(runner) = self.protontricks.clone() else {
+            return;
+        };
+        if self.busy.is_some() {
+            return;
+        }
+        let (updates, progress) = mpsc::channel();
+        self.submit(
+            "Setting up XXMI and Visual C++ in Steam Proton…",
+            move |_| {
+                let result = target
+                    .install(&runner, |stage| {
+                        let _ = updates.send(stage);
+                    })
+                    .map(|()| {
+                        target.installed = true;
+                        target
+                    });
+                Ok(Update::SteamXxmiInstalled(result))
+            },
+        );
+        self.setup.steam_dialog = Some(if self.busy.is_some() {
+            SteamDialog::Running {
+                stage: InstallStage::Preparing,
+                progress,
+            }
+        } else {
+            SteamDialog::Complete(Err(self.notice.clone()))
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_steam_xxmi(&mut self, target: SteamXxmi) {
+        let Some(runner) = self.protontricks.clone() else {
+            return;
+        };
+        self.submit("Starting XXMI through Proton…", move |_| {
+            target.start_launcher(&runner)?;
+            Ok(Update::Message("XXMI launch requested".into()))
+        });
+    }
+
     fn set_screen(&mut self, screen: Screen, tx: &mut Tx) {
         let previous = self.screen;
         self.screen = screen;
+        self.detail_revision = self.detail_revision.wrapping_add(1);
         self.game_menu = false;
+        self.local.close_menus();
         self.browser.close_menus();
         self.browser.detail = None;
+        self.local_detail = None;
         self.sync_previews();
         tx.scroll_to_instant("main-scroll", 0.0, 0.0);
         if screen == Screen::Explore {
@@ -467,7 +635,7 @@ impl State {
         }
         let detected = self.detected.clone();
         self.submit("Switching games…", move |dir| {
-            let library = Library::open(&dir)?;
+            let library = open_library(&dir)?;
             let active = installations::resolve(&library, &detected, kind)?;
             Ok(Update::GameChanged(
                 kind,
@@ -476,7 +644,32 @@ impl State {
         });
     }
 
+    fn set_enable_new_mods(&mut self, enabled: bool) {
+        self.preferences.enable_new_mods = enabled;
+        self.save_preferences();
+    }
+
+    fn save_preferences(&mut self) {
+        if let Err(error) = self.preferences.save(&self.state_dir) {
+            self.notice = format!("Could not save desktop preferences: {error:#}");
+        }
+    }
+
+    fn open_installed_details(&mut self, slug: &str, tx: &mut Tx) {
+        let Some(record) = self.snapshot.mods.iter().find(|record| record.slug == slug) else {
+            return;
+        };
+        self.browser.detail = None;
+        if let Some(details) = record.details().cloned() {
+            self.browser.show_details(details);
+        }
+        self.local_detail = Some(slug.to_owned());
+        self.sync_previews();
+        tx.scroll_to_instant("main-scroll", 0.0, 0.0);
+    }
+
     fn change_origin(&mut self, tx: &mut Tx) {
+        self.detail_revision = self.detail_revision.wrapping_add(1);
         let preferred = if self.game_kind() == GameKind::Zzmi {
             Source::GameBanana
         } else {
@@ -518,10 +711,16 @@ impl State {
         let Some(previews) = &mut self.previews else {
             return;
         };
-        if matches!(self.screen, Screen::Explore | Screen::Local)
-            && let Some(detail) = &self.browser.detail
+        if matches!(
+            self.screen,
+            Screen::Explore | Screen::Local | Screen::Downloads
+        ) && let Some(detail) = &self.browser.detail
         {
-            previews.show(browse::details::preview_requests(detail));
+            if self.local_detail.is_some() {
+                previews.show_saved(browse::details::preview_requests(detail, true));
+            } else {
+                previews.show(browse::details::preview_requests(detail, false));
+            }
         } else if self.screen == Screen::Explore {
             let cards = self
                 .browser
@@ -532,11 +731,21 @@ impl State {
                 .filter_map(|item| item.image.as_deref().map(|url| (url, Size::Card)));
             let icons = self.browser.category_icons().map(|url| (url, Size::Icon));
             previews.show(cards.chain(icons));
+        } else if self.screen == Screen::Local {
+            let sources = if self.snapshot.selected.is_some() {
+                &self.snapshot.sources
+            } else {
+                &self.public_sources
+            };
+            previews.show_saved(workbench::preview_requests(
+                &self.local,
+                &self.snapshot,
+                sources,
+            ));
         } else {
             previews.show([]);
         }
     }
-
     fn apply_snapshot(&mut self, snapshot: Snapshot, tx: &mut Tx) {
         self.apply_game(self.public_game, snapshot, tx);
     }
@@ -548,6 +757,25 @@ impl State {
         let sources_changed = self.snapshot.sources != snapshot.sources;
         self.snapshot = snapshot;
         self.public_game = kind;
+        if let Some(slug) = &self.local_detail {
+            if let Some(record) = self
+                .snapshot
+                .mods
+                .iter()
+                .find(|record| !changed && &record.slug == slug)
+            {
+                let displayed = self.browser.detail.as_ref().map(|detail| &detail.info);
+                if record.details() != displayed {
+                    self.browser.detail = None;
+                    if let Some(details) = record.details().cloned() {
+                        self.browser.show_details(details);
+                    }
+                }
+            } else {
+                self.local_detail = None;
+                self.browser.detail = None;
+            }
+        }
         if changed {
             self.public_sources = public_origins(kind);
             self.local = LocalForm::default();
@@ -556,6 +784,7 @@ impl State {
         } else if sources_changed {
             self.change_origin(tx);
         }
+        self.sync_previews();
     }
 
     fn poll(&mut self, now: f64, tx: &mut Tx) -> bool {
@@ -569,6 +798,10 @@ impl State {
             (Worker::receive(self.worker.as_ref(), &mut self.busy), true),
             (
                 Worker::receive(self.catalog_worker.as_ref(), &mut self.catalog_busy),
+                false,
+            ),
+            (
+                Worker::receive(self.details_worker.as_ref(), &mut self.details_busy),
                 false,
             ),
         ];
@@ -589,15 +822,28 @@ impl State {
                             format!("Checked for {} installations.", game_name(self.game_kind()));
                     }
                 }
-                Ok(Update::GameChanged(kind, snapshot)) => self.apply_game(kind, snapshot, tx),
-                Ok(Update::Library(snapshot)) => self.apply_snapshot(snapshot, tx),
-                Ok(Update::RemoteInstalled(snapshot)) => {
-                    browse::details::close_install(self);
-                    self.apply_snapshot(snapshot, tx);
-                    self.browser.handoff = None;
-                    self.browser.nxm = TextEdit::default();
-                    self.notice = "File imported. Manage it under Local mods.".into();
+                #[cfg(target_os = "linux")]
+                Ok(Update::SteamXxmiInstalled(result)) => {
+                    let result = result
+                        .map(|target| {
+                            if let Some(entry) = self
+                                .steam_xxmi
+                                .iter_mut()
+                                .find(|entry| entry.compatdata == target.compatdata)
+                            {
+                                entry.installed = true;
+                            }
+                            target
+                        })
+                        .map_err(|error| format!("{error:#}"));
+                    self.setup.steam_dialog = Some(SteamDialog::Complete(result));
                 }
+                Ok(Update::GameChanged(kind, snapshot)) => {
+                    self.apply_game(kind, snapshot, tx);
+                    self.preferences.game = kind;
+                    self.save_preferences();
+                }
+                Ok(Update::Library(snapshot)) => self.apply_snapshot(snapshot, tx),
                 Ok(Update::LocalPlan(inspection)) => self.local.apply_preview(inspection),
                 Ok(Update::Message(message)) => self.notice = message,
                 Ok(Update::Search(revision, query, result))
@@ -622,17 +868,23 @@ impl State {
                         Err(error) => self.notice = format!("{error:#}"),
                     }
                 }
-                Ok(Update::Details(revision, install, result))
-                    if match revision {
-                        Some(n) => {
-                            self.screen == Screen::Explore && n == self.browser.search_revision
-                        }
-                        None => self.screen == Screen::Local,
-                    } =>
+                Ok(Update::Details(
+                    screen,
+                    revision,
+                    search_revision,
+                    local_detail,
+                    install,
+                    result,
+                )) if self.screen == screen
+                    && self.detail_revision == revision
+                    && (screen != Screen::Explore
+                        || self.browser.search_revision == search_revision)
+                    && self.local_detail == local_detail =>
                 {
                     match result {
                         Ok(details) => {
-                            self.browser.show_details(details);
+                            self.local_detail = None;
+                            self.show_online_details(details);
                             if install {
                                 browse::details::open_install(self);
                             }
@@ -643,16 +895,16 @@ impl State {
                     }
                 }
                 Ok(Update::Search(..) | Update::Filters(..) | Update::Details(..)) => {}
-                Ok(Update::Handoff(url)) => {
-                    browse::details::close_install(self);
-                    self.browser.handoff = Some(url);
-                    self.notice =
-                        "Continue on Nexus, then paste the Mod Manager Download link.".into();
-                    tx.scroll_to_instant("main-scroll", 0.0, 0.0);
-                }
                 Err(error) => self.notice = format!("{error:#}"),
             }
             changed = true;
+        }
+        changed |= self.poll_queue(tx);
+        #[cfg(target_os = "linux")]
+        {
+            changed |= self
+                .setup
+                .poll_steam_dialog(self.busy.is_some(), &self.notice, tx);
         }
         changed
             | self.drive_explore()
@@ -678,13 +930,25 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
     } else {
         s.browser.detail.as_ref()
     };
-    let content = if let Some(detail) = detail {
+    let installed = s.local_detail.as_ref().and_then(|slug| {
+        let instance = s.snapshot.selected.as_ref()?;
+        let record = s.snapshot.mods.iter().find(|record| &record.slug == slug)?;
+        Some((instance, record))
+    });
+    let content = if let Some((instance, record)) = installed {
+        let mut page = col().w_full().gap(18.0);
+        if let Some(detail) = detail {
+            page = page.child(browse::details::body(s, detail, t));
+        }
+        page.child(workbench::installed_actions(s, t, &instance.name, record))
+    } else if let Some(detail) = detail {
         browse::details::body(s, detail, t)
     } else {
         match s.screen {
             Screen::Explore => browse::explore(s, t, &k, &mut layer),
-            Screen::Local => workbench::local_mods(s, t),
+            Screen::Local => workbench::local_mods(s, t, &k, &mut layer),
             Screen::Setup => game_setup::view(s, t, &k),
+            Screen::Downloads => download_queue::page(s, t, &k),
         }
     };
     let content = col().w_full().gap(16.0).padding(24.0).child(content);
@@ -692,6 +956,22 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
     if let Some(detail) = detail {
         main = main.child(browse::details::header(s, detail, t, &k));
         browse::details::overlays(s, detail, t, &k, &mut layer, cx.is_reduced_motion());
+    } else if let Some((_, record)) = installed {
+        main = main.child(
+            row()
+                .w_full()
+                .items_center()
+                .gap(12.0)
+                .padding(16.0)
+                .fill(k.c.layer_01)
+                .child(
+                    button("details-back", "←", t, false, true, |s, tx| {
+                        s.set_screen(Screen::Local, tx)
+                    })
+                    .label("Back to mods"),
+                )
+                .child(heading(workbench::installed_title(record), t)),
+        );
     }
     let main = main.child(
         col()
@@ -715,6 +995,10 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
         .titlebar_inset(cx.titlebar_inset())
         .reduced_motion(cx.is_reduced_motion())
         .build(&Kit::neutral(dark));
+    #[cfg(target_os = "linux")]
+    game_setup::overlays(s, t, &k, &mut layer);
+    workbench::overlays(s, t, &k, &mut layer);
+    download_queue::overlay(s, t, &k, &mut layer);
     rune_kit::root(shell, layer).on_layout(|s: &mut State, [_, _, width, height]| {
         s.window_size = [width, height];
     })
@@ -745,6 +1029,7 @@ fn sidebar(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
         .footer(
             col()
                 .gap(4.0)
+                .child(download_queue::sidebar(s, t, k))
                 .child(button(
                     "launch-game",
                     "Launch game",
@@ -752,6 +1037,7 @@ fn sidebar(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
                     true,
                     s.snapshot.selected.is_some()
                         && s.game_kind() != GameKind::Generic
+                        && !s.queue.running()
                         && s.busy.is_none(),
                     |s, _| s.launch_game(),
                 ))
@@ -871,8 +1157,12 @@ fn source_icon(s: &State, source: Source, side: f32) -> El {
     }
 }
 
+fn open_library(path: &Path) -> Result<Library> {
+    Library::open_wait(path, std::time::Duration::from_secs(5))
+}
+
 fn status(s: &State, t: Theme) -> El {
-    let label = match s.busy.or(s.catalog_busy) {
+    let label = match s.busy.or(s.details_busy).or(s.catalog_busy) {
         Some("Searching mods…") if !s.browser.show_search_progress => "Ready",
         Some(label) => label,
         None if s.notice.is_empty() => "Ready",

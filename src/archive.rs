@@ -615,7 +615,7 @@ fn copy_directory(
 }
 
 #[cfg(unix)]
-fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
     let file_type = metadata.file_type();
     file_type.is_symlink()
         || file_type.is_block_device()
@@ -625,14 +625,14 @@ fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(windows)]
-fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     metadata.file_type().is_symlink()
         || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
 #[cfg(not(any(unix, windows)))]
-fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 

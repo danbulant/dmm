@@ -2,11 +2,13 @@ use anyhow::{Context, Result, ensure};
 use clap::Args;
 use dmm::{
     acquisition::{
-        RemoteOutcome, RemoteSelection, accept_nxm as acquire_nxm, install_archive, install_remote,
+        RemoteOutcome, accept_nxm as acquire_nxm, install_archive_with_details, install_remote,
         source_client,
     },
     library::{InstallOptions, Library, Release, SavedSearch},
-    sources::{DownloadAction, ModFile, RemoteMod, SearchQuery, Sort, Source, SourceClient},
+    sources::{
+        DownloadAction, Maturity, ModFile, RemoteMod, SearchQuery, Sort, Source, SourceClient,
+    },
 };
 use serde_json::json;
 
@@ -65,13 +67,13 @@ impl From<Browse> for SavedSearch {
 #[derive(Args)]
 pub(crate) struct RemoteInstall {
     instance: String,
-    slug: String,
     source: Source,
     mod_id: u64,
-    file_id: u64,
+    #[arg(num_args = 1..)]
+    file_ids: Vec<u64>,
     #[command(flatten)]
     flags: InstallFlags,
-    /// Print the Nexus handoff URL instead of opening the browser.
+    /// Print Nexus handoff URLs instead of opening the browser.
     #[arg(long)]
     no_browser: bool,
 }
@@ -81,8 +83,12 @@ pub(crate) fn client() -> Result<SourceClient> {
 }
 
 pub(crate) fn search(library: &Library, search: SavedSearch, instance: Option<&str>) -> Result<()> {
-    let results = client()?.search(search.source, &search.game, &search.query)?;
-    let favorites = library.favorites()?;
+    let mut query = search.query.clone();
+    if search.source == Source::GameBanana {
+        query.maturity = Maturity::All;
+    }
+    let results = client()?.search(search.source, &search.game, &query)?;
+    let favorites = library.saved_favorites()?;
     let installed = instance
         .map(|name| library.mods(name))
         .transpose()?
@@ -96,7 +102,11 @@ pub(crate) fn search(library: &Library, search: SavedSearch, instance: Option<&s
                 .filter(|m| m.release().is_some_and(|r| r.id == item.id))
                 .map(|m| (&m.slug, m.enabled))
                 .collect();
-            json!({ "id": item.id, "saved": favorites.contains(&item.id), "installed": slugs })
+            json!({
+                "id": item.id,
+                "saved": favorites.iter().any(|saved| saved.item == item.id),
+                "installed": slugs
+            })
         })
         .collect::<Vec<_>>();
     print(&json!({ "results": results, "overlays": overlays }))
@@ -114,30 +124,38 @@ pub(crate) fn install(library: &mut Library, input: RemoteInstall) -> Result<()>
     };
     let client = client()?;
     let details = client.details(&id)?;
-    let file = details
-        .files
+    let files = input
+        .file_ids
         .iter()
-        .find(|file| file.id == input.file_id)
-        .context("file ID does not belong to that mod; use details to list file choices")?;
+        .map(|file_id| {
+            details
+                .files
+                .iter()
+                .find(|file| file.id == *file_id)
+                .with_context(|| format!("file ID {file_id} does not belong to that mod"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let files = files.into_iter().cloned().collect::<Vec<_>>();
     match install_remote(
         library,
         &client,
         &input.instance,
-        &input.slug,
-        RemoteSelection {
-            id: &id,
-            file,
-            source_url: details.url.as_deref(),
-        },
+        &details,
+        &files,
         input.flags.options(),
+        |_| {},
     )? {
         RemoteOutcome::Installed => Ok(()),
-        RemoteOutcome::Browser(url) => {
-            print(
-                &json!({ "action": "open_browser", "url": url, "then": "Pick Mod Manager Download; pass the nxm:// link to accept-nxm." }),
-            )?;
+        RemoteOutcome::Browser(urls) => {
+            print(&json!({
+                "action": "open_browser",
+                "urls": urls,
+                "then": "Pick Mod Manager Download for every selected file; pass each nxm:// link to accept-nxm."
+            }))?;
             if !input.no_browser {
-                open::that(url.as_str())?;
+                for url in urls {
+                    open::that(url.as_str())?;
+                }
             }
             Ok(())
         }
@@ -146,7 +164,10 @@ pub(crate) fn install(library: &mut Library, input: RemoteInstall) -> Result<()>
 
 pub(crate) fn accept_nxm(library: &mut Library, uri: &str) -> Result<()> {
     let client = client()?;
-    acquire_nxm(library, &client, uri)
+    match acquire_nxm(library, &client, uri, |_| {})? {
+        RemoteOutcome::Installed => Ok(()),
+        RemoteOutcome::Browser(urls) => print(&json!({ "action": "open_browser", "urls": urls })),
+    }
 }
 
 pub(crate) fn updates(library: &mut Library, instance: &str, apply: bool) -> Result<()> {
@@ -159,6 +180,14 @@ pub(crate) fn updates(library: &mut Library, instance: &str, apply: bool) -> Res
         };
         let result = (|| -> Result<_> {
             let details = client.details(&old.id)?;
+            if record.is_bundle() {
+                return Ok(json!({
+                    "mod": record.slug,
+                    "status": "choose_bundle_files",
+                    "files": details.files,
+                    "installed_files": record.releases()
+                }));
+            }
             let Some(file) = candidate(old, &details.files) else {
                 let known = details.files.iter().any(|file| file.id == old.file_id);
                 let newer_choices = details
@@ -171,22 +200,25 @@ pub(crate) fn updates(library: &mut Library, instance: &str, apply: bool) -> Res
                     json!({"mod": record.slug, "status": "current"})
                 });
             };
-            let next = RemoteSelection {
-                id: &old.id,
-                file,
-                source_url: details.url.as_deref(),
-            }
-            .release();
+            let next = Release {
+                id: old.id.clone(),
+                source_url: details.url.clone(),
+                file_id: file.id,
+                filename: file.name.clone(),
+                version: file.version.clone(),
+                updated_at: file.updated_at.clone(),
+            };
             let status = if !apply {
                 "available"
             } else if let DownloadAction::Direct(url) = client.download(&old.id, file)? {
-                install_archive(
+                install_archive_with_details(
                     library,
                     &client,
                     &url,
                     instance,
                     &record.slug,
                     next.clone(),
+                    &details,
                     InstallOptions::default(),
                 )?;
                 "updated"

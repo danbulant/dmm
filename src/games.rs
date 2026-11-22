@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::archive::portable_path;
 use crate::sources::Source;
 
+#[cfg(target_os = "linux")]
+pub mod steam_xxmi;
+
 const CYBERPUNK_PROFILE: &str = include_str!("../profiles/cyberpunk.toml");
 const ZZMI_PROFILE: &str = include_str!("../profiles/zzmi.toml");
 const GENERIC_PROFILE: &str = include_str!("../profiles/generic.toml");
@@ -173,15 +176,58 @@ pub fn plan(
                 destination.is_none(),
                 "ZZMI mods must install directly under the configured Mods folder"
             );
-            plan_mod_folder(profile, files, slug, None)
+            plan_mod_folder(profile, files, slug, None, true)
         }
         GameKind::Generic => plan_mod_folder(
             profile,
             files,
             slug,
             destination.or(profile.installation_root.as_deref()),
+            true,
         ),
     }
+}
+pub fn plan_bundle(
+    profile: &GameProfile,
+    packages: &[&[PathBuf]],
+    slug: &str,
+    destination: Option<&Path>,
+) -> Result<Vec<InstallPlan>> {
+    if profile.kind == GameKind::Zzmi {
+        ensure!(
+            destination.is_none(),
+            "ZZMI mods must install directly under the configured Mods folder"
+        );
+        let required_file = profile
+            .settings
+            .installation
+            .required_file
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        if let Some(required_file) = required_file {
+            let suffix = format!(".{}", required_file.trim_start_matches('.')).to_ascii_lowercase();
+            ensure!(
+                packages
+                    .iter()
+                    .flat_map(|package| package.iter())
+                    .any(|path| {
+                        path.to_string_lossy()
+                            .to_ascii_lowercase()
+                            .ends_with(&suffix)
+                    }),
+                "{} mods must contain at least one {suffix} file",
+                profile.name
+            );
+        }
+        return packages
+            .iter()
+            .map(|files| plan_mod_folder(profile, files, slug, None, false))
+            .collect();
+    }
+    packages
+        .iter()
+        .map(|files| plan(profile, files, slug, destination))
+        .collect()
 }
 
 fn plan_mod_folder(
@@ -189,6 +235,7 @@ fn plan_mod_folder(
     files: &[PathBuf],
     slug: &str,
     destination: Option<&Path>,
+    enforce_required: bool,
 ) -> Result<InstallPlan> {
     let paths = normalized_paths(files)?;
     let required_file = profile
@@ -197,8 +244,8 @@ fn plan_mod_folder(
         .required_file
         .as_deref()
         .filter(|value| !value.is_empty());
-    let requires_file = required_file.is_some();
-    if let Some(extension) = required_file {
+    let requires_file = enforce_required && required_file.is_some();
+    if enforce_required && let Some(extension) = required_file {
         let suffix = format!(".{}", extension.trim_start_matches('.')).to_ascii_lowercase();
         if !paths
             .iter()
@@ -233,9 +280,13 @@ fn plan_mod_folder(
             destination: target,
         });
     }
-    if !requires_file {
-        plan.warnings.push("Generic folder placement is profile-defined; review the destination before deployment.".into());
+    if profile.kind == GameKind::Generic && !requires_file {
+        plan.warnings.push(
+            "Generic folder placement is profile-defined; review the destination before deployment."
+                .into(),
+        );
     }
+
     validate_plan(plan)
 }
 
@@ -600,6 +651,11 @@ fn standard_xxmi_roots() -> Vec<PathBuf> {
                 if let Ok(libraries) = steam.libraries() {
                     for library in libraries.filter_map(std::result::Result::ok) {
                         roots.push(library.path().join("steamapps/compatdata/4162040/pfx/drive_c/users/steamuser/AppData/Roaming/XXMI Launcher"));
+                        #[cfg(target_os = "linux")]
+                        roots.push(
+                            steam_xxmi::compatdata_dir(library.path())
+                                .join(steam_xxmi::PORTABLE_DIR),
+                        );
                     }
                 }
             }
@@ -615,9 +671,9 @@ fn standard_xxmi_roots() -> Vec<PathBuf> {
     roots.dedup();
     roots
 }
-fn find_launcher(root: &Path) -> Option<PathBuf> {
+fn find_launcher(root: Option<&Path>) -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    for ancestor in root.ancestors().take(3) {
+    for ancestor in root.into_iter().flat_map(Path::ancestors).take(3) {
         candidates.push(ancestor.join("XXMI Launcher.exe"));
         candidates.push(ancestor.join("Resources/Bin/XXMI Launcher.exe"));
     }
@@ -656,6 +712,13 @@ impl LaunchCommand {
             open::that(value).context("failed to open game launch URL")?;
             return Ok(());
         }
+        self.process()
+            .spawn()
+            .with_context(|| format!("failed to launch {}", Path::new(&self.program).display()))?;
+        Ok(())
+    }
+
+    fn process(&self) -> Command {
         let mut command = Command::new(&self.program);
         command.args(&self.args).stdin(Stdio::null());
         if let Some(cwd) = &self.cwd {
@@ -665,9 +728,6 @@ impl LaunchCommand {
             command.env(key, value);
         }
         command
-            .spawn()
-            .with_context(|| format!("failed to launch {}", Path::new(&self.program).display()))?;
-        Ok(())
     }
 }
 
@@ -716,68 +776,85 @@ pub fn launch_profile(
             env: Vec::new(),
             url: true,
         }),
-        GameKind::Zzmi => {
-            let launcher = xxmi
-                .map(Path::to_owned)
-                .or_else(|| find_launcher(root))
-                .context(
-                    "XXMI Launcher.exe was not found. Select it in Game setup or pass --xxmi.",
-                )?;
-            let launcher = std::env::current_dir()?.join(launcher);
-            let cwd = launcher.parent().map(Path::to_path_buf);
-            #[cfg(target_os = "linux")]
-            let mut env = Vec::new();
-            #[cfg(target_os = "linux")]
-            {
-                let wine = wine
-                    .map(Path::to_owned)
-                    .or_else(|| std::env::var_os("WINE").map(PathBuf::from))
-                    .unwrap_or_else(|| PathBuf::from("wine"));
-                let mut args = vec![launcher.as_os_str().to_owned()];
-                args.extend(
-                    profile
-                        .settings
-                        .launch
-                        .arguments
-                        .iter()
-                        .cloned()
-                        .map(OsString::from),
-                );
-                let prefix = wine_prefix
-                    .map(Path::to_owned)
-                    .or_else(|| std::env::var_os("WINEPREFIX").map(PathBuf::from))
-                    .or_else(|| wine_prefix_for_launcher(&launcher));
-                if let Some(prefix) = prefix {
-                    env.push(("WINEPREFIX".into(), prefix.into_os_string()));
-                }
-                Ok(LaunchCommand {
-                    program: wine.into_os_string(),
-                    args,
-                    cwd,
-                    env,
-                    url: false,
-                })
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = (wine, wine_prefix);
-                Ok(LaunchCommand {
-                    program: launcher.into_os_string(),
-                    args: profile
-                        .settings
-                        .launch
-                        .arguments
-                        .iter()
-                        .cloned()
-                        .map(OsString::from)
-                        .collect(),
-                    cwd,
-                    env: Vec::new(),
-                    url: false,
-                })
-            }
-        }
+        GameKind::Zzmi => xxmi_command(
+            Some(root),
+            xxmi,
+            wine,
+            wine_prefix,
+            profile
+                .settings
+                .launch
+                .arguments
+                .iter()
+                .map(OsString::from)
+                .collect(),
+        ),
         GameKind::Generic => bail!("generic games require a custom launch command"),
+    }
+}
+
+/// Open the XXMI settings window without starting a game.
+pub fn start_xxmi(
+    root: Option<&Path>,
+    xxmi: Option<&Path>,
+    wine_prefix: Option<&Path>,
+) -> Result<LaunchCommand> {
+    xxmi_command(root, xxmi, None, wine_prefix, Vec::new())
+}
+
+fn xxmi_command(
+    root: Option<&Path>,
+    xxmi: Option<&Path>,
+    wine: Option<&Path>,
+    wine_prefix: Option<&Path>,
+    arguments: Vec<OsString>,
+) -> Result<LaunchCommand> {
+    let launcher = xxmi
+        .map(Path::to_owned)
+        .or_else(|| find_launcher(root))
+        .context("XXMI Launcher.exe was not found. Select it in Game setup or pass --xxmi.")?;
+    let launcher = std::env::current_dir()?.join(launcher);
+    let cwd = launcher.parent().map(Path::to_path_buf);
+    #[cfg(target_os = "linux")]
+    {
+        if wine.is_none()
+            && wine_prefix.is_none()
+            && let Some(command) = steam_xxmi::managed_launch(&launcher, &arguments)?
+        {
+            return Ok(command);
+        }
+        let wine = wine
+            .map(Path::to_owned)
+            .or_else(|| std::env::var_os("WINE").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("wine"));
+        let prefix = wine_prefix
+            .map(Path::to_owned)
+            .or_else(|| std::env::var_os("WINEPREFIX").map(PathBuf::from))
+            .or_else(|| wine_prefix_for_launcher(&launcher));
+        let mut args = vec![launcher.into_os_string()];
+        args.extend(arguments);
+        let env = prefix
+            .into_iter()
+            .map(|prefix| ("WINEPREFIX".into(), prefix.into_os_string()))
+            .collect();
+        Ok(LaunchCommand {
+            program: wine.into_os_string(),
+            args,
+            cwd,
+            env,
+            url: false,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (wine, wine_prefix);
+        Ok(LaunchCommand {
+            program: launcher.into_os_string(),
+            args: arguments,
+            cwd,
+            env: Vec::new(),
+            url: false,
+        })
     }
 }
 

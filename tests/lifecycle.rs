@@ -225,7 +225,7 @@ fn local_bookmarks_survive_reopening() -> Result<()> {
         game: "1".into(),
         id: 2,
     };
-    library.favorite(&id, true)?;
+    library.save_favorite(&id, "Example mod", None)?;
     library.save_search(
         "browse",
         &SavedSearch {
@@ -242,11 +242,13 @@ fn local_bookmarks_survive_reopening() -> Result<()> {
     )?;
     drop(library);
     let library = Library::open(&f.state)?;
-    assert_eq!(library.favorites()?, [id.clone()]);
+    let bookmarks = library.saved_favorites()?;
+    assert_eq!(bookmarks[0].item, id);
+    assert_eq!(bookmarks[0].name, "Example mod");
     let saved = library.saved_search("browse")?;
     assert_eq!(saved.query.category.as_deref(), Some("5"));
     assert_eq!(saved.query.page, 3);
-    library.favorite(&id, false)?;
-    assert!(library.favorites()?.is_empty());
+    library.unsave(&id)?;
+    assert!(library.saved_favorites()?.is_empty());
     Ok(())
 }

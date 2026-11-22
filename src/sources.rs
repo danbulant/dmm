@@ -1,7 +1,7 @@
-use std::{fmt, fs::File, io::Read, str::FromStr, time::Duration};
+use std::{fmt, fs::File, future::Future, io::Write, pin::pin, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::blocking::Client;
+use reqwest::{Client as AsyncClient, blocking::Client};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -231,6 +231,8 @@ pub struct ModDetails {
     pub updated_at: Option<String>,
     pub created_at: Option<String>,
     pub url: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub images: Vec<ModImage>,
     #[serde(default)]
     pub adult: Option<bool>,
@@ -246,6 +248,8 @@ pub enum DownloadAction {
 pub struct SourceClient {
     http: Client,
     downloads: Client,
+    download_stream: AsyncClient,
+    download_runtime: tokio::runtime::Runtime,
     nexus_key: Option<String>,
     cache: cache::Cache,
 }
@@ -261,11 +265,23 @@ impl SourceClient {
         let downloads = Client::builder()
             .user_agent(concat!("dmm/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(60))
+            .connect_timeout(Duration::from_secs(20))
             .build()
-            .context("building download HTTP client")?;
+            .context("building download-link HTTP client")?;
+        let download_stream = AsyncClient::builder()
+            .user_agent(concat!("dmm/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(20))
+            .build()
+            .context("building streaming download HTTP client")?;
+        let download_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("building download runtime")?;
         Ok(Self {
             http,
             downloads,
+            download_stream,
+            download_runtime,
             nexus_key,
             cache: cache::Cache::default(),
         })
@@ -278,12 +294,12 @@ impl SourceClient {
 
     pub fn search(&self, source: Source, game: &str, query: &SearchQuery) -> Result<SearchPage> {
         self.cache.get(
-            "search-v3",
+            "search-v4",
             &(source, game, query),
             Duration::from_secs(300),
             true,
             || match source {
-                Source::GameBanana => gamebanana::search(&self.http, &self.cache, game, query),
+                Source::GameBanana => gamebanana::search(&self.http, game, query),
                 Source::Nexus => {
                     if let Some(category) = query.category.as_deref()
                         && category.parse::<u64>().is_ok()
@@ -311,7 +327,7 @@ impl SourceClient {
     pub fn details(&self, id: &RemoteMod) -> Result<ModDetails> {
         let public = id.source != Source::Nexus || self.nexus_key.is_none();
         self.cache.get(
-            "details-v4",
+            "details-v5",
             id,
             Duration::from_secs(120),
             public,
@@ -361,34 +377,75 @@ impl SourceClient {
             Source::Local => bail!("local files are not downloaded from a remote source"),
         }
     }
-
     pub fn redeem(&self, uri: &str) -> Result<(RemoteMod, u64, Url)> {
         nexus::redeem(&self.http, self.nexus_key.as_deref(), uri)
     }
 
     pub fn fetch(&self, url: &Url, dest: &mut File) -> Result<()> {
-        let response = self
-            .downloads
-            .get(url.clone())
-            .send()
-            .map_err(|_| anyhow!("requesting download failed"))?;
-        if !response.status().is_success() {
-            bail!("download server returned HTTP {}", response.status());
-        }
-        const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
-        if response
-            .content_length()
-            .is_some_and(|size| size > MAX_DOWNLOAD_BYTES)
-        {
-            bail!("download exceeds the 16 GiB safety limit");
-        }
-        let copied = std::io::copy(&mut response.take(MAX_DOWNLOAD_BYTES + 1), dest)
-            .map_err(|_| anyhow!("streaming download failed"))?;
-        if copied > MAX_DOWNLOAD_BYTES {
-            bail!("download exceeds the 16 GiB safety limit");
-        }
-        Ok(())
+        self.fetch_observed(url, dest, |_, _| Ok(()))
     }
+
+    pub fn fetch_observed(
+        &self,
+        url: &Url,
+        dest: &mut File,
+        mut observe: impl FnMut(u64, Option<u64>) -> Result<()>,
+    ) -> Result<()> {
+        const MAX_DOWNLOAD_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+        self.download_runtime.block_on(async {
+            let response = wait_for_io(self.download_stream.get(url.clone()).send(), || {
+                observe(0, None)
+            })
+            .await?
+            .map_err(|_| anyhow!("requesting download failed"))?;
+            if !response.status().is_success() {
+                bail!("download server returned HTTP {}", response.status());
+            }
+            let total = response.content_length();
+            if total.is_some_and(|size| size > MAX_DOWNLOAD_BYTES) {
+                bail!("download exceeds the 16 GiB safety limit");
+            }
+            let mut response = response;
+            let mut copied = 0_u64;
+            observe(copied, total)?;
+            loop {
+                let chunk = wait_for_io(response.chunk(), || observe(copied, total))
+                    .await?
+                    .map_err(|_| anyhow!("streaming download failed"))?;
+                let Some(chunk) = chunk else { break };
+                copied += chunk.len() as u64;
+                if copied > MAX_DOWNLOAD_BYTES {
+                    bail!("download exceeds the 16 GiB safety limit");
+                }
+                dest.write_all(&chunk)
+                    .map_err(|_| anyhow!("writing downloaded archive failed"))?;
+                observe(copied, total)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+async fn wait_for_io<T>(
+    future: impl Future<Output = T>,
+    mut on_wait: impl FnMut() -> Result<()>,
+) -> Result<T> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut future = pin!(future);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("download stalled");
+        }
+        match tokio::time::timeout(remaining.min(Duration::from_millis(100)), &mut future).await {
+            Ok(result) => return Ok(result),
+            Err(_) => on_wait()?,
+        }
+    }
+}
+
+pub fn nexus_identity(uri: &str) -> Result<(RemoteMod, u64)> {
+    nexus::identity(uri)
 }
 
 pub(super) fn json(
@@ -451,7 +508,17 @@ pub(super) fn epoch_iso_timestamp(seconds: u64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Category, ProviderFilters, TimeWindow, epoch_iso_timestamp};
+    use std::{
+        io::{Read, Seek, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
+
+    use super::{
+        Category, ModDetails, ProviderFilters, SourceClient, TimeWindow, Url, epoch_iso_timestamp,
+    };
     #[test]
     fn formats_unix_seconds_as_utc_iso_timestamps() {
         assert_eq!(
@@ -488,9 +555,84 @@ mod tests {
     }
 
     #[test]
+    fn mod_details_decode_without_tags() {
+        let details: ModDetails = serde_json::from_str(
+            r#"{"id":{"source":"nexus","game":"skyrim","id":12},"name":"Example","images":[],"requirements":[],"files":[]}"#,
+        )
+        .unwrap();
+        assert!(details.tags.is_empty());
+    }
+    #[test]
     fn published_time_window_decodes_and_defaults() {
         let filters: ProviderFilters =
             serde_json::from_str(r#"{"published_within":"month"}"#).unwrap();
         assert_eq!(filters.published_within, Some(TimeWindow::Month));
+    }
+    #[test]
+    fn observed_fetch_reports_received_and_total_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n0123456789",
+                )
+                .unwrap();
+        });
+        let client = SourceClient::new(None).unwrap();
+        let url = Url::parse(&format!("http://{address}/archive")).unwrap();
+        let mut output = tempfile::tempfile().unwrap();
+        let mut observations = Vec::new();
+        client
+            .fetch_observed(&url, &mut output, |received, total| {
+                observations.push((received, total));
+                Ok(())
+            })
+            .unwrap();
+        server.join().unwrap();
+        assert!(observations.contains(&(0, Some(10))));
+        assert_eq!(observations.last(), Some(&(10, Some(10))));
+        let mut bytes = Vec::new();
+        output.rewind().unwrap();
+        output.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"0123456789");
+    }
+
+    #[test]
+    fn observed_fetch_can_cancel_while_the_server_is_stalled() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done, wait) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(3));
+        });
+        let client = SourceClient::new(None).unwrap();
+        let url = Url::parse(&format!("http://{address}/archive")).unwrap();
+        let mut output = tempfile::tempfile().unwrap();
+        let mut received_headers = false;
+        let error = client
+            .fetch_observed(&url, &mut output, |_, total| {
+                if total == Some(10) {
+                    if received_headers {
+                        return Err(anyhow::anyhow!("cancelled in test"));
+                    }
+                    received_headers = true;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        let _ = done.send(());
+        server.join().unwrap();
+        assert_eq!(error.to_string(), "cancelled in test");
+        assert_eq!(output.metadata().unwrap().len(), 0);
     }
 }

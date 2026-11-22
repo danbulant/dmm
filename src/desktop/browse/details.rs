@@ -2,11 +2,9 @@ use dmm::games::GameKind;
 use dmm::sources::{ModFile, ModImage};
 use rune::tok::{Theme, type_};
 use rune::{El, Icon, ScrollSpec, SurfaceFit, col, el, row, text};
-use rune_kit::{Dialog, ImageZoom, Kit, Preview};
+use rune_kit::{Checkbox, Dialog, ImageZoom, Kit, Preview};
 
-use super::{
-    Detail, Screen, State, button, field, handoff, muted, open_page, page_url, panel, source_name,
-};
+use super::{Detail, Screen, State, button, field, muted, open_page, page_url, panel, source_name};
 use crate::desktop::{Size, source_icon};
 
 static ZOOM_PLUS: Icon = Icon {
@@ -35,6 +33,7 @@ pub(in crate::desktop) fn header(s: &State, detail: &Detail, t: Theme, k: &Kit) 
     }
     let available = s.matches_instance(&info.id);
     let has_files = !info.files.is_empty();
+    let saved = s.snapshot.is_saved(&info.id);
     let mut header = row()
         .key("detail-header")
         .w_full()
@@ -44,14 +43,9 @@ pub(in crate::desktop) fn header(s: &State, detail: &Detail, t: Theme, k: &Kit) 
         .fill(k.c.layer_01)
         .border(1.0, t.separator)
         .child(
-            button(
-                "details-back",
-                "←",
-                t,
-                false,
-                s.busy.is_none(),
-                |s, tx| s.set_screen(s.screen, tx),
-            )
+            button("details-back", "←", t, false, true, |s, tx| {
+                s.set_screen(s.screen, tx)
+            })
             .label("Back to mods")
             .help("Back to mods"),
         )
@@ -70,25 +64,55 @@ pub(in crate::desktop) fn header(s: &State, detail: &Detail, t: Theme, k: &Kit) 
                 )
                 .child(meta),
         );
+    if s.local_detail.is_some() {
+        return header;
+    }
+    header = header.child(button(
+        "details-save",
+        if saved { "Unsave" } else { "Save" },
+        t,
+        saved,
+        s.busy.is_none(),
+        {
+            let id = info.id.clone();
+            let name = info.name.clone();
+            let image = info
+                .images
+                .first()
+                .map(|image| image.thumbnail.as_deref().unwrap_or(&image.url).to_owned());
+            move |s, _| s.toggle_bookmark(id.clone(), name.clone(), image.clone(), saved)
+        },
+    ));
+    let queued = s.queued_for_selected(&info.id);
     header = header.child(
         button(
             "details-install",
-            "Install",
+            if queued {
+                "In Downloads"
+            } else if s.installed_for(&info.id).is_some() {
+                "Reinstall"
+            } else {
+                "Install"
+            },
             t,
             true,
-            has_files && s.busy.is_none(),
-            move |s, _| {
-                if let Some(detail) = &mut s.browser.detail {
+            queued || (has_files && available && s.queue.available()),
+            move |s, tx| {
+                if queued {
+                    s.open_downloads(tx);
+                } else if let Some(detail) = &mut s.browser.detail {
                     detail.install_open = true;
                 }
             },
         )
-        .help(if !has_files {
+        .help(if queued {
+            "View this mod in the download queue"
+        } else if !has_files {
             "No downloadable files from this source"
         } else if !available {
             "Select a game installation before installing"
         } else {
-            "Choose a file and install options"
+            "Choose files and install options"
         }),
     );
     header
@@ -97,9 +121,6 @@ pub(in crate::desktop) fn header(s: &State, detail: &Detail, t: Theme, k: &Kit) 
 pub(in crate::desktop) fn body(s: &State, detail: &Detail, t: Theme) -> El {
     let info = &detail.info;
     let mut view = col().w_full().gap(18.0);
-    if s.browser.handoff.is_some() {
-        view = view.child(handoff(s, t));
-    }
     if !info.images.is_empty() {
         view = view.child(gallery(s, detail, t));
     }
@@ -146,14 +167,19 @@ pub(in crate::desktop) fn body(s: &State, detail: &Detail, t: Theme) -> El {
         view = view.child(requirements);
     }
     let id = info.id.clone();
-    let saved = s.snapshot.favorites.contains(&id);
+    let name = info.name.clone();
+    let image = info
+        .images
+        .first()
+        .map(|image| image.thumbnail.as_deref().unwrap_or(&image.url).to_owned());
+    let saved = s.snapshot.is_saved(&id);
     let mut actions = row().gap(8.0).flex_wrap().child(button(
-        "details-save",
+        "details-save-body",
         if saved { "Saved" } else { "Save" },
         t,
         saved,
         s.busy.is_none(),
-        move |s, _| s.favorite(id.clone(), !saved),
+        move |s, _| s.toggle_bookmark(id.clone(), name.clone(), image.clone(), saved),
     ));
     if let Some(url) = info.url.clone() {
         actions = actions.child(button(
@@ -177,7 +203,7 @@ pub(in crate::desktop) fn body(s: &State, detail: &Detail, t: Theme) -> El {
             .wrap(),
         )
         .child(actions);
-    view.child(about).child(files(detail, t, false))
+    view.child(about).child(files(detail, t, None))
 }
 
 fn section(title: &str, t: Theme) -> El {
@@ -224,17 +250,31 @@ pub(in crate::desktop) fn overlays(
 ) {
     if detail.install_open {
         let content = if s.matches_instance(&detail.info.id) {
-            install_options(s, detail, t)
+            install_options(s, detail, t, k)
         } else {
-            col().w_full().gap(12.0)
-                .child(muted("Choose a configured installation of this game in the Game menu, or add one in Game setup.", t).wrap())
-                .child(button("needs-setup", "Open Game setup", t, true, true, |s, tx| s.set_screen(Screen::Setup, tx)))
+            col()
+                .w_full()
+                .gap(12.0)
+                .child(muted("Choose a main installation for this game in Game setup.", t).wrap())
+                .child(button(
+                    "needs-setup",
+                    "Open Game setup",
+                    t,
+                    true,
+                    true,
+                    |s, tx| s.set_screen(Screen::Setup, tx),
+                ))
         };
-        Dialog::new("mod-install", "Install mod")
+        let title = if s.installed_for(&detail.info.id).is_some() {
+            "Reinstall mod"
+        } else {
+            "Install mod"
+        };
+        Dialog::new("mod-install", title)
             .description(&detail.info.name)
             .open(true)
             .fit()
-            .width(680.0)
+            .width(760.0)
             .on_close(close_install)
             .child(col().w_full().px(16.0).pb(16.0).child(content))
             .build(k, layer);
@@ -390,18 +430,22 @@ fn thumbnail(image: &ModImage) -> &str {
     image.thumbnail.as_deref().unwrap_or(&image.url)
 }
 
-pub(in crate::desktop) fn preview_requests(detail: &Detail) -> impl Iterator<Item = (&str, Size)> {
+pub(in crate::desktop) fn preview_requests(
+    detail: &Detail,
+    saved: bool,
+) -> impl Iterator<Item = (&str, Size)> {
     let image = detail.info.images.get(detail.image);
-    image
+    let gallery = image.map(|image| (image.url.as_str(), Size::Gallery));
+    let thumbnails = detail
+        .info
+        .images
+        .iter()
+        .map(|image| (thumbnail(image), Size::Thumbnail));
+    gallery
+        .filter(|_| !saved)
         .into_iter()
-        .map(|image| (image.url.as_str(), Size::Gallery))
-        .chain(
-            detail
-                .info
-                .images
-                .iter()
-                .map(|image| (thumbnail(image), Size::Thumbnail)),
-        )
+        .chain(thumbnails)
+        .chain(gallery.filter(|_| saved))
         .chain(
             detail
                 .info
@@ -434,41 +478,53 @@ fn render(s: &State, url: Option<&str>, size: Size, frame: El, fit: SurfaceFit, 
     }
 }
 
-fn files(detail: &Detail, t: Theme, picker: bool) -> El {
-    let mut view = section(if picker { "Choose a file" } else { "Files" }, t);
+fn files(detail: &Detail, t: Theme, picker: Option<&Kit>) -> El {
+    let mut view = section(
+        if picker.is_some() {
+            "Choose files"
+        } else {
+            "Files"
+        },
+        t,
+    );
     if detail.info.files.is_empty() {
         return view.child(muted("The source did not list downloadable files.", t));
     }
     for file in &detail.info.files {
         let id = file.id;
-        let chosen = picker && detail.selected_file == Some(id);
+        let chosen = detail.selected_files.contains(&id);
+        let title = if let Some(k) = picker {
+            Checkbox::new(chosen)
+                .label(&file.name)
+                .on_toggle(move |s: &mut State| {
+                    if let Some(detail) = &mut s.browser.detail
+                        && !detail.selected_files.remove(&id)
+                    {
+                        detail.selected_files.insert(id);
+                    }
+                })
+                .build(k)
+                .key(format!("file-{id}"))
+        } else {
+            text(&file.name).font(type_::LABEL).color(t.text).wrap()
+        };
         let mut entry = col()
             .w_full()
             .gap(5.0)
             .padding(10.0)
             .radius(8.0)
-            .fill(if chosen { t.control_track } else { t.card })
+            .fill(if picker.is_some() && chosen {
+                t.control_track
+            } else {
+                t.card
+            })
             .border(1.0, t.separator)
-            .child(text(&file.name).font(type_::LABEL).color(t.text).wrap())
+            .child(title)
             .child(muted(file_metadata(file), t).wrap());
         if let Some(description) = &file.description
             && !description.trim().is_empty()
         {
             entry = entry.child(muted(description, t).wrap());
-        }
-        if picker {
-            entry = entry
-                .key(format!("file-{id}"))
-                .role("radio")
-                .label(&file.name)
-                .checked(chosen)
-                .focusable(true)
-                .hover(t.hover)
-                .on_press(move |s: &mut State| {
-                    if let Some(detail) = &mut s.browser.detail {
-                        detail.selected_file = Some(id);
-                    }
-                });
         }
         view = view.child(entry);
     }
@@ -510,66 +566,62 @@ fn file_metadata(file: &ModFile) -> String {
     items.join("  ·  ")
 }
 
-fn install_options(s: &State, detail: &Detail, t: Theme) -> El {
-    let enabled = s.busy.is_none();
-    let slug = field(
-        "remote-slug",
-        "Local mod name (slug)",
-        &s.browser.install_name,
-        t,
-        |s| &mut s.browser.install_name,
-    );
-    let mut fields = row().w_full().gap(8.0).child(slug);
+fn install_options(s: &State, detail: &Detail, t: Theme, k: &Kit) -> El {
+    let enabled = s.queue.available();
+    let mut content = panel(t)
+        .children(detail.missing_previous_files.then(|| {
+            muted(
+                "Some installed files are no longer listed. Choose the complete replacement.",
+                t,
+            )
+            .wrap()
+        }))
+        .child(
+            col()
+                .w_full()
+                .max_h((s.window_size[1] - 290.0).clamp(145.0, 440.0))
+                .scroll(ScrollSpec {
+                    stick_bottom: false,
+                })
+                .child(files(detail, t, Some(k))),
+        );
     if s.game_kind() != GameKind::Zzmi {
-        fields = fields.child(field(
-            "remote-into",
-            "Override destination (optional)",
-            &s.browser.install_into,
-            t,
-            |s| &mut s.browser.install_into,
-        ));
+        content = content.child(
+            col()
+                .w_full()
+                .gap(5.0)
+                .child(muted("Destination override (optional)", t))
+                .child(field(
+                    "remote-into",
+                    "Default: detected game folder layout",
+                    &s.browser.install_into,
+                    t,
+                    |s| &mut s.browser.install_into,
+                )),
+        );
     }
-    let selection = col()
-        .w_full()
-        .max_h(220.0)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .child(files(detail, t, true));
     let controls = row()
         .w_full()
         .items_center()
         .justify_between()
         .gap(8.0)
-        .child(button(
-            "remote-stage",
-            if detail.stage {
-                "Import disabled"
-            } else {
-                "Enable on import"
-            },
-            t,
-            detail.stage,
-            enabled,
-            |s, _| {
-                if let Some(detail) = &mut s.browser.detail {
-                    detail.stage = !detail.stage;
-                }
-            },
-        ))
+        .children(s.installed_for(&detail.info.id).is_none().then(|| {
+            Checkbox::new(s.preferences.enable_new_mods)
+                .label("Enable after installing")
+                .disabled(!enabled)
+                .on_toggle(|s: &mut State| s.set_enable_new_mods(!s.preferences.enable_new_mods))
+                .build(k)
+                .key("remote-stage")
+        }))
         .child(button(
             "remote-install",
-            "Install selected file",
+            format!("Queue install ({})", detail.selected_files.len()),
             t,
             true,
-            enabled
-                && detail.selected_file.is_some()
-                && !s.browser.install_name.text.trim().is_empty(),
+            enabled && !detail.selected_files.is_empty(),
             |s, _| s.install_selected(),
         ));
-    let mut content = panel(t).child(selection).child(fields).child(controls);
-    if !enabled || (!s.notice.is_empty() && s.notice != "Ready") {
-        content = content.child(muted(s.busy.unwrap_or(&s.notice), t).wrap());
-    }
     content
+        .child(controls)
+        .children((!s.notice.is_empty()).then(|| muted(&s.notice, t).wrap()))
 }

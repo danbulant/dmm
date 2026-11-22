@@ -2,6 +2,8 @@ use std::rc::Rc;
 
 use dmm::sources::{ModFile, ModImage, Requirement, SearchResult};
 use rune::{Env, Runtime};
+#[cfg(target_os = "linux")]
+use rune::{Key, KeyEvent, Mods};
 
 use super::*;
 
@@ -237,6 +239,7 @@ fn details_fixture() -> State {
         name: "Night City wardrobe".into(),
         author: Some("Judy".into()),
         category: Some("Clothing".into()),
+        tags: vec!["Outfits".into()],
         summary: None,
         description: Some(
             "About this wardrobe:\nAn example with two downloadable files.\n".repeat(20),
@@ -267,8 +270,11 @@ fn details_fixture() -> State {
 
 #[test]
 fn details_keeps_install_header_and_opens_file_and_image_overlays() {
+    let mut state = details_fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let mut dispatched = state.queue.fixture(dir.path()).unwrap();
     let mut runtime = Runtime::new(
-        details_fixture(),
+        state,
         view,
         (960.0, 620.0),
         Env {
@@ -305,7 +311,43 @@ fn details_keeps_install_header_and_opens_file_and_image_overlays() {
     click(&mut runtime, "details-install");
     assert!(runtime.presented("mod-install-dialog").is_some());
     click(&mut runtime, "file-2");
+    runtime.update(|state, _| {
+        let selected: Vec<_> = state
+            .browser
+            .detail
+            .as_ref()
+            .unwrap()
+            .picked_files()
+            .map(|file| file.id)
+            .collect();
+        assert_eq!(
+            selected,
+            [1, 2],
+            "the optional file must not deselect the main file"
+        );
+    });
     assert!(runtime.presented("remote-install").is_some());
+    click(&mut runtime, "remote-install");
+    for _ in 0..24 {
+        runtime.frame(1.0 / 60.0);
+    }
+    assert!(runtime.presented("mod-install-dialog").is_none());
+    assert!(
+        dispatched(),
+        "install must be submitted to the independent download worker"
+    );
+    assert!(
+        runtime.state.busy.is_none(),
+        "install must not take the library worker"
+    );
+    assert!(
+        runtime.presented("download-sidebar").unwrap().0[1]
+            < runtime.presented("launch-game").unwrap().0[1]
+    );
+    click(&mut runtime, "nav-Downloads");
+    assert!(runtime.presented("queue-entry-0").is_some());
+    click(&mut runtime, "nav-Explore");
+    assert!(runtime.presented("explore-heading").is_some());
 }
 
 #[test]
@@ -371,4 +413,135 @@ fn catalog_loading_does_not_block_setup_or_local_import_controls() {
     assert!(runtime.find("local:path").is_none());
     press(&mut runtime, "local:add");
     assert!(runtime.find("local:path").is_some());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn xxmi_setup_blocks_navigation_and_escape_until_the_worker_finishes() {
+    let mut state = State::new(PathBuf::from("unused"));
+    state.screen = Screen::Setup;
+    state.public_game = GameKind::Zzmi;
+    state.busy = Some("Setting up XXMI…");
+    let (jobs, _requests) = mpsc::channel();
+    let (responses, results) = mpsc::channel();
+    state.worker = Some(Worker { jobs, results });
+    let (stages, progress) = mpsc::channel();
+    state.setup.steam_dialog = Some(SteamDialog::Running {
+        stage: InstallStage::Preparing,
+        progress,
+    });
+    let mut runtime = Runtime::new(state, view, (960.0, 620.0), Env::new(true, 1.0));
+    runtime.poll = Some(State::poll);
+    runtime.frame(0.0);
+    stages.send(InstallStage::InstallingRuntime).unwrap();
+    runtime.frame(0.1);
+    assert!(runtime.presented("xxmi-setup-progress").is_some());
+    let (x, y) = runtime.find("nav-Local mods").unwrap();
+    runtime.pointer_down(x, y);
+    runtime.pointer_up(x, y);
+    runtime.key(KeyEvent {
+        key: Key::Escape,
+        mods: Mods::default(),
+    });
+    runtime.frame(0.1);
+    assert!(matches!(runtime.state.screen, Screen::Setup));
+    assert!(runtime.presented("xxmi-setup-progress").is_some());
+
+    responses
+        .send(Ok(Update::SteamXxmiInstalled(Err(anyhow::anyhow!(
+            "Test installer failure"
+        )))))
+        .unwrap();
+    runtime.frame(0.1);
+    let (x, y) = runtime
+        .find("xxmi-setup-done")
+        .expect("failed setup is dismissible");
+    runtime.pointer_down(x, y);
+    runtime.pointer_up(x, y);
+    runtime.frame(0.1);
+    assert!(runtime.state.setup.steam_dialog.is_none());
+}
+
+#[test]
+fn local_grid_presents_bookmarks_and_requires_confirmation_before_removing_an_install() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let state_dir = dir.path().join("state");
+    let game = dir.path().join("game");
+    let input = dir.path().join("input");
+    std::fs::create_dir(&game)?;
+    std::fs::create_dir(&input)?;
+    std::fs::write(input.join("mod.archive"), b"archive fixture")?;
+    let mut library = Library::open(&state_dir)?;
+    library.register("cp", GameKind::Cyberpunk, &game, None)?;
+    library.install("cp", "night-city", &input, None, Default::default())?;
+    let bookmark = RemoteMod {
+        source: Source::Nexus,
+        game: "cyberpunk2077".into(),
+        id: 11,
+    };
+    library.save_favorite(&bookmark, "Saved wardrobe", None)?;
+    let mut state = State::new(state_dir.clone());
+    state.screen = Screen::Local;
+    state.snapshot = Snapshot::load(&library, Some("cp"))?;
+    drop(library);
+    let (jobs, requests) = mpsc::channel();
+    let (responses, results) = mpsc::channel();
+    state.worker = Some(Worker { jobs, results });
+
+    let mut runtime = Runtime::new(state, view, (960.0, 620.0), Env::new(true, 1.0));
+    runtime.poll = Some(State::poll);
+    runtime.frame(0.0);
+    let click = |runtime: &mut Runtime<State>, key| {
+        let (x, y) = runtime
+            .find(key)
+            .unwrap_or_else(|| panic!("{key} not found"));
+        runtime.pointer_down(x, y);
+        runtime.pointer_up(x, y);
+        runtime.frame(1.0 / 60.0);
+    };
+    assert!(
+        runtime
+            .presented("saved-card-nexus-cyberpunk2077-11")
+            .is_some()
+    );
+    let mut backend = Backend {
+        state_dir,
+        online: None,
+    };
+    let live = game.join("archive/pc/mod/mod.archive");
+    for enable in [false, true] {
+        click(&mut runtime, "mod:cp:night-city:enabled");
+        responses.send(requests.try_recv()?(&mut backend))?;
+        runtime.frame(1.0 / 60.0);
+        assert_eq!(runtime.state.snapshot.mods[0].enabled, enable);
+        assert_eq!(live.exists(), enable);
+    }
+    click(&mut runtime, "mod:cp:night-city:details");
+    click(&mut runtime, "installed:cp:night-city:remove");
+    assert!(runtime.presented("remove-installed-dialog").is_some());
+    assert!(
+        requests.try_recv().is_err(),
+        "opening confirmation must not remove anything"
+    );
+    click(&mut runtime, "remove-cancel");
+    for _ in 0..24 {
+        runtime.frame(1.0 / 60.0);
+    }
+    assert!(runtime.presented("remove-installed-dialog").is_none());
+    assert!(game.join("archive/pc/mod/mod.archive").is_file());
+    click(&mut runtime, "installed:cp:night-city:remove");
+    click(&mut runtime, "remove-confirm");
+
+    responses.send(requests.try_recv()?(&mut backend))?;
+    runtime.frame(1.0 / 60.0);
+    assert!(runtime.state.local_detail.is_none());
+    assert!(runtime.state.snapshot.mods.is_empty());
+    assert!(!game.join("archive/pc/mod/mod.archive").exists());
+    assert!(
+        runtime
+            .presented("saved-card-nexus-cyberpunk2077-11")
+            .is_some()
+    );
+    Ok(())
 }

@@ -6,6 +6,7 @@ use rune::{El, ScrollSpec, col, row};
 use rune_kit::{Checkbox, Kit, Placement, SegmentedControl, Select, SelectAppearance, TextInput};
 
 use super::{Catalog, State, button, muted, nonempty, panel, search_field, sort_name};
+use crate::desktop::inputs;
 
 const SORTS: [Sort; 4] = [
     Sort::Relevance,
@@ -55,16 +56,14 @@ pub(super) fn toolbar(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
             .expanded(s.browser.show_filters),
         )
         .children(active(s, t));
-    if s.browser.source == Source::Nexus || s.browser.handoff.is_some() {
+    if s.browser.source == Source::Nexus && s.snapshot.nexus_pages.is_empty() {
         toolbar = toolbar.child(button(
             "nxm-toggle",
             "Nexus link",
             t,
-            s.browser.show_nxm,
-            true,
-            |s, _| {
-                s.browser.show_nxm = !s.browser.show_nxm;
-            },
+            s.handoff_open,
+            s.busy.is_none(),
+            |s, _| s.handoff_open = true,
         ));
     }
     toolbar
@@ -73,11 +72,13 @@ pub(super) fn toolbar(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
 fn active(s: &State, t: Theme) -> Vec<El> {
     let b = &s.browser;
     let mut labels = Vec::new();
-    labels.push(match b.maturity {
-        Maturity::Safe => "SFW only".to_owned(),
-        Maturity::All => "All content".to_owned(),
-        Maturity::Adult => "NSFW only".to_owned(),
-    });
+    if b.source == Source::Nexus {
+        labels.push(match b.maturity {
+            Maturity::Safe => "SFW only".to_owned(),
+            Maturity::All => "All content".to_owned(),
+            Maturity::Adult => "NSFW only".to_owned(),
+        });
+    }
     if let Some(window) = b.provider_filters.published_within {
         labels.push(format!("Published: {}", window.label()));
     }
@@ -111,6 +112,15 @@ fn active(s: &State, t: Theme) -> Vec<El> {
                 labels.push(option.name.clone());
             }
         }
+    }
+    if b.source == Source::GameBanana
+        && b.provider_filters
+            .content_ratings
+            .iter()
+            .any(|rating| rating == "-")
+        && !labels.iter().any(|label| label == "Unrated")
+    {
+        labels.push("Unrated".to_owned());
     }
     for (label, edit) in [
         ("Author", &b.author),
@@ -148,23 +158,25 @@ fn active(s: &State, t: Theme) -> Vec<El> {
 pub(super) fn options(s: &State, t: Theme, k: &Kit) -> El {
     let b = &s.browser;
     let mut body = panel(t).gap(16.0);
-    let maturity = SegmentedControl::new(
-        &["SFW only", "All", "NSFW only"],
-        CONTENT_MODES.iter().position(|&mode| mode == b.maturity),
-    )
-    .label("Content visibility")
-    .width(Some(246.0))
-    .on_pick(|s: &mut State, index, _| {
-        let mode = CONTENT_MODES[index];
-        if s.browser.maturity != mode {
-            s.browser.maturity = mode;
-            s.search();
-        }
-    })
-    .build(k)
-    .key("content-visibility")
-    .motion_snaps();
-    body = body.child(maturity);
+    if b.source == Source::Nexus {
+        let maturity = SegmentedControl::new(
+            &["SFW only", "All", "NSFW only"],
+            CONTENT_MODES.iter().position(|&mode| mode == b.maturity),
+        )
+        .label("Content visibility")
+        .width(Some(246.0))
+        .on_pick(|s: &mut State, index, _| {
+            let mode = CONTENT_MODES[index];
+            if s.browser.maturity != mode {
+                s.browser.maturity = mode;
+                s.search();
+            }
+        })
+        .build(k)
+        .key("content-visibility")
+        .motion_snaps();
+        body = body.child(maturity);
+    }
     if b.source == Source::Nexus {
         let selected = b.provider_filters.published_within;
         let dates = row()
@@ -255,17 +267,23 @@ pub(super) fn options(s: &State, t: Theme, k: &Kit) -> El {
                     row()
                         .w_full()
                         .gap(8.0)
-                        .child(search_field("filter-author", "Author", &b.author, k, |s| {
-                            &mut s.browser.author
-                        }))
+                        .child(search_field(
+                            "filter-author",
+                            "Author",
+                            &b.author,
+                            k,
+                            t,
+                            |s| &mut s.browser.author,
+                        ))
                         .child(search_field(
                             "filter-language",
                             "Language",
                             &b.language,
                             k,
+                            t,
                             |s| &mut s.browser.language,
                         ))
-                        .child(search_field("filter-tag", "Tag", &b.tag, k, |s| {
+                        .child(search_field("filter-tag", "Tag", &b.tag, k, t, |s| {
                             &mut s.browser.tag
                         })),
                 ),
@@ -279,6 +297,17 @@ fn ratings(s: &State, catalog: &FilterCatalog, t: Theme, k: &Kit) -> El {
     col()
         .gap(6.0)
         .child(muted("Site content tags · match all selected", t))
+        .child(row().child(button(
+            "rating-all",
+            "All",
+            t,
+            selected.is_empty(),
+            true,
+            |s, _| {
+                s.browser.provider_filters.content_ratings.clear();
+                s.search();
+            },
+        )))
         .child(row().w_full().flex_wrap().gaps(14.0, 6.0).children(
             catalog.content_ratings.iter().map(|option| {
                 let id = option.id.clone();
@@ -322,25 +351,22 @@ fn categories(s: &State, catalog: &FilterCatalog, t: Theme, k: &Kit) -> El {
     let group = b.category_group.as_deref();
     let query = b.find_category.text.trim().to_lowercase();
     let region = col().gap(8.0).child(muted("Categories", t)).child(
-        TextInput::new(&b.find_category)
-            .placeholder("Find a category, character or Bangboo…")
-            .width(None)
-            .height(34.0)
-            .on_edit(|s: &mut State| &mut s.browser.find_category)
-            .on_change(|s: &mut State, tx| {
-                s.sync_previews();
-                tx.scroll_to_instant("category-scroll", 0.0, 0.0);
-            })
-            .build(k)
-            .border(
-                1.0,
-                if b.find_category.focused {
-                    k.c.border_focus
-                } else {
-                    k.c.border_base
-                },
-            )
-            .key("category-find"),
+        inputs::field(
+            TextInput::new(&b.find_category)
+                .placeholder("Find a category, character or Bangboo…")
+                .width(None)
+                .height(34.0)
+                .on_edit(|s: &mut State| &mut s.browser.find_category)
+                .on_change(|s: &mut State, tx| {
+                    s.sync_previews();
+                    tx.scroll_to_instant("category-scroll", 0.0, 0.0);
+                })
+                .build(k),
+            &b.find_category,
+            k,
+            t,
+        )
+        .key("category-find"),
     );
     let selected_path = b.category.as_deref().and_then(|id| by_id.get(id)).copied();
     let (trail, selected_trail) = if let Some(category) = selected_path {

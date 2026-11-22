@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use dmm::games::{GameKind, detect, launch_profile};
 use dmm::library::{InstallOptions, Library};
-use dmm::sources::Source;
+use dmm::sources::{RemoteMod, Source};
 use serde::Serialize;
 use serde_json::json;
 
@@ -260,9 +260,17 @@ fn with_library(state: &Path, command: Command) -> Result<()> {
         Command::InstallRemote(request) => remote::install(&mut library, request),
         Command::AcceptNxm { uri } => remote::accept_nxm(&mut library, &uri),
         Command::Updates { instance, apply } => remote::updates(&mut library, &instance, apply),
-        Command::Save(identity) => library.favorite(&identity.into(), true),
-        Command::Unsave(identity) => library.favorite(&identity.into(), false),
-        Command::Saved => print(&library.favorites()?),
+        Command::Save(identity) => {
+            let id: RemoteMod = identity.into();
+            let details = remote::client()?.details(&id)?;
+            let image = details
+                .images
+                .first()
+                .map(|image| image.thumbnail.as_deref().unwrap_or(&image.url));
+            library.save_favorite(&id, &details.name, image)
+        }
+        Command::Unsave(identity) => library.unsave(&identity.into()),
+        Command::Saved => print(&library.saved_favorites()?),
         Command::SaveSearch { name, search } => library.save_search(&name, &search.into()),
         Command::RunSearch { name } => remote::search(&library, library.saved_search(&name)?, None),
         #[cfg(feature = "rune-ui")]

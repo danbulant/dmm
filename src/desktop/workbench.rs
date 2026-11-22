@@ -1,15 +1,53 @@
-use std::collections::HashSet;
+mod import;
+
 use std::path::PathBuf;
 
 use anyhow::Result;
 use rune::tok::Theme;
-use rune::{El, FileDialogOptions, TextEdit, Tx, col, row};
+use rune::{El, SurfaceFit, TextEdit, Tx, col, row};
+use rune_kit::{Dialog, Kit, Placement, Select, SelectAppearance, Switch, TextInput};
 
 use dmm::games::GameKind;
-use dmm::library::{Inspection, InstallOptions, Library, ManagedMod};
+use dmm::library::{Inspection, Library, ManagedMod, SavedFavorite};
+use dmm::sources::Source;
 
-use super::Screen;
-use super::{Snapshot, State, Update, button, field, heading, muted, panel};
+use super::{
+    Origin, Screen, Size, Snapshot, State, Update, browse, button, heading, muted, open_library,
+    panel,
+};
+
+const PAGE_SIZE: usize = 24;
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Status {
+    #[default]
+    Any,
+    Enabled,
+    Disabled,
+    Saved,
+}
+
+impl Status {
+    const OPTIONS: [(Self, &'static str); 4] = [
+        (Self::Any, "Any state"),
+        (Self::Enabled, "Enabled"),
+        (Self::Disabled, "Disabled"),
+        (Self::Saved, "Saved only"),
+    ];
+}
+
+const SITES: [(Option<Source>, &str); 4] = [
+    (None, "Any site"),
+    (Some(Source::Nexus), "Nexus Mods"),
+    (Some(Source::GameBanana), "GameBanana"),
+    (Some(Source::Local), "Local files"),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilterMenu {
+    Status,
+    Site,
+}
 
 pub(super) struct LocalForm {
     import_open: bool,
@@ -17,11 +55,18 @@ pub(super) struct LocalForm {
     pub slug: TextEdit,
     pub destination: TextEdit,
     pub replace_unmanaged: bool,
-    pub keep_disabled: bool,
+    search: TextEdit,
+    tag_filter: TextEdit,
+    category_filter: TextEdit,
+    character_filter: TextEdit,
+    group_filter: TextEdit,
+    site_filter: Option<Source>,
+    status: Status,
+    filter_menu: Option<FilterMenu>,
+    page: usize,
     preview: Option<LocalPreview>,
     pending_preview: Option<(String, PathBuf, String, Option<PathBuf>)>,
-    remove_confirm: Option<String>,
-    installed_page: usize,
+    remove_confirm: Option<(String, String)>,
 }
 
 impl Default for LocalForm {
@@ -32,11 +77,18 @@ impl Default for LocalForm {
             slug: TextEdit::default(),
             destination: TextEdit::default(),
             replace_unmanaged: false,
-            keep_disabled: true,
+            search: TextEdit::default(),
+            tag_filter: TextEdit::default(),
+            category_filter: TextEdit::default(),
+            character_filter: TextEdit::default(),
+            group_filter: TextEdit::default(),
+            site_filter: None,
+            status: Status::Any,
+            filter_menu: None,
+            page: 0,
             preview: None,
             pending_preview: None,
             remove_confirm: None,
-            installed_page: 0,
         }
     }
 }
@@ -50,6 +102,11 @@ struct LocalPreview {
 }
 
 impl LocalForm {
+    pub(super) fn close_menus(&mut self) {
+        self.filter_menu = None;
+        self.remove_confirm = None;
+    }
+
     pub(super) fn begin_preview(&mut self, instance: String) {
         self.pending_preview = Some((
             instance,
@@ -88,8 +145,7 @@ impl LocalForm {
     }
 }
 
-pub(super) fn local_mods(s: &State, t: Theme) -> El {
-    const PAGE_SIZE: usize = 20;
+pub(super) fn local_mods(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
     let mut title = row()
         .w_full()
         .items_center()
@@ -122,45 +178,7 @@ pub(super) fn local_mods(s: &State, t: Theme) -> El {
             .wrap(),
         );
         if s.local.import_open {
-            content = content.child(local_import(s, t, &instance.name));
-        }
-        let pages = s.snapshot.mods.len().div_ceil(PAGE_SIZE).max(1);
-        let page = s.local.installed_page.min(pages - 1);
-        if pages > 1 {
-            content = content.child(
-                row()
-                    .items_center()
-                    .gap(8.0)
-                    .child(muted(
-                        format!("Installed · page {} of {pages}", page + 1),
-                        t,
-                    ))
-                    .child(button(
-                        "local-prev",
-                        "Previous",
-                        t,
-                        false,
-                        page > 0 && s.busy.is_none(),
-                        move |s, _| s.local.installed_page = page - 1,
-                    ))
-                    .child(button(
-                        "local-next",
-                        "Next",
-                        t,
-                        false,
-                        page + 1 < pages && s.busy.is_none(),
-                        move |s, _| s.local.installed_page = page + 1,
-                    )),
-            );
-        }
-        for managed in s
-            .snapshot
-            .mods
-            .iter()
-            .skip(page * PAGE_SIZE)
-            .take(PAGE_SIZE)
-        {
-            content = content.child(mod_row(s, t, &instance.name, managed));
+            content = content.child(import::local_import(s, t, k, &instance.name));
         }
     } else {
         content = content.child(
@@ -182,391 +200,512 @@ pub(super) fn local_mods(s: &State, t: Theme) -> El {
                 )),
         );
     }
-    let installed: HashSet<_> = s
-        .snapshot
-        .mods
-        .iter()
-        .filter_map(|managed| managed.release().map(|release| &release.id))
-        .collect();
-    let saved: Vec<_> = s
-        .snapshot
-        .favorites
-        .iter()
-        .filter(|id| {
-            !installed.contains(*id)
-                && s.available_sources()
-                    .iter()
-                    .any(|origin| origin.source == id.source && origin.game == id.game)
-        })
-        .collect();
-    if s.snapshot.mods.is_empty() && saved.is_empty() {
-        content = content.child(panel(t).child(muted("No local mods or saved bookmarks.", t)));
+    content = content.child(
+        super::inputs::field(
+            TextInput::new(&s.local.search)
+                .placeholder("Search installed and saved mods…")
+                .height(36.0)
+                .width(None)
+                .on_edit(|s: &mut State| &mut s.local.search)
+                .on_change(|s, _| refresh_filters(s))
+                .build(k),
+            &s.local.search,
+            k,
+            t,
+        )
+        .key("local-search")
+        .w_full(),
+    );
+    content = content.child(
+        row()
+            .w_full()
+            .flex_wrap()
+            .gap(7.0)
+            .child(filter_menu(s, k, layer, FilterMenu::Status))
+            .child(filter_menu(s, k, layer, FilterMenu::Site))
+            .children(
+                [
+                    (
+                        "local-tag-filter",
+                        "Tag",
+                        &s.local.tag_filter,
+                        (|s: &mut State| &mut s.local.tag_filter)
+                            as fn(&mut State) -> &mut TextEdit,
+                    ),
+                    (
+                        "local-category-filter",
+                        "Category",
+                        &s.local.category_filter,
+                        |s| &mut s.local.category_filter,
+                    ),
+                    (
+                        "local-character-filter",
+                        "Character",
+                        &s.local.character_filter,
+                        |s| &mut s.local.character_filter,
+                    ),
+                    (
+                        "local-group-filter",
+                        "Local group",
+                        &s.local.group_filter,
+                        |s| &mut s.local.group_filter,
+                    ),
+                ]
+                .into_iter()
+                .map(|(key, label, edit, access)| {
+                    super::inputs::field(
+                        TextInput::new(edit)
+                            .label(label)
+                            .placeholder(label)
+                            .height(32.0)
+                            .width(Some(130.0))
+                            .on_edit(access)
+                            .on_change(|s, _| refresh_filters(s))
+                            .build(k),
+                        edit,
+                        k,
+                        t,
+                    )
+                    .key(key)
+                }),
+            ),
+    );
+    let entries = entries(&s.local, &s.snapshot, s.available_sources());
+    let pages = entries.len().div_ceil(PAGE_SIZE);
+    let page = s.local.page.min(pages.saturating_sub(1));
+    let mut grid = row().w_full().flex_wrap().gaps(12.0, 12.0);
+    for entry in entries.into_iter().skip(page * PAGE_SIZE).take(PAGE_SIZE) {
+        grid = grid.child(match entry {
+            Entry::Installed(instance, record) => mod_card(s, t, k, instance, record),
+            Entry::Saved(bookmark) => saved_card(s, t, bookmark),
+        });
     }
-    if !saved.is_empty() {
-        content = content.child(heading("Saved bookmarks", t)).child(
-            muted(
-                "Open a bookmark to choose and import a file. Only installed mods can be enabled.",
-                t,
-            )
-            .wrap(),
-        );
-        for id in saved {
-            let key = format!("{}-{}-{}", id.source, id.game, id.id);
-            let open_id = id.clone();
-            let saved_id = id.clone();
+    if pages == 0 {
+        content = content
+            .child(panel(t).child(muted("No installed or saved mods match these filters.", t)));
+    } else {
+        content = content.child(grid);
+        if pages > 1 {
             content = content.child(
-                panel(t).child(
-                    row()
-                        .gap(8.0)
-                        .items_center()
-                        .w_full()
-                        .child(
-                            col()
-                                .grow(1.0)
-                                .shrink()
-                                .child(heading(format!("{} · {}", id.source, id.id), t))
-                                .child(muted(format!("{} · {}", id.source, id.game), t)),
-                        )
-                        .child(button(
-                            format!("local-saved-open-{key}"),
-                            "Details",
-                            t,
-                            false,
-                            s.busy.is_none(),
-                            move |s, _| s.details(open_id.clone()),
-                        ))
-                        .child(button(
-                            format!("local-saved-remove-{key}"),
-                            "Unsave",
-                            t,
-                            false,
-                            s.busy.is_none(),
-                            move |s, _| s.favorite(saved_id.clone(), false),
-                        )),
-                ),
+                row()
+                    .gap(8.0)
+                    .items_center()
+                    .justify_between()
+                    .w_full()
+                    .child(muted(format!("Page {} of {pages}", page + 1), t))
+                    .child(
+                        row()
+                            .gap(8.0)
+                            .child(button(
+                                "local-prev",
+                                "Previous",
+                                t,
+                                false,
+                                page > 0,
+                                move |s, tx| set_page(s, page.saturating_sub(1), tx),
+                            ))
+                            .child(button(
+                                "local-next",
+                                "Next",
+                                t,
+                                false,
+                                page + 1 < pages,
+                                move |s, tx| set_page(s, page + 1, tx),
+                            )),
+                    ),
             );
         }
     }
     content
 }
-fn local_import(s: &State, t: Theme, instance: &str) -> El {
-    let mut body = col().gap(8.0).child(heading("Install from local files", t));
-    body = body.child(field(
-        "local:path",
-        "Archive or folder path",
-        &s.local.input,
-        t,
-        |s| &mut s.local.input,
-    ));
-    body = body.child(field("local:slug", "Mod name", &s.local.slug, t, |s| {
-        &mut s.local.slug
-    }));
-    body = body.child(field(
-        "local:destination",
-        "Optional destination override",
-        &s.local.destination,
-        t,
-        |s| &mut s.local.destination,
-    ));
-    body = body.child(
-        row()
-            .gap(8.0)
-            .child(button(
-                "local:pick-file",
-                "Choose archive",
-                t,
-                false,
-                true,
-                |_, tx: &mut Tx| {
-                    tx.open_file(
-                        FileDialogOptions {
-                            title: "Choose mod archive".into(),
-                            ..Default::default()
-                        },
-                        |s: &mut State, result, _| match result {
-                            Ok(Some(path)) => {
-                                s.local.input = TextEdit::new(path.display().to_string())
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                s.notice = format!(
-                                    "File chooser failed: {error}. Enter the path manually."
-                                )
-                            }
-                        },
-                    );
-                },
-            ))
-            .child(button(
-                "local:pick-folder",
-                "Choose folder",
-                t,
-                false,
-                true,
-                |_, tx: &mut Tx| {
-                    tx.open_folder(
-                        FileDialogOptions {
-                            title: "Choose mod folder".into(),
-                            ..Default::default()
-                        },
-                        |s: &mut State, result, _| match result {
-                            Ok(Some(path)) => {
-                                s.local.input = TextEdit::new(path.display().to_string())
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                s.notice = format!(
-                                    "Folder chooser failed: {error}. Enter the path manually."
-                                )
-                            }
-                        },
-                    );
-                },
-            ))
-            .child(button(
-                "local:keep-disabled",
-                if s.local.keep_disabled {
-                    "Staged (disabled)"
-                } else {
-                    "Install enabled"
-                },
-                t,
-                s.local.keep_disabled,
-                true,
-                |s, _| s.local.keep_disabled = !s.local.keep_disabled,
-            ))
-            .child(button(
-                "local:replace-unmanaged",
-                if s.local.replace_unmanaged {
-                    "Replace unmanaged: yes"
-                } else {
-                    "Replace unmanaged: no"
-                },
-                t,
-                s.local.replace_unmanaged,
-                true,
-                |s, _| s.local.replace_unmanaged = !s.local.replace_unmanaged,
-            )),
-    );
-    body = body.child(button(
-        "local:preview",
-        "Preview install",
-        t,
-        false,
-        s.busy.is_none(),
-        move |state, _| {
-            let Some(instance) = state.snapshot.selected.as_ref().map(|i| i.name.clone()) else {
-                return;
-            };
-            let input = PathBuf::from(state.local.input.text.trim());
-            let slug = state.local.slug.text.trim().to_owned();
-            let destination = nonempty_path(&state.local.destination.text);
-            if input.as_os_str().is_empty() || slug.is_empty() {
-                state.notice = "Choose a local archive or folder and enter a mod name.".into();
-                return;
-            }
-            state.local.begin_preview(instance.clone());
-            state.submit("Inspecting local mod", move |root| {
-                let library = Library::open(&root)?;
-                Ok(Update::LocalPlan(library.inspect(
-                    &instance,
-                    &slug,
-                    &input,
-                    destination.as_deref(),
-                )?))
-            });
-        },
-    ));
-    if let Some(preview) = s
-        .local
-        .preview
-        .as_ref()
-        .filter(|preview| preview.instance == instance && s.local.preview_matches())
-    {
-        body = body.child(muted(
-            format!(
-                "Placement: {:?} · {} planned files",
-                preview.inspection.plan.placement,
-                preview.inspection.plan.files.len()
-            ),
-            t,
-        ));
-        for mapping in preview.inspection.plan.files.iter().take(40) {
-            body = body.child(muted(
-                format!(
-                    "{} → {}",
-                    mapping.source.display(),
-                    mapping.destination.display()
-                ),
-                t,
-            ));
-        }
-        if preview.inspection.plan.files.len() > 40 {
-            body = body.child(muted(
-                format!(
-                    "…and {} more files",
-                    preview.inspection.plan.files.len() - 40
-                ),
-                t,
-            ));
-        }
-        for warning in &preview.inspection.plan.warnings {
-            body = body.child(muted(format!("Warning: {warning}"), t));
-        }
-        if preview.inspection.conflicts.is_empty() {
-            body = body.child(muted("No file conflicts detected.", t));
-        } else {
-            body = body.child(muted(
-                format!("{} conflicts:", preview.inspection.conflicts.len()),
-                t,
-            ));
-            for conflict in &preview.inspection.conflicts {
-                body = body.child(muted(
-                    format!(
-                        "{} (owned by {})",
-                        conflict.path,
-                        conflict.owner.as_deref().unwrap_or("unmanaged files")
-                    ),
-                    t,
-                ));
-            }
-        }
-        let safe = preview
-            .inspection
-            .conflicts
-            .iter()
-            .all(|conflict| conflict.owner.is_none())
-            && (preview.inspection.conflicts.is_empty() || s.local.replace_unmanaged);
-        let instance = instance.to_owned();
-        body = body.child(button(
-            "local:install",
-            "Install preview",
-            t,
-            true,
-            safe && s.busy.is_none(),
-            move |state, _| {
-                if state
-                    .snapshot
-                    .selected
-                    .as_ref()
-                    .map(|current| current.name.as_str())
-                    != Some(instance.as_str())
-                {
-                    state.notice = "Selected game changed; preview the install again.".into();
-                    return;
-                }
-                if !state.local.preview_matches() {
-                    state.notice =
-                        "Inputs changed since preview; preview the install again.".into();
-                    return;
-                }
-                let Some(preview) = state.local.preview.take() else {
-                    return;
-                };
-                if preview.instance != instance {
-                    state.notice = "Selected game changed; preview the install again.".into();
-                    return;
-                }
-                if preview
-                    .inspection
-                    .conflicts
-                    .iter()
-                    .any(|conflict| conflict.owner.is_some())
-                    || (!preview.inspection.conflicts.is_empty() && !state.local.replace_unmanaged)
-                {
-                    state.notice =
-                        "Resolve conflicts and explicitly allow replacing unmanaged files.".into();
-                    return;
-                }
-                let keep_disabled = state.local.keep_disabled;
-                let replace_unmanaged = state.local.replace_unmanaged;
-                let instance = preview.instance;
-                state.submit("Installing local mod", move |root| {
-                    let mut library = Library::open(&root)?;
-                    library.install(
-                        &instance,
-                        &preview.slug,
-                        &preview.input,
-                        None,
-                        InstallOptions {
-                            destination: preview.destination.as_deref(),
-                            keep_disabled,
-                            replace_unmanaged,
-                            ..Default::default()
-                        },
-                    )?;
-                    Ok(Update::Library(Snapshot::load(&library, Some(&instance))?))
-                });
-            },
-        ));
-    }
-    panel(t).child(body)
+
+fn refresh_filters(s: &mut State) {
+    s.local.page = 0;
+    s.sync_previews();
 }
 
-fn mod_row(s: &State, t: Theme, instance: &str, managed: &ManagedMod) -> El {
-    let slug = managed.slug.clone();
-    let file_count = managed.files().count();
-    let target = instance.to_owned();
-    let toggle_slug = slug.clone();
-    let source_link = managed.release().and_then(|r| r.source_url.clone());
-    let enabled = managed.enabled;
-    let toggle = button(
-        format!("mod:{slug}:toggle"),
-        if enabled { "Disable" } else { "Enable" },
-        t,
-        enabled,
-        s.busy.is_none(),
-        move |state, _| {
-            change_mod(
-                state,
-                &target,
-                &toggle_slug,
-                "Updating mod…",
-                move |lib, game, slug| lib.toggle(game, slug, !enabled, false, false),
-            );
-        },
-    );
-    let mut body = col().gap(6.0).child(
-        row()
-            .gap(8.0)
-            .child(heading(slug.clone(), t))
-            .child(muted(if enabled { "Enabled" } else { "Disabled" }, t))
-            .child(toggle),
-    );
-    if let Some(id) = managed.release().map(|release| release.id.clone()) {
-        let detail_id = id.clone();
-        let saved = s.snapshot.favorites.contains(&id);
-        body = body.child(
+fn set_page(s: &mut State, page: usize, tx: &mut Tx) {
+    s.local.page = page;
+    s.sync_previews();
+    tx.scroll_to_instant("main-scroll", 0.0, 0.0);
+}
+
+fn filter_menu(s: &State, k: &Kit, layer: &mut Vec<El>, menu: FilterMenu) -> El {
+    let (key, label, options, current) = match menu {
+        FilterMenu::Status => (
+            "local-state",
+            "Deployment state",
+            Status::OPTIONS.map(|(_, label)| label),
+            Status::OPTIONS
+                .iter()
+                .find(|(status, _)| *status == s.local.status)
+                .map(|(_, label)| *label),
+        ),
+        FilterMenu::Site => (
+            "local-site",
+            "Mod source",
+            SITES.map(|(_, label)| label),
+            SITES
+                .iter()
+                .find(|(source, _)| *source == s.local.site_filter)
+                .map(|(_, label)| *label),
+        ),
+    };
+    Select::new(key, &options)
+        .label(label)
+        .appearance(SelectAppearance::Field)
+        .placement(Placement::BottomStart)
+        .width(140.0)
+        .current(current)
+        .open(s.local.filter_menu == Some(menu))
+        .on_toggle(move |s: &mut State| {
+            s.local.filter_menu = (s.local.filter_menu != Some(menu)).then_some(menu)
+        })
+        .on_close(|s: &mut State| s.local.filter_menu = None)
+        .on_choose(move |s: &mut State, chosen, _| {
+            s.local.filter_menu = None;
+            match menu {
+                FilterMenu::Status => {
+                    if let Some((status, _)) =
+                        Status::OPTIONS.iter().find(|(_, label)| *label == chosen)
+                    {
+                        s.local.status = *status;
+                    }
+                }
+                FilterMenu::Site => {
+                    if let Some((source, _)) = SITES.iter().find(|(_, label)| *label == chosen) {
+                        s.local.site_filter = *source;
+                    }
+                }
+            }
+            refresh_filters(s);
+        })
+        .build(k, layer)
+        .border(1.0, k.c.border_base)
+}
+
+enum Entry<'a> {
+    Installed(&'a str, &'a ManagedMod),
+    Saved(&'a SavedFavorite),
+}
+
+fn entries<'a>(form: &LocalForm, snapshot: &'a Snapshot, origins: &[Origin]) -> Vec<Entry<'a>> {
+    let mut entries = Vec::new();
+    let q = form.search.text.trim().to_lowercase();
+    let tag = form.tag_filter.text.trim().to_lowercase();
+    let category = form.category_filter.text.trim().to_lowercase();
+    let character = form.character_filter.text.trim().to_lowercase();
+    let group = form.group_filter.text.trim().to_lowercase();
+    if let Some(instance) = &snapshot.selected {
+        for record in &snapshot.mods {
+            let state_matches = match form.status {
+                Status::Any => true,
+                Status::Enabled => record.enabled,
+                Status::Disabled => !record.enabled,
+                Status::Saved => record
+                    .release()
+                    .is_some_and(|release| snapshot.is_saved(&release.id)),
+            };
+            if !state_matches
+                || form
+                    .site_filter
+                    .is_some_and(|site| site != record_source(record))
+            {
+                continue;
+            }
+            let details = record.details();
+            let release = record.release();
+            let title = installed_title(record);
+            let cat = details.and_then(|d| d.category.as_deref()).unwrap_or("");
+            let tags = details.map(|d| d.tags.as_slice()).unwrap_or(&[]);
+            if (contains(title, &q)
+                || contains(&record.slug, &q)
+                || release.is_some_and(|r| contains(&r.filename, &q))
+                || details
+                    .and_then(|d| d.author.as_deref())
+                    .is_some_and(|author| contains(author, &q)))
+                && (tag.is_empty() || tags.iter().any(|value| contains(value, &tag)))
+                && contains(cat, &category)
+                && (contains(cat, &character)
+                    || tags
+                        .iter()
+                        .filter_map(|value| value.strip_prefix("Character: "))
+                        .any(|value| contains(value, &character)))
+                && contains(record.group.as_deref().unwrap_or(""), &group)
+            {
+                entries.push(Entry::Installed(&instance.name, record));
+            }
+        }
+    }
+    if matches!(form.status, Status::Any | Status::Saved)
+        && [&tag, &category, &character, &group]
+            .iter()
+            .all(|value| value.is_empty())
+    {
+        entries.extend(
+            snapshot
+                .favorites
+                .iter()
+                .filter(|favorite| {
+                    origins.iter().any(|origin| {
+                        origin.source == favorite.item.source && origin.game == favorite.item.game
+                    }) && form
+                        .site_filter
+                        .is_none_or(|site| site == favorite.item.source)
+                        && contains(&favorite.name, &q)
+                        && !snapshot.mods.iter().any(|record| {
+                            record
+                                .release()
+                                .is_some_and(|release| release.id == favorite.item)
+                        })
+                })
+                .map(Entry::Saved),
+        );
+    }
+    entries
+}
+
+fn contains(value: &str, query: &str) -> bool {
+    query.is_empty() || value.to_lowercase().contains(query)
+}
+
+fn record_source(record: &ManagedMod) -> Source {
+    record
+        .release()
+        .map_or(Source::Local, |release| release.id.source)
+}
+
+pub(super) fn installed_title(record: &ManagedMod) -> &str {
+    record
+        .details()
+        .map(|details| details.name.as_str())
+        .or_else(|| record.release().map(|release| release.filename.as_str()))
+        .unwrap_or(&record.slug)
+}
+
+fn installed_image(record: &ManagedMod) -> Option<&str> {
+    let image = record.details()?.images.first()?;
+    Some(image.thumbnail.as_deref().unwrap_or(&image.url))
+}
+
+pub(super) fn preview_requests<'a>(
+    form: &LocalForm,
+    snapshot: &'a Snapshot,
+    origins: &[Origin],
+) -> impl Iterator<Item = (&'a str, Size)> + use<'a> {
+    let entries = entries(form, snapshot, origins);
+    let page = form
+        .page
+        .min(entries.len().div_ceil(PAGE_SIZE).saturating_sub(1));
+    entries
+        .into_iter()
+        .skip(page * PAGE_SIZE)
+        .take(PAGE_SIZE)
+        .filter_map(|entry| {
+            let url = match entry {
+                Entry::Installed(_, record) => installed_image(record),
+                Entry::Saved(bookmark) => bookmark.image.as_deref(),
+            }?;
+            Some((url, Size::Card))
+        })
+}
+
+fn saved_card(s: &State, t: Theme, bookmark: &SavedFavorite) -> El {
+    let id = bookmark.item.clone();
+    let key = format!("{}-{}-{}", id.source, id.game, id.id);
+    let image = bookmark.image.as_deref();
+    let detail_id = id.clone();
+    let install_id = id.clone();
+    let saved_id = id.clone();
+    col()
+        .key(format!("saved-card-{key}"))
+        .w(248.0)
+        .padding(9.0)
+        .gap(7.0)
+        .radius(12.0)
+        .fill(t.card)
+        .border(1.0, t.card_border)
+        .child(super::browse::preview(s, image, 112.0, SurfaceFit::Fill, t))
+        .child(heading(&bookmark.name, t).truncate().help(&bookmark.name))
+        .child(muted(format!("Saved · {} · {}", id.source, id.game), t).truncate())
+        .child(
             row()
-                .gap(8.0)
+                .gap(6.0)
+                .flex_wrap()
                 .child(button(
-                    format!("mod:{slug}:details"),
+                    format!("local-saved-open-{key}"),
                     "Details",
                     t,
                     false,
-                    s.busy.is_none(),
+                    s.details_busy.is_none(),
                     move |s, _| s.details(detail_id.clone()),
                 ))
                 .child(button(
-                    format!("mod:{slug}:favorite"),
-                    if saved { "Unsave" } else { "Save" },
+                    format!("local-saved-install-{key}"),
+                    "Install",
                     t,
-                    saved,
+                    false,
+                    s.details_busy.is_none() && s.queue.available() && s.matches_instance(&id),
+                    move |s, _| s.details_for_install(install_id.clone()),
+                ))
+                .child(button(
+                    format!("local-saved-remove-{key}"),
+                    "Unsave",
+                    t,
+                    false,
                     s.busy.is_none(),
-                    move |s, _| s.favorite(id.clone(), !saved),
+                    move |s, _| s.unsave(saved_id.clone()),
                 )),
-        );
+        )
+}
+
+fn mod_card(s: &State, t: Theme, k: &Kit, instance: &str, managed: &ManagedMod) -> El {
+    let slug = managed.slug.as_str();
+    let details = managed.details();
+    let release = managed.release();
+    let name = installed_title(managed);
+    let image = installed_image(managed);
+    let source = record_source(managed);
+    let mut card = col()
+        .key(format!("installed-card-{instance}-{slug}"))
+        .w(248.0)
+        .padding(9.0)
+        .gap(7.0)
+        .radius(12.0)
+        .fill(t.card)
+        .border(1.0, t.card_border)
+        .child(super::browse::preview(s, image, 112.0, SurfaceFit::Fill, t))
+        .child(heading(name, t).truncate().help(name))
+        .child(muted(browse::source_name(source), t).truncate());
+    if let Some(category) = details.and_then(|details| details.category.as_deref()) {
+        card = card.child(muted(category, t).truncate());
+    } else if let Some(release) = release {
+        card = card.child(muted(&release.filename, t).truncate());
     }
-    if !enabled
+    let tags = details
+        .map(|details| details.tags.as_slice())
+        .unwrap_or(&[]);
+    if !tags.is_empty() {
+        let labels = tags
+            .iter()
+            .take(3)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let more = tags.len().saturating_sub(3);
+        let label = if more == 0 {
+            labels
+        } else {
+            format!("{labels} · +{more}")
+        };
+        card = card.child(muted(label, t).truncate());
+    }
+    if let Some(group) = &managed.group {
+        card = card.child(muted(format!("Group: {group}"), t).truncate());
+    }
+    let open_slug = managed.slug.clone();
+    card = card.child(button(
+        format!("mod:{instance}:{slug}:details"),
+        "Details and files",
+        t,
+        false,
+        true,
+        move |s, tx| s.open_installed_details(&open_slug, tx),
+    ));
+    if let Some(id) = release.map(|release| release.id.clone())
+        && s.snapshot.is_saved(&id)
+    {
+        card = card.child(button(
+            format!("mod:{instance}:{slug}:unsave"),
+            "Unsave",
+            t,
+            false,
+            s.busy.is_none(),
+            move |s, _| s.unsave(id.clone()),
+        ));
+    }
+    let toggle_slug = managed.slug.clone();
+    let toggle_game = instance.to_owned();
+    let enabled = managed.enabled;
+    card.child(
+        row()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .child(muted(if enabled { "Enabled" } else { "Disabled" }, t))
+            .child(
+                Switch::new(enabled)
+                    .label(format!("Enable {name}"))
+                    .hide_label()
+                    .disabled(s.busy.is_some())
+                    .on_toggle(move |state: &mut State| {
+                        change_mod(
+                            state,
+                            &toggle_game,
+                            &toggle_slug,
+                            "Updating mod…",
+                            move |lib, game, slug| lib.toggle(game, slug, !enabled, false, false),
+                        );
+                    })
+                    .build(k)
+                    .key(format!("mod:{instance}:{slug}:enabled")),
+            ),
+    )
+}
+
+pub(super) fn installed_actions(s: &State, t: Theme, instance: &str, managed: &ManagedMod) -> El {
+    let slug = managed.slug.clone();
+    let mut body = col()
+        .w_full()
+        .gap(10.0)
+        .child(heading("Installed files and actions", t))
+        .child(muted(
+            format!(
+                "{} · {}",
+                instance,
+                if managed.enabled {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                }
+            ),
+            t,
+        ));
+    if managed.details().is_none()
+        && let Some(url) = managed
+            .release()
+            .and_then(|release| release.source_url.clone())
+    {
+        body = body.child(button(
+            format!("installed:{instance}:{slug}:source"),
+            "Open source page",
+            t,
+            false,
+            true,
+            move |state, tx| browse::open_page(state, tx, &url),
+        ));
+    }
+    if let Some(release) = managed.release() {
+        let id = release.id.clone();
+        body = body.child(button(
+            format!("installed:{instance}:{slug}:reinstall"),
+            "Choose files to reinstall…",
+            t,
+            false,
+            s.details_busy.is_none() && s.queue.available() && s.matches_instance(&id),
+            move |s, _| s.details_for_install(id.clone()),
+        ));
+    }
+    if !managed.enabled
         && s.snapshot
             .selected
             .as_ref()
-            .is_some_and(|game| game.kind != GameKind::Zzmi)
+            .is_some_and(|game| game.name == instance && game.kind != GameKind::Zzmi)
     {
         let target = instance.to_owned();
-        let slug = slug.clone();
+        let backup_slug = slug.clone();
         body = body.child(button(
-            format!("mod:{slug}:enable-with-backup"),
+            format!("installed:{instance}:{slug}:enable-backup"),
             "Enable and back up unmanaged files",
             t,
             false,
@@ -575,25 +714,23 @@ fn mod_row(s: &State, t: Theme, instance: &str, managed: &ManagedMod) -> El {
                 change_mod(
                     state,
                     &target,
-                    &slug,
+                    &backup_slug,
                     "Enabling mod with backup…",
                     |lib, game, slug| lib.toggle(game, slug, true, true, false),
-                );
+                )
             },
         ));
     }
     if let Some(group) = &managed.group {
-        body = body.child(muted(format!("Group: {group}"), t));
+        body = body.child(muted(format!("Local group: {group}"), t));
     }
-    body = body.child(muted(format!("{file_count} managed files"), t));
-    for (file, _) in managed.files().take(20) {
-        body = body.child(muted(file, t));
-    }
-    if file_count > 20 {
-        body = body.child(muted(format!("…and {} more files", file_count - 20), t));
+    let files: Vec<_> = managed.files().collect();
+    body = body.child(heading(format!("Managed files ({})", files.len()), t));
+    for (file, _) in files {
+        body = body.child(muted(file, t).wrap());
     }
     if managed.versions.len() > 1 {
-        let mut controls = row().gap(8.0).flex_wrap().child(muted("Rollback to:", t));
+        body = body.child(heading("Version history · roll back to", t));
         for (index, version) in managed.versions.iter().enumerate() {
             if index == managed.current {
                 continue;
@@ -601,13 +738,13 @@ fn mod_row(s: &State, t: Theme, instance: &str, managed: &ManagedMod) -> El {
             let label = version
                 .release
                 .as_ref()
-                .and_then(|r| r.version.as_deref())
+                .and_then(|release| release.version.as_deref())
                 .map_or_else(|| format!("Version {}", index + 1), str::to_owned);
-            let slug = slug.clone();
             let target = instance.to_owned();
-            controls = controls.child(button(
-                format!("mod:{slug}:rollback:{index}"),
-                label,
+            let rollback_slug = slug.clone();
+            body = body.child(button(
+                format!("installed:{instance}:{slug}:rollback:{index}"),
+                &label,
                 t,
                 false,
                 s.busy.is_none(),
@@ -615,55 +752,51 @@ fn mod_row(s: &State, t: Theme, instance: &str, managed: &ManagedMod) -> El {
                     change_mod(
                         state,
                         &target,
-                        &slug,
+                        &rollback_slug,
                         "Rolling back mod…",
                         move |lib, game, slug| lib.rollback(game, slug, index, false),
-                    );
+                    )
                 },
             ));
         }
-        body = body.child(controls);
     }
-    if let Some(url) = source_link {
-        body = body.child(button(
-            format!("mod:{slug}:source"),
-            "Open source page",
-            t,
-            false,
-            true,
-            move |state, tx| {
-                if let Err(error) = tx.open_url(&url) {
-                    state.notice = error.to_string();
-                }
-            },
-        ));
-    }
-    let removing = s.local.remove_confirm.as_deref() == Some(slug.as_str());
-    let instance = instance.to_owned();
-    let remove = if removing { "Confirm remove" } else { "Remove" };
-    let remove_slug = slug.clone();
-    body = body.child(button(
-        format!("mod:{slug}:remove"),
-        remove,
+    let target = instance.to_owned();
+    body.child(button(
+        format!("installed:{instance}:{slug}:remove"),
+        "Remove installed mod…",
         t,
         false,
         s.busy.is_none(),
-        move |state, _| {
-            if state.local.remove_confirm.as_deref() != Some(remove_slug.as_str()) {
-                state.local.remove_confirm = Some(remove_slug.clone());
-                return;
-            }
-            state.local.remove_confirm = None;
-            change_mod(
-                state,
-                &instance,
-                &remove_slug,
-                "Removing mod…",
-                Library::remove,
-            );
+        move |s, _| {
+            s.local.remove_confirm = Some((target.clone(), slug.clone()));
         },
-    ));
-    panel(t).child(body)
+    ))
+}
+
+pub(super) fn overlays(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) {
+    let Some((game, slug)) = &s.local.remove_confirm else {
+        return;
+    };
+    let game = game.clone();
+    let slug = slug.clone();
+    let name = s
+        .snapshot
+        .mods
+        .iter()
+        .find(|record| record.slug == slug)
+        .map_or(slug.as_str(), installed_title);
+    Dialog::new("remove-installed", "Remove installed mod?")
+        .open(true).fit().width(440.0)
+        .on_close(|s: &mut State| s.local.remove_confirm = None)
+        .child(col().w_full().gap(12.0).px(16.0).pb(16.0)
+            .child(muted(format!("Remove {name}? Its managed files and rollback history will be removed. This cannot be undone."), t).wrap())
+            .child(row().gap(8.0).justify_end()
+                .child(button("remove-cancel", "Cancel", t, false, true, |s, _| s.local.remove_confirm = None))
+                .child(button("remove-confirm", "Remove", t, true, s.busy.is_none(), move |s, _| {
+                    s.local.remove_confirm = None;
+                    change_mod(s, &game, &slug, "Removing mod…", Library::remove);
+                }))))
+        .build(k, layer);
 }
 
 fn change_mod(
@@ -685,7 +818,7 @@ fn change_mod(
     let game = game.to_owned();
     let slug = slug.to_owned();
     state.submit(label, move |root| {
-        let mut library = Library::open(&root)?;
+        let mut library = open_library(&root)?;
         change(&mut library, &game, &slug)?;
         Ok(Update::Library(Snapshot::load(&library, Some(&game))?))
     });

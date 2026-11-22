@@ -1,23 +1,23 @@
 pub(super) mod details;
 mod filters;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use dmm::acquisition::{RemoteOutcome, RemoteSelection, accept_nxm, install_remote};
 use dmm::games::GameKind;
-use dmm::library::{InstallOptions, Library};
+use dmm::library::{Library, ManagedMod};
 use dmm::sources::{
-    FilterCatalog, Maturity, ModDetails, ProviderFilters, RemoteMod, SearchPage, SearchQuery,
-    SearchResult, Sort, Source, TimeWindow,
+    FilterCatalog, Maturity, ModDetails, ModFile, ProviderFilters, RemoteMod, SearchPage,
+    SearchQuery, SearchResult, Sort, Source, TimeWindow,
 };
 use rune::tok::{Theme, type_};
-use rune::{El, SurfaceFit, TextEdit, TextStyle, Tx, col, el, oklch, row, text};
+use rune::{El, ScrollSpec, SurfaceFit, TextEdit, TextStyle, Tx, col, el, oklch, row, text};
 use rune_kit::{ImageZoom, Kit, TextInput};
 use url::Url;
 
+use super::inputs;
 use super::{Origin, Screen, Snapshot, State, Update, button, field, heading, muted, panel};
 
 const PAGE_CACHE_LIMIT: usize = 24;
@@ -49,11 +49,8 @@ pub(super) struct Browser {
     pub(super) results: Option<Rc<SearchPage>>,
     pub(super) shown_query: Option<SearchQuery>,
     pub(super) detail: Option<Detail>,
-    install_name: TextEdit,
     install_into: TextEdit,
-    pub(super) handoff: Option<Url>,
     pub(super) nxm: TextEdit,
-    show_nxm: bool,
 }
 
 impl Default for Browser {
@@ -82,10 +79,7 @@ impl Default for Browser {
             results: None,
             shown_query: None,
             detail: None,
-            handoff: None,
             nxm: TextEdit::default(),
-            show_nxm: false,
-            install_name: TextEdit::default(),
             install_into: TextEdit::default(),
         }
     }
@@ -109,14 +103,21 @@ pub(super) struct Detail {
     pub(super) info: ModDetails,
     pub(super) image: usize,
     description: String,
-    selected_file: Option<u64>,
-    stage: bool,
+    selected_files: BTreeSet<u64>,
+    missing_previous_files: bool,
     install_open: bool,
     full_image_open: bool,
     pub(super) zoom: ImageZoom,
 }
 
 impl Detail {
+    pub(super) fn picked_files(&self) -> impl Iterator<Item = &ModFile> {
+        self.info
+            .files
+            .iter()
+            .filter(|file| self.selected_files.contains(&file.id))
+    }
+
     pub(super) fn poll_zoom(&mut self, now: f64, tx: &mut Tx) -> bool {
         self.full_image_open && self.zoom.poll(now, tx)
     }
@@ -132,6 +133,9 @@ impl Browser {
         self.sort_menu = false;
         self.find_category = TextEdit::default();
         self.provider_filters = ProviderFilters::default();
+        if self.source == Source::GameBanana {
+            self.provider_filters.content_ratings.push("-".to_owned());
+        }
         self.author = TextEdit::default();
         self.language = TextEdit::default();
         self.tag = TextEdit::default();
@@ -202,17 +206,26 @@ impl Browser {
         } else {
             message
         };
-        self.install_name = TextEdit::new(format!("{}-{}", info.id.source, info.id.id));
+        let mut main = info.files.iter().filter(|file| file.primary);
+        let primary = main.next().filter(|_| main.next().is_none());
+        let selected_files = if info.files.len() == 1 {
+            info.files.first()
+        } else {
+            primary
+        }
+        .map(|file| file.id)
+        .into_iter()
+        .collect();
         self.install_into = TextEdit::default();
         self.detail = Some(Detail {
-            selected_file: (info.files.len() == 1).then(|| info.files[0].id),
+            selected_files,
+            missing_previous_files: false,
             info,
             image: 0,
             description,
             install_open: false,
             full_image_open: false,
             zoom: ImageZoom::new(),
-            stage: true,
         });
     }
 }
@@ -283,9 +296,13 @@ impl Browser {
     }
 
     pub(super) fn may_show_previous_cards(&self) -> bool {
-        self.shown_query
-            .as_ref()
-            .is_none_or(|query| self.maturity == Maturity::All || query.maturity == self.maturity)
+        self.shown_query.as_ref().is_none_or(|query| {
+            (self.source != Source::Nexus
+                || self.maturity == Maturity::All
+                || query.maturity == self.maturity)
+                && (self.source != Source::GameBanana
+                    || query.filters.content_ratings == self.provider_filters.content_ratings)
+        })
     }
 }
 
@@ -318,7 +335,11 @@ impl State {
             page: 1,
             category: self.browser.category.clone(),
             sort: self.browser.sort,
-            maturity: self.browser.maturity,
+            maturity: if self.browser.source == Source::Nexus {
+                self.browser.maturity
+            } else {
+                Maturity::All
+            },
             filters,
         }
     }
@@ -426,14 +447,23 @@ impl State {
     }
 
     fn clear_filters(&mut self) {
+        let preserve_unrated = self.browser.source == Source::GameBanana
+            && self.browser.provider_filters.content_ratings.len() == 1
+            && self.browser.provider_filters.content_ratings[0] == "-";
         self.browser.provider_filters = ProviderFilters::default();
+        if preserve_unrated {
+            self.browser
+                .provider_filters
+                .content_ratings
+                .push("-".to_owned());
+        }
         self.browser.category = None;
         self.browser.category_group = None;
         self.browser.find_category = TextEdit::default();
         self.browser.author = TextEdit::default();
         self.browser.language = TextEdit::default();
         self.browser.tag = TextEdit::default();
-        if self.browser.maturity == Maturity::Adult {
+        if self.browser.source == Source::Nexus && self.browser.maturity == Maturity::Adult {
             self.browser.maturity = Maturity::All;
         }
         self.sync_previews();
@@ -461,15 +491,19 @@ impl State {
     }
 
     fn load_details(&mut self, id: RemoteMod, install: bool) {
-        let maturity = (self.screen == Screen::Explore).then_some(self.browser.maturity);
-        let revision = maturity.map(|_| self.browser.search_revision);
+        let screen = self.screen;
+        let revision = self.detail_revision;
+        let search_revision = self.browser.search_revision;
+        let local_detail = self.local_detail.clone();
+        let maturity = (self.screen == Screen::Explore && self.browser.source == Source::Nexus)
+            .then_some(self.browser.maturity);
         let listed_rating = self.browser.results.as_ref().and_then(|page| {
             page.items
                 .iter()
                 .find(|item| item.id == id)
                 .and_then(|item| item.adult)
         });
-        self.submit_job("Loading mod details…", move |worker| {
+        self.submit_details(move |worker| {
             let result = worker
                 .online()
                 .and_then(|client| client.details(&id))
@@ -486,15 +520,39 @@ impl State {
                     );
                     Ok(detail)
                 });
-            Ok(Update::Details(revision, install, result))
+            Ok(Update::Details(
+                screen,
+                revision,
+                search_revision,
+                local_detail,
+                install,
+                result,
+            ))
         });
     }
 
-    pub(super) fn favorite(&mut self, id: RemoteMod, save: bool) {
+    pub(super) fn unsave(&mut self, id: RemoteMod) {
+        self.change_bookmark(move |library| library.unsave(&id));
+    }
+
+    fn toggle_bookmark(&mut self, id: RemoteMod, name: String, image: Option<String>, saved: bool) {
+        if saved {
+            self.unsave(id);
+        } else {
+            self.change_bookmark(move |library| {
+                library.save_favorite(&id, &name, image.as_deref())
+            });
+        }
+    }
+
+    fn change_bookmark(
+        &mut self,
+        change: impl FnOnce(&Library) -> anyhow::Result<()> + Send + 'static,
+    ) {
         let target = self.snapshot.selected.as_ref().map(|i| i.name.clone());
         self.submit("Updating saved mods…", move |dir| {
-            let library = Library::open(&dir)?;
-            library.favorite(&id, save)?;
+            let library = super::open_library(&dir)?;
+            change(&library)?;
             Ok(Update::Library(Snapshot::load(
                 &library,
                 target.as_deref(),
@@ -502,13 +560,51 @@ impl State {
         });
     }
 
-    fn matches_instance(&self, id: &RemoteMod) -> bool {
+    pub(super) fn matches_instance(&self, id: &RemoteMod) -> bool {
         self.snapshot.selected.is_some()
             && self
                 .snapshot
                 .sources
                 .iter()
                 .any(|o| o.source == id.source && o.game == id.game)
+    }
+
+    pub(super) fn installed_for(&self, id: &RemoteMod) -> Option<&ManagedMod> {
+        self.snapshot
+            .mods
+            .iter()
+            .find(|record| record.release().is_some_and(|release| release.id == *id))
+    }
+
+    pub(super) fn show_online_details(&mut self, info: ModDetails) {
+        let installed_files = self.installed_for(&info.id).map(|record| {
+            if record.releases().is_empty() {
+                record
+                    .release()
+                    .into_iter()
+                    .map(|release| release.file_id)
+                    .collect()
+            } else {
+                record
+                    .releases()
+                    .iter()
+                    .map(|release| release.file_id)
+                    .collect::<BTreeSet<_>>()
+            }
+        });
+        self.browser.show_details(info);
+        if let Some(ids) = installed_files
+            && let Some(detail) = &mut self.browser.detail
+        {
+            detail.missing_previous_files = ids
+                .iter()
+                .any(|id| !detail.info.files.iter().any(|file| file.id == *id));
+            detail.selected_files = if detail.missing_previous_files {
+                BTreeSet::new()
+            } else {
+                ids
+            };
+        }
     }
 
     fn install_selected(&mut self) {
@@ -521,55 +617,28 @@ impl State {
         let Some(target) = self.snapshot.selected.as_ref().map(|i| i.name.clone()) else {
             return;
         };
-        let Some(file) = detail
-            .info
-            .files
-            .iter()
-            .find(|file| Some(file.id) == detail.selected_file)
-            .cloned()
-        else {
+        let files: Vec<_> = detail.picked_files().cloned().collect();
+        if files.is_empty() {
             return;
-        };
-        let id = detail.info.id.clone();
-        let slug = self.browser.install_name.text.trim().to_owned();
-        let source_url = detail.info.url.clone();
+        }
+        let info = detail.info.clone();
         let into = nonempty(&self.browser.install_into.text).map(PathBuf::from);
-        let keep_disabled = detail.stage;
-        self.submit_online("Preparing selected file…", move |dir, client| {
-            let mut library = Library::open(&dir)?;
-            let selection = RemoteSelection {
-                id: &id,
-                file: &file,
-                source_url: source_url.as_deref(),
-            };
-            let options = InstallOptions {
-                destination: into.as_deref(),
-                keep_disabled,
-                ..Default::default()
-            };
-            match install_remote(&mut library, client, &target, &slug, selection, options)? {
-                RemoteOutcome::Installed => Ok(Update::RemoteInstalled(Snapshot::load(
-                    &library,
-                    Some(&target),
-                )?)),
-                RemoteOutcome::Browser(url) => Ok(Update::Handoff(url)),
-            }
-        });
+        let keep_disabled = self
+            .installed_for(&info.id)
+            .map_or(!self.preferences.enable_new_mods, |record| !record.enabled);
+        if self.enqueue_install(target, info, files, into, keep_disabled) {
+            details::close_install(self);
+        }
     }
 
     fn redeem_link(&mut self) {
         let Some(uri) = nonempty(&self.browser.nxm.text).map(str::to_owned) else {
             return;
         };
-        let target = self.snapshot.selected.as_ref().map(|i| i.name.clone());
-        self.submit_online("Receiving Nexus download…", move |dir, client| {
-            let mut library = Library::open(&dir)?;
-            accept_nxm(&mut library, client, &uri)?;
-            Ok(Update::RemoteInstalled(Snapshot::load(
-                &library,
-                target.as_deref(),
-            )?))
-        });
+        if self.enqueue_nexus(uri) {
+            self.handoff_open = false;
+            self.browser.nxm = TextEdit::default();
+        }
     }
 
     fn gallery_step(&mut self, index: usize) {
@@ -626,7 +695,7 @@ pub(super) fn explore(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
             ),
         );
     }
-    let query = search_field("query", "Search mods…", &s.browser.query, k, |s| {
+    let query = search_field("query", "Search mods…", &s.browser.query, k, t, |s| {
         &mut s.browser.query
     });
     let controls = row()
@@ -638,9 +707,6 @@ pub(super) fn explore(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
     view = view.child(controls).child(filters::toolbar(s, t, k, layer));
     if s.browser.show_filters {
         view = view.child(filters::options(s, t, k));
-    }
-    if s.browser.show_nxm || s.browser.handoff.is_some() {
-        view = view.child(handoff(s, t));
     }
     if let Some(page) = &s.browser.results {
         view.child(results(s, page, t))
@@ -659,27 +725,25 @@ fn search_field(
     label: &str,
     edit: &TextEdit,
     k: &Kit,
+    t: Theme,
     access: fn(&mut State) -> &mut TextEdit,
 ) -> El {
-    TextInput::new(edit)
-        .placeholder(label)
-        .height(34.0)
-        .width(None)
-        .on_edit(access)
-        .on_change(State::search_after_edit)
-        .on_submit(|s: &mut State, _| s.search())
-        .build(k)
-        .border(
-            1.0,
-            if edit.focused {
-                k.c.border_focus
-            } else {
-                k.c.border_base
-            },
-        )
-        .key(key)
-        .grow(1.0)
-        .shrink()
+    inputs::field(
+        TextInput::new(edit)
+            .placeholder(label)
+            .height(34.0)
+            .width(None)
+            .on_edit(access)
+            .on_change(State::search_after_edit)
+            .on_submit(|s: &mut State, _| s.search())
+            .build(k),
+        edit,
+        k,
+        t,
+    )
+    .key(key)
+    .grow(1.0)
+    .shrink()
 }
 
 fn source_button(s: &State, source: Source, t: Theme) -> El {
@@ -782,8 +846,9 @@ fn results(s: &State, page: &SearchPage, t: Theme) -> El {
 fn card(s: &State, item: &SearchResult, t: Theme) -> El {
     let key = id_key(&item.id);
     let id = item.id.clone();
-    let enabled = s.busy.is_none();
-    let saved = s.snapshot.favorites.contains(&id);
+    let enabled = s.details_busy.is_none();
+    let saved = s.snapshot.is_saved(&id);
+    let queued = s.queued_for_selected(&id);
     let installed = s
         .snapshot
         .mods
@@ -799,6 +864,9 @@ fn card(s: &State, item: &SearchResult, t: Theme) -> El {
     }
     if saved {
         state.push("Saved");
+    }
+    if queued {
+        state.push("Queued");
     }
     if item.adult == Some(true) {
         state.push("NSFW");
@@ -885,6 +953,8 @@ fn card(s: &State, item: &SearchResult, t: Theme) -> El {
         card = card.child(muted(meta.join("  ·  "), t).w_full().truncate());
     }
     let card_id = item.id.clone();
+    let saved_name = item.name.clone();
+    let saved_image = item.image.clone();
     let actions = row()
         .pin(None, Some(16.0), Some(16.0), None)
         .group_opacity(0.0, 1.0)
@@ -894,15 +964,17 @@ fn card(s: &State, item: &SearchResult, t: Theme) -> El {
             if saved { "Unsave" } else { "Save" },
             t,
             saved,
-            enabled,
-            move |s, _| s.favorite(id.clone(), !saved),
+            s.busy.is_none(),
+            move |s, _| {
+                s.toggle_bookmark(id.clone(), saved_name.clone(), saved_image.clone(), saved)
+            },
         ))
         .child(button(
             format!("result-install-{key}"),
-            "Install",
+            if queued { "Queued" } else { "Install" },
             t,
             false,
-            enabled && s.matches_instance(&item.id),
+            enabled && !queued && s.queue.available() && s.matches_instance(&item.id),
             {
                 let id = item.id.clone();
                 move |s, _| s.details_for_install(id.clone())
@@ -922,20 +994,26 @@ fn short_date(value: &str) -> Option<&str> {
     (date.as_bytes().get(4) == Some(&b'-') && date.as_bytes().get(7) == Some(&b'-')).then_some(date)
 }
 
-fn handoff(s: &State, t: Theme) -> El {
-    let enabled = s.busy.is_none();
-    let mut view = panel(t).child(text("Nexus browser download").font(type_::TITLE).color(t.text))
-        .child(muted("Complete the pending request with Mod Manager Download, then paste the nxm:// link. Uses the same NEXUS_API_KEY as the CLI.", t).wrap());
-    if let Some(url) = s.browser.handoff.clone() {
-        view = view.child(button(
-            "open-handoff",
-            "Open Nexus file page",
+pub(super) fn handoff(s: &State, t: Theme) -> El {
+    let enabled = s.snapshot.selected.is_some();
+    let mut links = col().w_full().gap(6.0);
+    for (index, url) in s.snapshot.nexus_pages.iter().enumerate() {
+        let url = url.clone();
+        links = links.child(button(
+            format!("open-handoff-{index}"),
+            format!("Open Nexus file {} ↗", index + 1),
             t,
-            true,
+            false,
             enabled,
             move |s, tx| open_page(s, tx, url.as_str()),
         ));
     }
+    let view = panel(t)
+        .child(muted("On Nexus, click Mod Manager Download for each file, then paste each nxm:// link below.", t).wrap())
+        .children((!s.snapshot.nexus_pages.is_empty()).then(|| {
+            col().w_full().max_h(220.0).scroll(ScrollSpec { stick_bottom: false }).child(links)
+        }));
+    let view = view.children((!s.notice.is_empty()).then(|| muted(&s.notice, t).wrap()));
     view.child(
         row()
             .w_full()
@@ -957,7 +1035,13 @@ fn handoff(s: &State, t: Theme) -> El {
     )
 }
 
-fn preview(s: &State, url: Option<&str>, height: f32, fit: SurfaceFit, t: Theme) -> El {
+pub(in crate::desktop) fn preview(
+    s: &State,
+    url: Option<&str>,
+    height: f32,
+    fit: SurfaceFit,
+    t: Theme,
+) -> El {
     if let Some(previews) = &s.previews {
         previews.view(url, height, fit, t)
     } else {
@@ -997,7 +1081,7 @@ fn id_key(id: &RemoteMod) -> String {
     format!("{}-{}-{}", id.source, id.game, id.id)
 }
 
-fn source_name(source: Source) -> &'static str {
+pub(super) fn source_name(source: Source) -> &'static str {
     match source {
         Source::Nexus => "Nexus Mods",
         Source::GameBanana => "GameBanana",
@@ -1051,6 +1135,51 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn gamebanana_queries_skip_nexus_maturity_and_hide_stale_rating_results() {
+        let mut state = State::new(PathBuf::from("unused"));
+        state.browser.source = Source::GameBanana;
+        state.browser.maturity = Maturity::Safe;
+        assert_eq!(state.query_for_controls().maturity, Maturity::All);
+
+        state.browser.shown_query = Some(SearchQuery::default());
+        state.browser.provider_filters.content_ratings = vec!["-".into()];
+        assert!(!state.browser.may_show_previous_cards());
+
+        state
+            .browser
+            .shown_query
+            .as_mut()
+            .unwrap()
+            .filters
+            .content_ratings = vec!["-".into()];
+        assert!(state.browser.may_show_previous_cards());
+    }
+
+    #[test]
+    fn gamebanana_unrated_is_default_and_survives_clear() {
+        let mut state = State::new(PathBuf::from("unused"));
+        state.browser.source = Source::GameBanana;
+        state.browser.reset_origin();
+        assert_eq!(
+            state.browser.provider_filters.content_ratings,
+            vec!["-".to_owned()]
+        );
+
+        state.browser.provider_filters.content_ratings = vec!["nu".into(), "iv".into()];
+        state.clear_filters();
+        assert!(state.browser.provider_filters.content_ratings.is_empty());
+        state.clear_filters();
+        assert!(state.browser.provider_filters.content_ratings.is_empty());
+
+        state.browser.provider_filters.content_ratings = vec!["-".into()];
+        state.clear_filters();
+        assert_eq!(
+            state.browser.provider_filters.content_ratings,
+            vec!["-".to_owned()]
+        );
     }
 
     #[test]

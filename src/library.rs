@@ -1,6 +1,10 @@
+mod volumes;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -12,14 +16,46 @@ use crate::deploy::{
     Deployment, FileChange, FileState, checked_root, clear_empty_folder, fingerprint, metadata,
     store_blob, target, verify_folder,
 };
-use crate::games::{GameKind, GameProfile, InstallPlan, parse_profile, plan, profile};
-use crate::sources::{RemoteMod, SearchQuery, Source};
+use crate::games::{GameKind, GameProfile, InstallPlan, parse_profile, plan, plan_bundle, profile};
+use crate::sources::{ModDetails, RemoteMod, SearchQuery, Source};
 
 pub struct Library {
     db: Connection,
     _lock: File,
     state: PathBuf,
     blobs: PathBuf,
+}
+
+fn migrate_favorites(db: &Connection) -> Result<()> {
+    let has_name = {
+        let mut statement = db.prepare("PRAGMA table_info(favorites)")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "name")
+    };
+    if has_name {
+        return Ok(());
+    }
+    let tx = db.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS favorite_metadata (id TEXT PRIMARY KEY NOT NULL, name TEXT, image TEXT) STRICT;
+         CREATE TABLE favorites_new (
+             data TEXT PRIMARY KEY NOT NULL,
+             name TEXT NOT NULL,
+             image TEXT
+         ) STRICT;
+         INSERT INTO favorites_new(data, name, image)
+             SELECT favorites.data, favorite_metadata.name, favorite_metadata.image
+             FROM favorites JOIN favorite_metadata ON favorites.data = favorite_metadata.id
+             WHERE favorite_metadata.name IS NOT NULL AND trim(favorite_metadata.name) != '';
+         DROP TABLE favorite_metadata;
+         DROP TABLE favorites;
+         ALTER TABLE favorites_new RENAME TO favorites;",
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,6 +97,14 @@ pub struct Version {
     pub release: Option<Release>,
     pub archive_hash: Option<String>,
     pub destination: Option<PathBuf>,
+    #[serde(default)]
+    pub archive_hashes: Vec<String>,
+    #[serde(default)]
+    pub details: Option<ModDetails>,
+    #[serde(default)]
+    pub provenance: BTreeMap<String, Release>,
+    #[serde(default)]
+    pub releases: Vec<Release>,
     files: BTreeMap<String, FileState>,
 }
 
@@ -75,8 +119,19 @@ pub struct ManagedMod {
 }
 
 impl ManagedMod {
+    pub fn details(&self) -> Option<&ModDetails> {
+        self.versions[self.current].details.as_ref()
+    }
+
     pub fn release(&self) -> Option<&Release> {
         self.versions[self.current].release.as_ref()
+    }
+    pub fn releases(&self) -> &[Release] {
+        &self.versions[self.current].releases
+    }
+
+    pub fn is_bundle(&self) -> bool {
+        self.versions[self.current].releases.len() > 1
     }
 
     pub fn files(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -108,6 +163,13 @@ pub struct Inspection {
     pub conflicts: Vec<Conflict>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SavedFavorite {
+    pub item: RemoteMod,
+    pub name: String,
+    pub image: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SavedSearch {
     pub source: Source,
@@ -115,11 +177,17 @@ pub struct SavedSearch {
     pub query: SearchQuery,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingDownload {
     pub instance: String,
     pub slug: String,
     pub release: Release,
+    #[serde(default)]
+    pub bundle: Vec<Release>,
+    #[serde(default)]
+    pub details: Option<ModDetails>,
+    #[serde(default)]
+    pub received: BTreeMap<u64, PathBuf>,
     pub destination: Option<PathBuf>,
     pub keep_disabled: bool,
     pub replace_unmanaged: bool,
@@ -141,6 +209,14 @@ struct Pending {
 
 impl Library {
     pub fn open(state: &Path) -> Result<Self> {
+        Self::open_with_wait(state, Duration::ZERO)
+    }
+
+    pub fn open_wait(state: &Path, timeout: Duration) -> Result<Self> {
+        Self::open_with_wait(state, timeout)
+    }
+
+    fn open_with_wait(state: &Path, timeout: Duration) -> Result<Self> {
         fs::create_dir_all(state)?;
         let state = state.canonicalize()?;
         let lock = OpenOptions::new()
@@ -148,10 +224,24 @@ impl Library {
             .create(true)
             .truncate(false)
             .open(state.join("lock"))?;
-        lock.try_lock()
-            .context("DMM state is in use by another process")?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    bail!("DMM state is in use by another process");
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(error).context("locking DMM state");
+                }
+            }
+        }
         let db = Connection::open(state.join("library.sqlite3"))?;
         db.execute_batch(include_str!("schema.sql"))?;
+        migrate_favorites(&db)?;
         let blobs = state.join("blobs");
         fs::create_dir_all(&blobs)?;
         let library = Self {
@@ -274,6 +364,13 @@ impl Library {
             [instance],
         )
     }
+    pub fn remote_slug(&self, instance: &str, id: &RemoteMod) -> Result<Option<String>> {
+        Ok(self
+            .mods(instance)?
+            .into_iter()
+            .find(|record| record.release().is_some_and(|release| &release.id == id))
+            .map(|record| record.slug))
+    }
 
     pub fn managed_mod(&self, instance: &str, slug: &str) -> Result<ManagedMod> {
         self.lookup(instance, slug)?
@@ -322,6 +419,36 @@ impl Library {
         release: Option<Release>,
         options: InstallOptions<'_>,
     ) -> Result<()> {
+        let releases = release.iter().cloned().collect::<Vec<_>>();
+        self.install_with_metadata(
+            instance,
+            slug,
+            input,
+            release,
+            None,
+            &releases,
+            &BTreeMap::new(),
+            options,
+        )
+    }
+
+    pub fn install_with_metadata(
+        &mut self,
+        instance: &str,
+        slug: &str,
+        input: &Path,
+        release: Option<Release>,
+        details: Option<ModDetails>,
+        releases: &[Release],
+        provenance: &BTreeMap<String, Release>,
+        options: InstallOptions<'_>,
+    ) -> Result<()> {
+        let details = details.map(|mut details| {
+            for file in &mut details.files {
+                file.url = None;
+            }
+            details
+        });
         validate_slug(slug)?;
         ensure!(
             !slug.starts_with("disabled"),
@@ -362,7 +489,160 @@ impl Library {
             validate_slug(group)?;
             next.group = Some(group.to_owned());
         }
-        let version = self.stage_version(&tree, input, plan, release, destination)?;
+        let details = details.or_else(|| {
+            old.as_ref()
+                .and_then(|mod_record| mod_record.versions[mod_record.current].details.clone())
+        });
+        let inherited_provenance = old
+            .as_ref()
+            .map(|mod_record| mod_record.versions[mod_record.current].provenance.clone())
+            .unwrap_or_default();
+        let provenance = if provenance.is_empty() {
+            &inherited_provenance
+        } else {
+            provenance
+        };
+        let releases = if releases.is_empty() {
+            old.as_ref()
+                .map(|mod_record| mod_record.versions[mod_record.current].releases.clone())
+                .filter(|previous| !previous.is_empty())
+                .unwrap_or_else(|| release.iter().cloned().collect())
+        } else {
+            releases.to_vec()
+        };
+        let version = self.stage_version(
+            &tree,
+            input,
+            plan,
+            release,
+            details,
+            &releases,
+            provenance,
+            destination,
+        )?;
+        next.current = next.versions.len();
+        next.versions.push(version);
+        let deployment = self.prepare(
+            &instance,
+            old.as_ref(),
+            Some(&mut next),
+            options.replace_unmanaged,
+            options.allow_multiple,
+        )?;
+        self.commit_change(&instance, slug, Some(&next), deployment)
+    }
+    pub fn install_remote_bundle(
+        &mut self,
+        instance: &str,
+        slug: &str,
+        archives: &[(PathBuf, Release)],
+        details: &ModDetails,
+        options: InstallOptions<'_>,
+    ) -> Result<()> {
+        ensure!(!archives.is_empty(), "download bundle cannot be empty");
+        ensure!(
+            archives.iter().all(|(_, release)| release.id == details.id),
+            "download bundle contains a different source identity"
+        );
+        let mut selected_ids = BTreeSet::new();
+        ensure!(
+            archives
+                .iter()
+                .all(|(_, release)| selected_ids.insert(release.file_id)),
+            "download bundle contains duplicate file IDs"
+        );
+        validate_slug(slug)?;
+        ensure!(
+            !slug.starts_with("disabled"),
+            "mod name cannot start with the ZZMI disabled prefix"
+        );
+        let instance = self.instance(instance)?;
+        checked_root(&instance.root)?;
+        let old = self.lookup(&instance.name, slug)?;
+        let primary = &archives[0].1;
+        if let Some(old) = &old {
+            ensure!(
+                old.release().map(|release| &release.id) == Some(&primary.id),
+                "existing mod has a different source; use another name or remove it first"
+            );
+            ensure!(
+                !options.keep_disabled || !old.enabled || instance.kind != GameKind::Zzmi,
+                "disable the ZZMI mod before updating it as disabled"
+            );
+        }
+        let destination = options.destination.or_else(|| {
+            old.as_ref()
+                .and_then(|record| record.versions[record.current].destination.as_deref())
+        });
+        let scratch = self.scratch()?;
+        let inputs = volumes::packages(archives, scratch.path())?;
+        let trees = inputs
+            .iter()
+            .map(|(input, _)| unpack(input, scratch.path()))
+            .collect::<Result<Vec<_>>>()?;
+        let packages = trees
+            .iter()
+            .map(|tree| tree.files.as_slice())
+            .collect::<Vec<_>>();
+        let profile = instance.profile()?;
+        let plans = plan_bundle(&profile, &packages, slug, destination)?;
+        let mut files = BTreeMap::new();
+        let mut provenance = BTreeMap::new();
+        let mut claims = Claims::default();
+        for ((tree, plan), (_, release)) in trees.iter().zip(plans).zip(inputs) {
+            for mapping in plan.files {
+                let path = portable_path(&mapping.destination)?;
+                ensure!(
+                    claims.conflict(&path).is_none(),
+                    "selected files have overlapping destinations: {path}"
+                );
+                claims.insert(&path, "selected bundle");
+                let state = store_blob(&tree.root().join(&mapping.source), &self.blobs)?;
+                files.insert(path.clone(), state);
+                provenance.insert(path, release.clone());
+            }
+        }
+        ensure!(!files.is_empty(), "installation plan is empty");
+        let archive_hashes = archives
+            .iter()
+            .map(|(input, _)| store_blob(input, &self.blobs).map(|state| state.hash))
+            .collect::<Result<Vec<_>>>()?;
+        let archive_hash = (archive_hashes.len() == 1).then(|| archive_hashes[0].clone());
+        let mut next = old.clone().unwrap_or_else(|| ManagedMod {
+            slug: slug.to_owned(),
+            enabled: !options.keep_disabled,
+            group: None,
+            current: 0,
+            versions: Vec::new(),
+            backups: BTreeMap::new(),
+        });
+        if options.keep_disabled {
+            next.enabled = false;
+        }
+        if let Some(group) = options.group {
+            validate_slug(group)?;
+            next.group = Some(group.to_owned());
+        }
+        let details = {
+            let mut details = details.clone();
+            for file in &mut details.files {
+                file.url = None;
+            }
+            details
+        };
+        let version = Version {
+            release: Some(primary.clone()),
+            archive_hash,
+            archive_hashes,
+            destination: destination.map(Path::to_path_buf),
+            details: Some(details),
+            provenance,
+            releases: archives
+                .iter()
+                .map(|(_, release)| release.clone())
+                .collect(),
+            files,
+        };
         next.current = next.versions.len();
         next.versions.push(version);
         let deployment = self.prepare(
@@ -447,20 +727,42 @@ impl Library {
         self.commit_change(&instance, slug, None, deployment)
     }
 
-    pub fn favorite(&self, item: &RemoteMod, save: bool) -> Result<()> {
-        let key = serde_json::to_string(item)?;
-        if save {
-            self.db
-                .execute("INSERT OR IGNORE INTO favorites VALUES (?1)", [&key])?;
-        } else {
-            self.db
-                .execute("DELETE FROM favorites WHERE data = ?1", [&key])?;
-        }
+    pub fn unsave(&self, item: &RemoteMod) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM favorites WHERE data = ?1",
+            [serde_json::to_string(item)?],
+        )?;
         Ok(())
     }
 
-    pub fn favorites(&self) -> Result<Vec<RemoteMod>> {
-        self.json_rows("SELECT data FROM favorites ORDER BY data", [])
+    pub fn save_favorite(&self, item: &RemoteMod, name: &str, image: Option<&str>) -> Result<()> {
+        let id = serde_json::to_string(item)?;
+        ensure!(!name.trim().is_empty(), "saved mod name cannot be empty");
+        self.db.execute(
+            "INSERT INTO favorites VALUES (?1, ?2, ?3)
+             ON CONFLICT(data) DO UPDATE SET name=excluded.name, image=COALESCE(excluded.image, favorites.image)",
+            params![id, name, image],
+        )?;
+        Ok(())
+    }
+
+    pub fn saved_favorites(&self) -> Result<Vec<SavedFavorite>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT data, name, image FROM favorites ORDER BY data")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
+            })?
+            .map(|row| {
+                let (id, name, image) = row?;
+                Ok(SavedFavorite {
+                    item: serde_json::from_str(&id)?,
+                    name,
+                    image,
+                })
+            })
+            .collect()
     }
 
     pub fn save_search(&self, name: &str, search: &SavedSearch) -> Result<()> {
@@ -504,6 +806,37 @@ impl Library {
             .transpose()?
             .context("no matching installation request; start with install-remote")
     }
+    pub fn pending_downloads(&self, instance: &str) -> Result<Vec<PendingDownload>> {
+        let mut pending: Vec<PendingDownload> = self.json_rows("SELECT data FROM downloads", [])?;
+        pending.retain(|download| download.instance == instance);
+        Ok(pending)
+    }
+    pub fn cancel_pending(&self, instance: &str, id: &RemoteMod) -> Result<()> {
+        let pending = self.pending_downloads(instance)?;
+        let matching: Vec<_> = pending
+            .into_iter()
+            .filter(|entry| entry.release.id == *id)
+            .collect();
+        let mut paths = BTreeSet::new();
+        let tx = self.db.unchecked_transaction()?;
+        for entry in matching {
+            paths.extend(entry.received.into_values());
+            tx.execute(
+                "DELETE FROM downloads WHERE key = ?1",
+                [PendingDownload::key(id, entry.release.file_id)?],
+            )?;
+        }
+        tx.commit()?;
+        let still_referenced: BTreeSet<PathBuf> = self
+            .json_rows::<PendingDownload, _>("SELECT data FROM downloads", [])?
+            .into_iter()
+            .flat_map(|entry| entry.received.into_values())
+            .collect();
+        for path in paths.difference(&still_referenced) {
+            let _ = fs::remove_file(path);
+        }
+        Ok(())
+    }
 
     pub fn finish_download(&self, id: &RemoteMod, file_id: u64) -> Result<()> {
         self.db.execute(
@@ -513,16 +846,191 @@ impl Library {
         Ok(())
     }
 
+    pub fn await_bundle(
+        &self,
+        request: &PendingDownload,
+        bundle: &[Release],
+        details: &ModDetails,
+    ) -> Result<()> {
+        ensure!(!bundle.is_empty(), "download bundle cannot be empty");
+        ensure!(
+            bundle.iter().all(|release| release.id == details.id),
+            "download bundle contains a different source identity"
+        );
+        self.instance(&request.instance)?;
+        validate_slug(&request.slug)?;
+        let mut selected_ids = BTreeSet::new();
+        ensure!(
+            bundle
+                .iter()
+                .all(|release| selected_ids.insert(release.file_id)),
+            "download bundle contains duplicate file IDs"
+        );
+        let mut details = details.clone();
+        for file in &mut details.files {
+            file.url = None;
+        }
+        let tx = self.db.unchecked_transaction()?;
+        let mut statement = tx.prepare("SELECT key, data FROM downloads")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut superseded = false;
+        let mut obsolete = BTreeSet::new();
+        let mut unchanged = false;
+        for (key, data) in rows {
+            let old: PendingDownload = serde_json::from_str(&data)?;
+            if old.release.id != details.id {
+                continue;
+            }
+            ensure!(
+                old.instance == request.instance,
+                "this provider mod is already awaiting download for {}",
+                old.instance
+            );
+            if old.slug == request.slug
+                && old.bundle == bundle
+                && old.destination == request.destination
+                && old.keep_disabled == request.keep_disabled
+                && old.replace_unmanaged == request.replace_unmanaged
+                && old.group == request.group
+                && old.allow_multiple == request.allow_multiple
+            {
+                unchanged = true;
+            } else {
+                superseded = true;
+                obsolete.extend(old.received.into_values());
+                tx.execute("DELETE FROM downloads WHERE key = ?1", [key])?;
+            }
+        }
+        if unchanged {
+            ensure!(!superseded, "inconsistent pending download records");
+            tx.commit()?;
+            return Ok(());
+        }
+        for release in bundle {
+            let pending = PendingDownload {
+                release: release.clone(),
+                bundle: bundle.to_vec(),
+                details: Some(details.clone()),
+                received: BTreeMap::new(),
+                ..request.clone()
+            };
+            let key = PendingDownload::key(&release.id, release.file_id)?;
+            tx.execute(
+                "INSERT INTO downloads VALUES (?1, ?2)",
+                params![key, serde_json::to_string(&pending)?],
+            )?;
+        }
+        tx.commit()?;
+        for path in obsolete {
+            match fs::remove_file(path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(error).context("cleaning superseded download parts");
+                }
+                Ok(()) | Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn record_pending_archive(
+        &self,
+        id: &RemoteMod,
+        file_id: u64,
+        input: &Path,
+    ) -> Result<PendingDownload> {
+        let mut pending = self.pending_download(id, file_id)?;
+        ensure!(
+            pending
+                .bundle
+                .iter()
+                .any(|release| release.file_id == file_id),
+            "download is not part of the outstanding bundle"
+        );
+        if pending.received.contains_key(&file_id) {
+            return Ok(pending);
+        }
+        let downloads = self.state.join("downloads");
+        fs::create_dir_all(&downloads)?;
+        let game = pending
+            .release
+            .id
+            .game
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let stored = downloads.join(format!(
+            "{}-{game}-{}-{file_id}.archive",
+            pending.release.id.source, pending.release.id.id
+        ));
+        fs::copy(input, &stored)?;
+        pending.received.insert(file_id, stored.clone());
+        let tx = self.db.unchecked_transaction()?;
+        let mut statement = tx.prepare("SELECT key, data FROM downloads")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        for (key, data) in rows {
+            let mut sibling: PendingDownload = serde_json::from_str(&data)?;
+            if sibling.release.id == *id && sibling.bundle == pending.bundle {
+                sibling.received.insert(file_id, stored.clone());
+                tx.execute(
+                    "UPDATE downloads SET data = ?2 WHERE key = ?1",
+                    params![key, serde_json::to_string(&sibling)?],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(pending)
+    }
+
+    pub fn finish_bundle(&self, id: &RemoteMod, bundle: &[Release]) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        let mut paths = BTreeSet::new();
+        for release in bundle {
+            let key = PendingDownload::key(id, release.file_id)?;
+            if let Some(path) = tx
+                .query_row("SELECT data FROM downloads WHERE key = ?1", [&key], |row| {
+                    row.get::<_, String>(0)
+                })
+                .optional()?
+                .map(|data| serde_json::from_str::<PendingDownload>(&data))
+                .transpose()?
+                .and_then(|pending| pending.received.get(&release.file_id).cloned())
+            {
+                paths.insert(path);
+            }
+            tx.execute("DELETE FROM downloads WHERE key = ?1", [&key])?;
+        }
+        tx.commit()?;
+        for path in paths {
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
     fn stage_version(
         &self,
         tree: &ArchiveTree,
         input: &Path,
         install: InstallPlan,
         release: Option<Release>,
+        details: Option<ModDetails>,
+        releases: &[Release],
+        provenance: &BTreeMap<String, Release>,
         destination: Option<&Path>,
     ) -> Result<Version> {
         let mut files = BTreeMap::new();
         let mut claims = Claims::default();
+        let mut file_provenance = BTreeMap::new();
         for mapping in install.files {
             let path = portable_path(&mapping.destination)?;
             ensure!(
@@ -530,19 +1038,29 @@ impl Library {
                 "duplicate or overlapping destination: {path}"
             );
             claims.insert(&path, "installation plan");
+            let source = mapping.source.to_string_lossy().replace('\\', "/");
+            if let Some(release) = provenance.get(&source) {
+                file_provenance.insert(path.clone(), release.clone());
+            }
             let state = store_blob(&tree.root().join(&mapping.source), &self.blobs)?;
             files.insert(path, state);
         }
+
         ensure!(!files.is_empty(), "installation plan is empty");
         let archive_hash = if input.is_file() {
             Some(store_blob(input, &self.blobs)?.hash)
         } else {
             None
         };
+        let archive_hashes = archive_hash.iter().cloned().collect();
         Ok(Version {
             release,
+            archive_hashes,
             archive_hash,
             destination: destination.map(Path::to_path_buf),
+            details,
+            provenance: file_provenance,
+            releases: releases.to_vec(),
             files,
         })
     }

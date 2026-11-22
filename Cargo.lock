@@ -764,6 +764,7 @@ dependencies = [
  "image",
  "open",
  "reqwest",
+ "ring",
  "rune",
  "rune-kit",
  "rusqlite",
@@ -771,6 +772,7 @@ dependencies = [
  "serde_json",
  "steamlocate",
  "tempfile",
+ "tokio",
  "toml",
  "url",
 ]

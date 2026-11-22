@@ -1,15 +1,11 @@
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
-use std::thread;
-use std::time::Duration;
-
 use super::{
     Category, DownloadAction, FilterCatalog, FilterOption, Maturity, ModDetails, ModFile, ModImage,
-    RemoteMod, Requirement, SearchPage, SearchQuery, SearchResult, Sort, Source, cache::Cache,
+    RemoteMod, Requirement, SearchPage, SearchQuery, SearchResult, Sort, Source,
     epoch_iso_timestamp, json, numeric, obj, string,
 };
 
@@ -42,170 +38,21 @@ fn id_for_game(game: &str) -> Result<u64> {
         .context("GameBanana game must be its numeric game ID")
 }
 
-const PAGE_SIZE: usize = 15;
-const SOURCE_PAGES_PER_REQUEST: usize = 8;
-const SEARCH_TTL: Duration = Duration::from_secs(300);
-
-#[derive(Default, Deserialize, Serialize)]
-struct Cursor {
-    source_page: u32,
-    tail: Vec<SearchResult>,
-    prior_matches: u64,
-}
-
-#[derive(Deserialize, Serialize)]
-struct PackedPage {
-    result: SearchPage,
-    next: Option<Cursor>,
-}
-
-pub(super) fn search(
-    client: &Client,
-    cache: &Cache,
-    game: &str,
-    query: &SearchQuery,
-) -> Result<SearchPage> {
-    let tags = &query.filters.content_ratings;
-    if query.maturity == Maturity::All && tags.len() <= 1 {
-        return search_single(client, game, query);
-    }
-    let mut base = query.clone();
-    base.page = 1;
-    base.maturity = Maturity::All;
-    base.filters.content_ratings = if tags.len() <= 1 {
-        tags.clone()
-    } else {
-        cache.get("gb-tag-anchor", &(game, &base), SEARCH_TTL, true, || {
-            let mut candidates = base.clone();
-            let mut best = None;
-            for tag in tags {
-                candidates.filters.content_ratings = vec![tag.clone()];
-                let page = search_single(client, game, &candidates)?;
-                let count = page.total.unwrap_or(u64::MAX);
-                if best.as_ref().is_none_or(|(smallest, _)| count < *smallest) {
-                    best = Some((count, tag.clone()));
-                }
-            }
-            Ok(best.map(|(_, tag)| tag).into_iter().collect::<Vec<_>>())
-        })?
-    };
-    let mut cursor = Cursor {
-        source_page: 1,
-        ..Cursor::default()
-    };
-    for number in 1..=query.page.max(1) {
-        let packed = cache.get(
-            "gb-packed-v2",
-            &(
-                game,
-                query.text.as_str(),
-                &query.category,
-                query.sort,
-                query.maturity,
-                &query.filters,
-                number,
-            ),
-            SEARCH_TTL,
-            true,
-            || {
-                pack_page(number, cursor, |source_page| {
-                    base.page = source_page;
-                    let page = search_single(client, game, &base)?;
-                    let matches = classify_candidates(client, page.items, query.maturity, tags)?;
-                    Ok((matches, page.has_more.then_some(source_page + 1)))
-                })
-            },
-        )?;
-        if number == query.page.max(1) || packed.next.is_none() {
-            return Ok(packed.result);
-        }
-        cursor = packed.next.expect("checked packed continuation");
-    }
-    unreachable!("a normalized page is always positive")
-}
-
-fn pack_page(
-    number: u32,
-    mut cursor: Cursor,
-    mut fetch: impl FnMut(u32) -> Result<(Vec<SearchResult>, Option<u32>)>,
-) -> Result<PackedPage> {
-    for _ in 0..SOURCE_PAGES_PER_REQUEST {
-        if cursor.tail.len() > PAGE_SIZE || cursor.source_page == 0 {
-            break;
-        }
-        let (matches, next) = fetch(cursor.source_page)?;
-        cursor.tail.extend(matches);
-        cursor.source_page = next.unwrap_or(0);
-    }
-    let items = if cursor.tail.len() <= PAGE_SIZE {
-        std::mem::take(&mut cursor.tail)
-    } else {
-        let tail = cursor.tail.split_off(PAGE_SIZE);
-        std::mem::replace(&mut cursor.tail, tail)
-    };
-    cursor.prior_matches += items.len() as u64;
-    let has_more = !cursor.tail.is_empty() || cursor.source_page != 0;
-    Ok(PackedPage {
-        result: SearchPage {
-            items,
-            page: number,
-            total: (!has_more).then_some(cursor.prior_matches),
-            total_pages: (!has_more).then_some(u64::from(number)),
-            has_more,
-        },
-        next: has_more.then_some(cursor),
-    })
-}
-
-fn classify_candidates(
-    client: &Client,
-    mut items: Vec<SearchResult>,
-    maturity: Maturity,
-    tags: &[String],
-) -> Result<Vec<SearchResult>> {
-    let wanted = match maturity {
-        Maturity::All => None,
-        Maturity::Safe => Some(false),
-        Maturity::Adult => Some(true),
-    };
-    if let Some(wanted) = wanted {
-        items.retain(|item| item.adult.is_none_or(|adult| adult == wanted));
-    }
-    let mut accepted = Vec::with_capacity(items.len());
-    for chunk in items.chunks_mut(5) {
-        thread::scope(|scope| {
-            let jobs: Vec<_> = chunk
-                .iter_mut()
-                .map(|item| {
-                    scope.spawn(move || {
-                        // A single tag was applied by the server, so only fetch its
-                        // profile if the requested visibility still needs classification.
-                        let matches = if tags.len() > 1 {
-                            let profile = fetch_profile_ratings(client, item.id.id)?;
-                            item.adult = content_rating(&profile);
-                            has_all_ratings(&profile, tags)
-                        } else {
-                            if item.adult.is_none() && wanted.is_some() {
-                                item.adult =
-                                    content_rating(&fetch_profile_ratings(client, item.id.id)?);
-                            }
-                            true
-                        };
-                        Ok::<_, anyhow::Error>(
-                            matches && wanted.is_none_or(|wanted| item.adult == Some(wanted)),
-                        )
-                    })
-                })
-                .collect();
-            for job in jobs {
-                accepted.push(job.join().expect("rating worker panicked")?);
-            }
-            Ok::<_, anyhow::Error>(())
-        })?;
-    }
-    let mut accepted = accepted.into_iter();
-    items.retain(|_| accepted.next() == Some(true));
-    Ok(items)
+pub(super) fn search(client: &Client, game: &str, query: &SearchQuery) -> Result<SearchPage> {
+    anyhow::ensure!(
+        query.maturity == Maturity::All,
+        "GameBanana does not support SFW/NSFW maturity filters; use site content ratings"
+    );
+    anyhow::ensure!(
+        query.filters.content_ratings.len() <= 1
+            || !query
+                .filters
+                .content_ratings
+                .iter()
+                .any(|rating| rating == "-"),
+        "GameBanana's Unrated filter cannot be combined with other content ratings"
+    );
+    search_single(client, game, query)
 }
 
 fn search_single(client: &Client, game: &str, query: &SearchQuery) -> Result<SearchPage> {
@@ -247,8 +94,11 @@ fn search_single(client: &Client, game: &str, query: &SearchQuery) -> Result<Sea
             if let Some(release) = &query.filters.release_type {
                 params.append_pair("_aFilters[Generic_ReleaseType]", release);
             }
-            if let Some(rating) = query.filters.content_ratings.first() {
-                params.append_pair("_aFilters[Generic_ContentRatings]", rating);
+            if !query.filters.content_ratings.is_empty() {
+                params.append_pair(
+                    "_aFilters[Generic_ContentRatings]",
+                    &query.filters.content_ratings.join(","),
+                );
             }
         } else {
             let order = match query.sort {
@@ -344,59 +194,27 @@ fn search_single(client: &Client, game: &str, query: &SearchQuery) -> Result<Sea
 }
 
 fn content_rating(value: &Value) -> Option<bool> {
-    if let Some(adult) = value.get("_bIsNsfw").and_then(Value::as_bool) {
-        return Some(adult);
-    }
-    if let Some(ratings) = value.get("_aContentRatings").and_then(Value::as_object) {
-        if ratings.keys().any(|rating| {
-            matches!(
-                rating.as_str(),
-                "cp" | "st"
-                    | "sc"
-                    | "bg"
-                    | "au"
-                    | "tu"
-                    | "du"
-                    | "sa"
-                    | "lp"
-                    | "pn"
-                    | "nu"
-                    | "iv"
-                    | "ft"
-            )
-        }) {
-            return Some(true);
-        }
-        return ratings.keys().all(|rating| rating == "ps").then_some(false);
-    }
-    if value
-        .get("_aContentRatings")
-        .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty)
-        || value.get("_bHasContentRatings").and_then(Value::as_bool) == Some(false)
-    {
-        return Some(false);
-    }
-    None
+    value.get("_bIsNsfw").and_then(Value::as_bool)
 }
 
-fn fetch_profile_ratings(client: &Client, id: u64) -> Result<Value> {
-    let mut response: Value = client
-        .get(endpoint(&format!("Mod/{id}/ProfilePage"))?)
-        .timeout(Duration::from_secs(5))
-        .send()?
-        .error_for_status()?
-        .json()?;
-    if let Some(data) = response.get_mut("data") {
-        return Ok(data.take());
-    }
-    Ok(response)
-}
-fn has_all_ratings(profile: &Value, selected: &[String]) -> bool {
-    profile
-        .get("_aContentRatings")
-        .and_then(Value::as_object)
-        .is_some_and(|ratings| selected.iter().all(|rating| ratings.contains_key(rating)))
+fn tags(value: &Value) -> Vec<String> {
+    value
+        .get("_aTags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tag| {
+            let value = optional_string(tag, "_sValue")?;
+            let value = value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            let title = optional_string(tag, "_sTitle")
+                .map(|title| title.trim().to_owned())
+                .filter(|title| !title.is_empty());
+            Some(title.map_or_else(|| value.to_owned(), |title| format!("{title}: {value}")))
+        })
+        .collect()
 }
 
 pub(super) fn details(client: &Client, id: &RemoteMod) -> Result<ModDetails> {
@@ -442,6 +260,7 @@ pub(super) fn details(client: &Client, id: &RemoteMod) -> Result<ModDetails> {
         version,
         author: author(value),
         category: category(value),
+        tags: tags(value),
         updated_at,
         created_at,
         url: optional_string(value, "_sProfileUrl").or_else(|| Some(format!("{WEB}{}", id.id))),
@@ -663,104 +482,42 @@ fn collect_categories(item: &Value, parent: Option<&str>, output: &mut Vec<Categ
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Cursor, collect_categories, content_rating, has_all_ratings, pack_page, parse_file,
-        preview_images, requirements,
-    };
     use serde_json::json;
 
+    use crate::sources::ProviderFilters;
+
+    use super::{
+        Maturity, SearchQuery, collect_categories, content_rating, parse_file, preview_images,
+        requirements, search, tags,
+    };
+
     #[test]
-    fn filtered_page_packs_matches_across_source_pages_without_losing_lookahead() {
-        use super::{RemoteMod, SearchResult, Source};
-        let items = |range: std::ops::RangeInclusive<u64>| {
-            range
-                .map(|id| SearchResult {
-                    id: RemoteMod {
-                        id,
-                        source: Source::GameBanana,
-                        game: "19567".into(),
-                    },
-                    name: id.to_string(),
-                    author: None,
-                    category: None,
-                    summary: None,
-                    image: None,
-                    version: None,
-                    updated_at: None,
-                    published_at: None,
-                    url: None,
-                    downloads: None,
-                    endorsements: None,
-                    likes: None,
-                    adult: Some(true),
-                })
-                .collect()
+    fn rejects_unsupported_maturity_and_unrated_combinations() {
+        let client = reqwest::blocking::Client::new();
+        let query = SearchQuery {
+            maturity: Maturity::Safe,
+            ..SearchQuery::default()
         };
-        let first = pack_page(
-            1,
-            Cursor {
-                source_page: 1,
-                ..Cursor::default()
+        assert!(search(&client, "19567", &query).is_err());
+        let query = SearchQuery {
+            maturity: Maturity::All,
+            filters: ProviderFilters {
+                content_ratings: vec!["-".into(), "nu".into()],
+                ..ProviderFilters::default()
             },
-            |p| {
-                Ok(if p == 1 {
-                    (items(1..=7), Some(2))
-                } else {
-                    (items(8..=17), Some(3))
-                })
-            },
-        )
-        .unwrap();
-        assert_eq!(first.result.items.len(), 15);
-        assert!(first.result.has_more);
-        let last = pack_page(2, first.next.unwrap(), |p| {
-            assert_eq!(p, 3);
-            Ok((items(18..=20), None))
-        })
-        .unwrap();
-        assert_eq!(
-            last.result
-                .items
-                .iter()
-                .map(|item| item.id.id)
-                .collect::<Vec<_>>(),
-            [16, 17, 18, 19, 20]
-        );
-        assert_eq!(last.result.total_pages, Some(2));
-        assert_eq!(last.result.total, Some(20));
-        assert!(!last.result.has_more);
+            ..SearchQuery::default()
+        };
+        assert!(search(&client, "19567", &query).is_err());
     }
 
     #[test]
-    fn distinguishes_mature_unrated_and_unknown_submissions() {
+    fn content_rating_uses_only_the_explicit_nsfw_flag() {
+        assert_eq!(content_rating(&json!({"_bIsNsfw": true})), Some(true));
+        assert_eq!(content_rating(&json!({"_bIsNsfw": false})), Some(false));
         assert_eq!(
-            content_rating(&json!({"_bHasContentRatings": false})),
-            Some(false)
-        );
-        assert_eq!(
-            content_rating(&json!({"_aContentRatings": {"ps": "Flashing lights"}})),
-            Some(false)
-        );
-        assert_eq!(
-            content_rating(&json!({"_aContentRatings": {"nu": "Full nudity"}})),
-            Some(true)
-        );
-        assert_eq!(
-            content_rating(&json!({"_aContentRatings": {"rp": "Pending"}})),
+            content_rating(&json!({"_aContentRatings": {"nu": "Full Nudity"}})),
             None
         );
-        assert_eq!(content_rating(&json!({"_bHasContentRatings": true})), None);
-    }
-
-    #[test]
-    fn rating_multi_select_uses_all_selected_profile_codes() {
-        let profile = json!({"_aContentRatings": {"iv": "Flashing lights", "nu": "Nudity"}});
-        assert!(has_all_ratings(&profile, &["iv".into(), "nu".into()]));
-        assert!(!has_all_ratings(&profile, &["iv".into(), "cp".into()]));
-        assert!(!has_all_ratings(
-            &json!({"_bHasContentRatings": true}),
-            &["iv".into()]
-        ));
     }
 
     #[test]
@@ -795,6 +552,19 @@ mod tests {
         assert_eq!(categories[2].icon, None);
     }
 
+    #[test]
+    fn gamebanana_tags_use_published_tag_values_and_ignore_missing_values() {
+        assert_eq!(
+            tags(&json!({"_aTags": [
+                {"_sTitle": "Character", "_sValue": "Mario"},
+                {"_sTitle": "Genre", "_sValue": "Platformer"},
+                {"_sTitle": "Empty", "_sValue": ""},
+                {"_sTitle": "Missing"}
+            ]})),
+            ["Character: Mario", "Genre: Platformer"]
+        );
+        assert!(tags(&json!({})).is_empty());
+    }
     #[test]
     fn decodes_gamebanana_file_metadata_and_previews() {
         let file = parse_file(&json!({

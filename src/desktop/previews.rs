@@ -1,5 +1,8 @@
+mod disk;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Read};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -15,6 +18,7 @@ use rune::{El, Pixels, SurfaceFit, Waker, el};
 use url::Url;
 
 use super::muted;
+use disk::ThumbnailCache;
 
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 const WORKERS: usize = 3;
@@ -42,7 +46,7 @@ type ImageKey = (String, Size);
 
 #[derive(Default)]
 struct Queue {
-    jobs: VecDeque<ImageKey>,
+    jobs: VecDeque<(ImageKey, bool)>,
     outstanding: HashSet<ImageKey>,
     closed: bool,
 }
@@ -116,7 +120,7 @@ impl Previews {
         }
     }
 
-    pub(super) fn start(wake: Waker) -> Result<Self> {
+    pub(super) fn start(state_dir: &Path, wake: Waker) -> Result<Self> {
         let dispatch = Arc::new(Dispatch::default());
         let (results, responses) = mpsc::channel();
         let client = Client::builder()
@@ -143,11 +147,13 @@ impl Previews {
             let results = results.clone();
             let wake = wake.clone();
             let client = client.clone();
+            let state_dir = state_dir.to_owned();
             thread::Builder::new()
                 .name(format!("dmm-previews-{worker}"))
                 .spawn(move || {
+                    let cache = ThumbnailCache::open(&state_dir).ok();
                     loop {
-                        let key = {
+                        let (key, saved) = {
                             let queue = dispatch.queue.lock().unwrap();
                             let mut queue = dispatch
                                 .ready
@@ -158,7 +164,7 @@ impl Previews {
                             }
                             queue.jobs.pop_front().expect("ready image job")
                         };
-                        let image = load(&client, &key.0, key.1).ok();
+                        let image = load(&client, cache.as_ref(), &key.0, key.1, saved).ok();
                         if results.send(Preview { key, image }).is_err() {
                             return;
                         }
@@ -170,10 +176,22 @@ impl Previews {
     }
 
     pub(super) fn show<'a>(&mut self, urls: impl IntoIterator<Item = (&'a str, Size)>) {
+        self.show_with_policy(urls, false);
+    }
+
+    pub(super) fn show_saved<'a>(&mut self, urls: impl IntoIterator<Item = (&'a str, Size)>) {
+        self.show_with_policy(urls, true);
+    }
+
+    fn show_with_policy<'a>(
+        &mut self,
+        urls: impl IntoIterator<Item = (&'a str, Size)>,
+        saved: bool,
+    ) {
         let now = Instant::now();
         let mut queue = self.dispatch.queue.lock().unwrap();
         // Replace unstarted jobs in priority order; never duplicate running requests.
-        while let Some(key) = queue.jobs.pop_front() {
+        while let Some((key, _)) = queue.jobs.pop_front() {
             queue.outstanding.remove(&key);
         }
         let old = std::mem::take(&mut self.wanted);
@@ -192,7 +210,7 @@ impl Previews {
                 continue;
             }
             if queue.outstanding.insert(key.clone()) {
-                queue.jobs.push_back(key);
+                queue.jobs.push_back((key.clone(), saved));
             }
         }
         let ready = !queue.jobs.is_empty();
@@ -361,9 +379,21 @@ fn freshness(headers: &HeaderMap) -> Duration {
     Duration::from_secs(seconds.saturating_sub(age))
 }
 
-fn load(client: &Client, url: &str, size: Size) -> Result<Decoded> {
-    let url = Url::parse(url)?;
+fn load(
+    client: &Client,
+    cache: Option<&ThumbnailCache>,
+    raw_url: &str,
+    size: Size,
+    saved: bool,
+) -> Result<Decoded> {
+    let url = Url::parse(raw_url)?;
     ensure!(image_host(&url), "image not hosted by a mod provider");
+    let cache = cache.filter(|_| matches!(size, Size::Card | Size::Thumbnail));
+    if let Some((bytes, ttl)) = cache.and_then(|cache| cache.get(raw_url, saved))
+        && let Ok(decoded) = decode(bytes, size, ttl, None)
+    {
+        return Ok(decoded);
+    }
     let response = client.get(url).send()?.error_for_status()?;
     let ttl = freshness(response.headers());
     ensure!(
@@ -373,13 +403,31 @@ fn load(client: &Client, url: &str, size: Size) -> Result<Decoded> {
     let mut bytes = Vec::new();
     response.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= MAX_BYTES, "image too large");
+    decode(bytes, size, ttl, cache.map(|cache| (cache, raw_url)))
+}
+
+fn decode(
+    bytes: Vec<u8>,
+    size: Size,
+    ttl: Duration,
+    cache: Option<(&ThumbnailCache, &str)>,
+) -> Result<Decoded> {
     let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = Limits::default();
     limits.max_image_width = Some(4096);
     limits.max_image_height = Some(4096);
     limits.max_alloc = Some(96 * 1024 * 1024);
     reader.limits(limits);
-    let decoded = reader.decode()?;
+    let mut decoded = reader.decode()?;
+    if let Some((cache, url)) = cache.filter(|_| !ttl.is_zero()) {
+        let edge = Size::Card.edge();
+        if decoded.width().max(decoded.height()) > edge {
+            decoded = decoded.thumbnail(edge, edge);
+        }
+        let rgba = decoded.into_rgba8();
+        let _ = cache.put(url, &rgba, ttl);
+        decoded = image::DynamicImage::ImageRgba8(rgba);
+    }
     let edge = size.edge();
     let rgba = if decoded.width().max(decoded.height()) > edge {
         decoded.thumbnail(edge, edge).into_rgba8()
