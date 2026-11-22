@@ -154,6 +154,10 @@ fn remote_bundle_plans_each_archive_and_records_offline_metadata() -> Result<()>
         &details,
         InstallOptions::default(),
     )?;
+    let downloaded_at = library
+        .managed_mod("game", "bundle")?
+        .downloaded_at_ms()
+        .context("remote bundle is missing its download date")?;
 
     assert_eq!(fs::read(root.join("archive/pc/mod/base.archive"))?, b"base");
     assert_eq!(fs::read(root.join("r6/tweaks/patch.yaml"))?, b"patch");
@@ -180,6 +184,7 @@ fn remote_bundle_plans_each_archive_and_records_offline_metadata() -> Result<()>
     assert_eq!(library.remote_slug("game", &id)?.as_deref(), Some("bundle"));
     let installed = library.managed_mod("game", "bundle")?;
     assert_eq!(installed.versions.len(), 1);
+    assert_eq!(installed.downloaded_at_ms(), Some(downloaded_at));
     assert_eq!(
         installed
             .releases()

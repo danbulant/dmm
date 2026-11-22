@@ -1,5 +1,6 @@
 mod import;
 
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -46,10 +47,29 @@ const SITES: [(Option<Source>, &str); 4] = [
     (Some(Source::Local), "Local files"),
 ];
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum LocalSort {
+    #[default]
+    Name,
+    Size,
+    State,
+    DownloadDate,
+}
+
+impl LocalSort {
+    const OPTIONS: [(Self, &'static str); 4] = [
+        (Self::Name, "Name (A–Z)"),
+        (Self::Size, "Size (largest)"),
+        (Self::State, "Mod state"),
+        (Self::DownloadDate, "Download date"),
+    ];
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FilterMenu {
     Status,
     Site,
+    Sort,
     Tag,
     Category,
     Character,
@@ -69,6 +89,7 @@ pub(super) struct LocalForm {
     group_filter: Option<String>,
     site_filter: Option<Source>,
     status: Status,
+    sort: LocalSort,
     filter_menu: Option<FilterMenu>,
     page: usize,
     preview: Option<LocalPreview>,
@@ -91,6 +112,7 @@ impl Default for LocalForm {
             group_filter: None,
             site_filter: None,
             status: Status::Any,
+            sort: LocalSort::default(),
             filter_menu: None,
             page: 0,
             preview: None,
@@ -227,7 +249,8 @@ pub(super) fn local_mods(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> E
             .child(record_filter_menu(s, k, layer, FilterMenu::Tag))
             .child(record_filter_menu(s, k, layer, FilterMenu::Category))
             .child(record_filter_menu(s, k, layer, FilterMenu::Character))
-            .child(record_filter_menu(s, k, layer, FilterMenu::Group)),
+            .child(record_filter_menu(s, k, layer, FilterMenu::Group))
+            .child(filter_menu(s, k, layer, FilterMenu::Sort)),
     );
     let entries = entries(&s.local, &s.snapshot, s.available_sources(), &s.queue);
     let pages = entries.len().div_ceil(PAGE_SIZE);
@@ -236,7 +259,9 @@ pub(super) fn local_mods(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> E
     for entry in entries.into_iter().skip(page * PAGE_SIZE).take(PAGE_SIZE) {
         grid = grid.child(match entry {
             Entry::Installed(instance, record) => installed_card(s, t, k, instance, record),
-            Entry::Remote { id, name, image } => remote_card(s, t, k, id, name, image),
+            Entry::Remote {
+                id, name, image, ..
+            } => remote_card(s, t, k, id, name, image),
         });
     }
     if pages == 0 {
@@ -311,6 +336,15 @@ fn filter_menu(s: &State, k: &Kit, layer: &mut Vec<El>, menu: FilterMenu) -> El 
                 .find(|(source, _)| *source == s.local.site_filter)
                 .map(|(_, label)| *label),
         ),
+        FilterMenu::Sort => (
+            "local-sort",
+            "Sort local mods",
+            LocalSort::OPTIONS.map(|(_, label)| label),
+            LocalSort::OPTIONS
+                .iter()
+                .find(|(sort, _)| *sort == s.local.sort)
+                .map(|(_, label)| *label),
+        ),
         FilterMenu::Tag | FilterMenu::Category | FilterMenu::Character | FilterMenu::Group => {
             unreachable!("record filters use record_filter_menu")
         }
@@ -326,7 +360,7 @@ fn filter_menu(s: &State, k: &Kit, layer: &mut Vec<El>, menu: FilterMenu) -> El 
             s.local.filter_menu = (s.local.filter_menu != Some(menu)).then_some(menu)
         })
         .on_close(|s: &mut State| s.local.filter_menu = None)
-        .on_choose(move |s: &mut State, chosen, _| {
+        .on_choose(move |s: &mut State, chosen, tx| {
             s.local.filter_menu = None;
             match menu {
                 FilterMenu::Status => {
@@ -340,6 +374,16 @@ fn filter_menu(s: &State, k: &Kit, layer: &mut Vec<El>, menu: FilterMenu) -> El 
                     if let Some((source, _)) = SITES.iter().find(|(_, label)| *label == chosen) {
                         s.local.site_filter = *source;
                     }
+                }
+                FilterMenu::Sort => {
+                    if let Some((sort, _)) = LocalSort::OPTIONS
+                        .iter()
+                        .find(|(_, label)| *label == chosen)
+                    {
+                        s.local.sort = *sort;
+                        set_page(s, 0, tx);
+                    }
+                    return;
                 }
                 FilterMenu::Tag
                 | FilterMenu::Category
@@ -378,7 +422,7 @@ fn record_filter_menu(s: &State, k: &Kit, layer: &mut Vec<El>, menu: FilterMenu)
             "Any group",
             s.local.group_filter.as_deref(),
         ),
-        FilterMenu::Status | FilterMenu::Site => unreachable!(),
+        FilterMenu::Status | FilterMenu::Site | FilterMenu::Sort => unreachable!(),
     };
     let mut values = BTreeSet::new();
     for record in &s.snapshot.mods {
@@ -417,7 +461,7 @@ fn record_filter_menu(s: &State, k: &Kit, layer: &mut Vec<El>, menu: FilterMenu)
                     values.insert(group.clone());
                 }
             }
-            FilterMenu::Character | FilterMenu::Status | FilterMenu::Site => {}
+            FilterMenu::Character | FilterMenu::Status | FilterMenu::Site | FilterMenu::Sort => {}
         }
     }
     let mut options = vec![any.to_owned()];
@@ -440,7 +484,7 @@ fn record_filter_menu(s: &State, k: &Kit, layer: &mut Vec<El>, menu: FilterMenu)
                 FilterMenu::Category => s.local.category_filter = value,
                 FilterMenu::Character => s.local.character_filter = value,
                 FilterMenu::Group => s.local.group_filter = value,
-                FilterMenu::Status | FilterMenu::Site => unreachable!(),
+                FilterMenu::Status | FilterMenu::Site | FilterMenu::Sort => unreachable!(),
             }
             s.local.filter_menu = None;
             refresh_filters(s);
@@ -455,7 +499,48 @@ enum Entry<'a> {
         id: &'a RemoteMod,
         name: &'a str,
         image: Option<&'a str>,
+        queued: bool,
     },
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum EntryState {
+    Enabled,
+    Disabled,
+    Queued,
+    Bookmarked,
+}
+
+impl Entry<'_> {
+    fn name(&self) -> &str {
+        match self {
+            Self::Installed(_, record) => installed_title(record),
+            Self::Remote { name, .. } => name,
+        }
+    }
+
+    fn state(&self) -> EntryState {
+        match self {
+            Self::Installed(_, record) if record.enabled => EntryState::Enabled,
+            Self::Installed(..) => EntryState::Disabled,
+            Self::Remote { queued: true, .. } => EntryState::Queued,
+            Self::Remote { queued: false, .. } => EntryState::Bookmarked,
+        }
+    }
+
+    fn size(&self) -> Option<u64> {
+        match self {
+            Self::Installed(_, record) => record.installed_size,
+            Self::Remote { .. } => None,
+        }
+    }
+
+    fn downloaded_at(&self) -> Option<u64> {
+        match self {
+            Self::Installed(_, record) => record.downloaded_at_ms(),
+            Self::Remote { .. } => None,
+        }
+    }
 }
 
 fn entries<'a>(
@@ -493,6 +578,7 @@ fn entries<'a>(
                     id: item.id,
                     name: item.name,
                     image: item.image,
+                    queued: true,
                 }),
         );
     }
@@ -575,10 +661,28 @@ fn entries<'a>(
                     id: &item.item,
                     name: &item.name,
                     image: item.image.as_deref(),
+                    queued: false,
                 }),
         );
     }
+    sort_entries(&mut entries, form.sort);
     entries
+}
+
+fn sort_entries(entries: &mut [Entry<'_>], sort: LocalSort) {
+    match sort {
+        LocalSort::Name => entries.sort_by_cached_key(|entry| entry.name().to_lowercase()),
+        LocalSort::Size => {
+            entries
+                .sort_by_cached_key(|entry| (Reverse(entry.size()), entry.name().to_lowercase()));
+        }
+        LocalSort::State => {
+            entries.sort_by_cached_key(|entry| (entry.state(), entry.name().to_lowercase()));
+        }
+        LocalSort::DownloadDate => entries.sort_by_cached_key(|entry| {
+            (Reverse(entry.downloaded_at()), entry.name().to_lowercase())
+        }),
+    }
 }
 
 fn contains(value: &str, query: &str) -> bool {

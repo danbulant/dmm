@@ -8,6 +8,8 @@ use rune::{Env, Runtime};
 #[cfg(target_os = "linux")]
 use rune::{Key, KeyEvent, Mods};
 
+use dmm::library::{InstallOptions, Release};
+
 use super::*;
 
 #[test]
@@ -463,6 +465,91 @@ fn xxmi_setup_blocks_navigation_and_escape_until_the_worker_finishes() {
     runtime.pointer_up(x, y);
     runtime.frame(0.1);
     assert!(runtime.state.setup.steam_dialog.is_none());
+}
+
+#[test]
+fn local_sort_reorders_cards_with_unknown_sizes_and_dates_last() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state_dir = dir.path().join("state");
+    let game = dir.path().join("game");
+    std::fs::create_dir(&game)?;
+    let mut library = Library::open(&state_dir)?;
+    library.register("cp", GameKind::Cyberpunk, &game, None)?;
+    let id = RemoteMod {
+        source: Source::Nexus,
+        game: "cyberpunk2077".into(),
+        id: 10,
+    };
+    for (slug, size, enabled) in [
+        ("amber", 6, false),
+        ("middle", 1, false),
+        ("zebra", 3, true),
+    ] {
+        let input = dir.path().join(slug);
+        std::fs::create_dir(&input)?;
+        std::fs::write(input.join(format!("{slug}.archive")), vec![0; size])?;
+        let release = (slug == "middle").then(|| Release {
+            id: id.clone(),
+            source_url: None,
+            file_id: 20,
+            filename: slug.into(),
+            version: None,
+            updated_at: None,
+        });
+        library.install(
+            "cp",
+            slug,
+            &input,
+            release,
+            InstallOptions {
+                keep_disabled: !enabled,
+                ..Default::default()
+            },
+        )?;
+    }
+    let bookmark = RemoteMod { id: 11, ..id };
+    library.save_favorite(&bookmark, "A bookmark", None)?;
+    let mut state = State::new(state_dir);
+    state.screen = Screen::Local;
+    state.snapshot = Snapshot::load(&library, Some("cp"))?;
+    assert_eq!(library.managed_mod("cp", "amber")?.downloaded_at_ms(), None);
+    let mut runtime = Runtime::new(state, view, (960.0, 620.0), Env::new(true, 1.0));
+    runtime.frame(0.0);
+
+    let amber = "installed-card-cp-amber";
+    let middle = "installed-card-cp-middle";
+    let zebra = "installed-card-cp-zebra";
+    let saved = "local-remote-nexus-cyberpunk2077-11";
+    let click = |runtime: &mut Runtime<State>, key| {
+        let (x, y) = runtime
+            .find(key)
+            .unwrap_or_else(|| panic!("{key} not found"));
+        runtime.pointer_down(x, y);
+        runtime.pointer_up(x, y);
+        for _ in 0..24 {
+            runtime.frame(1.0 / 60.0);
+        }
+    };
+    for (option, expected) in [
+        (None, [saved, amber, middle, zebra]),
+        (Some("option1"), [amber, zebra, middle, saved]),
+        (Some("option2"), [zebra, amber, middle, saved]),
+        (Some("option3"), [middle, saved, amber, zebra]),
+    ] {
+        if let Some(option) = option {
+            click(&mut runtime, "local-sort-trigger");
+            click(&mut runtime, option);
+        }
+        let positions = expected.map(|key| {
+            let [x, y, ..] = runtime.presented(key).unwrap().0;
+            (y, x)
+        });
+        assert!(
+            positions.windows(2).all(|p| p[0] < p[1]),
+            "{option:?}: {positions:?}"
+        );
+    }
+    Ok(())
 }
 
 #[test]

@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -80,6 +80,8 @@ pub struct Version {
     pub provenance: BTreeMap<String, Release>,
     #[serde(default)]
     pub releases: Vec<Release>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    downloaded_at_ms: Option<u64>,
     files: BTreeMap<String, FileState>,
 }
 
@@ -103,6 +105,11 @@ impl ManagedMod {
     pub fn release(&self) -> Option<&Release> {
         self.versions[self.current].release.as_ref()
     }
+
+    pub fn downloaded_at_ms(&self) -> Option<u64> {
+        self.versions[self.current].downloaded_at_ms
+    }
+
     pub fn releases(&self) -> &[Release] {
         &self.versions[self.current].releases
     }
@@ -117,6 +124,15 @@ impl ManagedMod {
             .iter()
             .map(|(path, state)| (path.as_str(), state.hash.as_str()))
     }
+}
+
+fn now_epoch_ms() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .try_into()
+        .ok()
 }
 
 #[derive(Default)]
@@ -627,6 +643,7 @@ impl Library {
         };
         let version = Version {
             release: Some(primary.clone()),
+            downloaded_at_ms: now_epoch_ms(),
             archive_hash,
             archive_hashes,
             destination: destination.map(Path::to_path_buf),
@@ -779,6 +796,7 @@ impl Library {
         };
         let archive_hashes = archive_hash.iter().cloned().collect();
         Ok(Version {
+            downloaded_at_ms: release.as_ref().and_then(|_| now_epoch_ms()),
             release,
             archive_hashes,
             archive_hash,
