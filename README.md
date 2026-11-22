@@ -4,12 +4,12 @@ DMM is a Rust mod manager for games that load mods from known directories. The R
 
 ## Build
 
-Install a recent Rust toolchain, a native C linker and **system libarchive** (development package on Linux, or the library and linker import library on Windows). On NixOS use `nix develop`. If building the optional Rune feature on Linux, also install the Wayland and xkbcommon development packages.
+Use `nix develop` for the project's Rust toolchain and system libraries. Outside Nix, install Rust, a native linker and libarchive development files (the library plus its import library on Windows). The default Rune build also needs the Wayland and xkbcommon development packages on Linux.
 
 ```sh
-cargo build --locked -j 1
-cargo test --locked -j 1 -- --test-threads=1
-cargo check --locked -j 1 --features rune-ui
+nix develop --command cargo build --locked
+nix develop --command cargo test --locked
+nix develop --command cargo build --locked --no-default-features # CLI only
 ```
 
 Run `./target/debug/dmm --help` to see the CLI. The examples below use `dmm` for that binary. Run from a dedicated working directory or pass `--state /path/to/library` on every invocation. The default is `.dmm` in the current directory. Keep that library separate from your game installations.
@@ -17,8 +17,10 @@ Run `./target/debug/dmm --help` to see the CLI. The examples below use `dmm` for
 ## Desktop app
 
 ```sh
-nix develop --command cargo run --locked --features rune-ui -- gui
+nix develop --command cargo run --locked
 ```
+
+With Rune enabled, run `dmm` (or `dmm --state /path/to/library`) to open the desktop. The explicit `gui` subcommand remains available.
 
 The **Game** dropdown lists games, not installation paths, and remembers the last game you used. **Game setup** merges detected and manually added paths. DMM automatically uses a single valid installation; if there are several, choose the main one with its radio button. The path choice is saved per game. Use **+ Add manually** for paths detection misses. **Launch game** is in the sidebar. For Cyberpunk it opens the copy registered in Steam; the active folder determines where DMM deploys mods.
 
@@ -43,6 +45,13 @@ Select every part of numbered split archives such as `.7z.001` and `.7z.002`. Sp
 New remote installations retain a snapshot of the provider details, which Local mods can open without network access. Dependencies are not installed automatically. Click a screenshot to expand it; use the zoom buttons or Ctrl+wheel and drag to pan. Cached thumbnails can display offline or while a full-size image loads.
 
 Public catalog responses are cached in `source-cache.sqlite3` under `--state` (search: 5 minutes; details: 2 minutes; filters: 1 hour). Preview workers share a pooled HTTP client and use a bounded decoded-image cache and a bounded `thumbnails.sqlite3` disk cache. Uncached images still require network access. Downloads are staged in the library, and Nexus handoff credentials are not saved. Game icons come from [Cyberpunk 2077](https://gamebanana.com/games/8722) and [Zenless Zone Zero](https://gamebanana.com/games/19567); source icons come from [GameBanana](https://gamebanana.com/) and [Nexus Mods](https://graphql.nexusmods.com/).
+
+## Code layout
+
+- `src/games/`: game profiles and the shared planner interface; `cp` owns Cyberpunk behavior and `zzz` owns ZZMI discovery, launch, and Steam Proton setup.
+- `src/archive.rs`, `src/acquisition.rs`, `src/sources/`: archive inspection, remote acquisition, and provider APIs. They don't render UI.
+- `src/library/`: installation manifests, deployment and recovery, and SQLite persistence. Explicit SQL keeps the on-disk schema visible; rusqlite transactions coordinate database writes with deployment recovery.
+- `src/desktop/`: Rune shell, views, shared components, and desktop background workers. `src/main.rs` dispatches commands to the same core.
 
 ## Local files
 

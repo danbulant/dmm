@@ -1,9 +1,10 @@
 use rune::tok::{Theme, type_};
-use rune::{El, col, row, text};
+use rune::{El, ScrollSpec, col, row, text};
 use rune_kit::{Dialog, Kit, Progress};
 
 use super::{Action, Entry, Phase, Transfer};
-use crate::desktop::{Screen, State, browse, button, heading, muted, panel};
+use crate::desktop::components::{button, field, heading, muted, open_page, panel, styled_field};
+use crate::desktop::{Screen, State};
 
 pub(in crate::desktop) fn page(s: &State, t: Theme, k: &Kit) -> El {
     let queue = &s.queue;
@@ -119,7 +120,7 @@ fn entry(s: &State, index: usize, item: &Entry, t: Theme, k: &Kit) -> El {
                 t,
                 false,
                 true,
-                move |s, tx| browse::open_page(s, tx, url.as_str()),
+                move |s, tx| open_page(s, tx, url.as_str()),
             )
         }));
     }
@@ -214,7 +215,7 @@ pub(in crate::desktop) fn overlay(s: &State, t: Theme, k: &Kit, layer: &mut Vec<
             .fit()
             .width(640.0)
             .on_close(|s: &mut State| s.handoff_open = false)
-            .child(browse::handoff(s, t).mx(16.0).mb(16.0))
+            .child(handoff(s, t, k).mx(16.0).mb(16.0))
             .build(k, layer);
     }
 }
@@ -295,4 +296,51 @@ fn bytes(value: u64) -> String {
         }
     }
     unreachable!()
+}
+
+fn handoff(s: &State, t: Theme, k: &Kit) -> El {
+    let enabled = s.snapshot.selected.is_some();
+    let mut links = col().w_full().gap(6.0);
+    for (index, url) in s.snapshot.nexus_pages.iter().enumerate() {
+        let url = url.clone();
+        links = links.child(button(
+            format!("open-handoff-{index}"),
+            format!("Open Nexus file {} ↗", index + 1),
+            t,
+            false,
+            enabled,
+            move |s, tx| open_page(s, tx, url.as_str()),
+        ));
+    }
+    let view = panel(t)
+        .child(muted("On Nexus, click Mod Manager Download for each file, then paste each nxm:// link below.", t).wrap())
+        .children((!s.snapshot.nexus_pages.is_empty()).then(|| {
+            col().w_full().max_h(220.0).scroll(ScrollSpec { stick_bottom: false }).child(links)
+        }));
+    let view = view.children((!s.notice.is_empty()).then(|| muted(&s.notice, t).wrap()));
+    view.child(
+        row()
+            .w_full()
+            .gap(8.0)
+            .child(
+                styled_field(
+                    "nxm-uri",
+                    &s.browser.nxm,
+                    field(&s.browser.nxm, "Paste nxm:// link", |s| &mut s.browser.nxm)
+                        .on_submit(|s: &mut State, _| s.redeem_link()),
+                    k,
+                    t,
+                )
+                .grow(1.0)
+                .shrink(),
+            )
+            .child(button(
+                "receive-nxm",
+                "Receive",
+                t,
+                false,
+                enabled && !s.browser.nxm.text.trim().is_empty(),
+                |s, _| s.redeem_link(),
+            )),
+    )
 }

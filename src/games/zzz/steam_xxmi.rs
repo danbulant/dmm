@@ -15,10 +15,9 @@ use serde::Deserialize;
 use tempfile::Builder;
 use url::Url;
 
-use super::LaunchCommand;
+use super::{LaunchCommand, STEAM_APP_ID as APP_ID};
 use crate::archive;
 
-const APP_ID: u32 = 4_162_040;
 const FLATPAK_ID: &str = "com.github.Matoking.protontricks";
 const RELEASE: &str = "https://api.github.com/repos/SpectrumQT/XXMI-Launcher/releases/latest";
 const RELEASE_DOWNLOAD: &str = "https://github.com/SpectrumQT/XXMI-Launcher/releases/download/";

@@ -2,14 +2,13 @@
 mod desktop;
 mod remote;
 
-use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use dmm::games::{GameKind, detect, launch_profile};
+use dmm::games::{GameKind, cp, detect, launch_profile};
 use dmm::library::{InstallOptions, Library};
 use dmm::sources::{RemoteMod, Source};
 use serde::Serialize;
@@ -18,12 +17,17 @@ use serde_json::json;
 use remote::{Browse, Identity, RemoteInstall};
 
 #[derive(Parser)]
-#[command(version, about = "Folder-based mod manager prototype")]
+#[command(
+    version,
+    about = "Folder-based mod manager prototype",
+    subcommand_required = !cfg!(feature = "rune-ui"),
+    arg_required_else_help = !cfg!(feature = "rune-ui")
+)]
 struct Cli {
     #[arg(long, global = true, default_value = ".dmm")]
     state: PathBuf,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -166,16 +170,18 @@ fn main() -> Result<()> {
     let Cli { state, command } = Cli::parse();
     match command {
         #[cfg(feature = "rune-ui")]
-        Command::Gui => {
+        None | Some(Command::Gui) => {
             desktop::run(state);
             Ok(())
         }
-        Command::Detect { kind } => print(&detect(kind)?),
-        Command::Categories { source, game } => {
+        Some(Command::Detect { kind }) => print(&detect(kind)?),
+        Some(Command::Categories { source, game }) => {
             print(&remote::client()?.categories(source, &game)?)
         }
-        Command::Details(identity) => print(&remote::client()?.details(&identity.into())?),
-        command => with_library(&state, command),
+        Some(Command::Details(identity)) => print(&remote::client()?.details(&identity.into())?),
+        Some(command) => with_library(&state, command),
+        #[cfg(not(feature = "rune-ui"))]
+        None => unreachable!("Clap requires a subcommand in CLI-only builds"),
     }
 }
 
@@ -245,12 +251,7 @@ fn with_library(state: &Path, command: Command) -> Result<()> {
             print(&json!({
                 "root": instance.root,
                 "exists": instance.root.is_dir(),
-                "cyberpunk_proton": (instance.kind == GameKind::Cyberpunk && cfg!(target_os = "linux")).then(|| json!({
-                    "red4ext_directory": instance.root.join("red4ext").is_dir(),
-                    "cet_directory": instance.root.join("bin/x64/plugins/cyber_engine_tweaks").is_dir(),
-                    "wine_dll_overrides": env::var("WINEDLLOVERRIDES").ok(),
-                    "note": "Shell overrides do not reflect Steam launch options. Consult each framework's Wine/Proton setup instructions. DMM does not change these settings."
-                })),
+                "cyberpunk_proton": (instance.kind == GameKind::Cyberpunk).then(|| cp::proton_diagnostics(&instance.root)).flatten(),
             }))
         }
         Command::Search(search) => {
@@ -287,4 +288,38 @@ fn print<T: Serialize>(value: &T) -> Result<()> {
     value.serialize(&mut json).context("writing JSON output")?;
     writeln!(json.into_inner())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "rune-ui")]
+    #[test]
+    fn the_desktop_accepts_no_subcommand_and_an_optional_state_directory() {
+        assert!(Cli::try_parse_from(["dmm"]).unwrap().command.is_none());
+        let app = Cli::try_parse_from(["dmm", "--state", "other-library"]).unwrap();
+        assert!(app.command.is_none());
+        assert_eq!(app.state, PathBuf::from("other-library"));
+        assert!(matches!(
+            Cli::try_parse_from(["dmm", "gui"]).unwrap().command,
+            Some(Command::Gui)
+        ));
+    }
+
+    #[cfg(not(feature = "rune-ui"))]
+    #[test]
+    fn the_cli_only_build_requires_a_command_and_displays_help() {
+        let Err(error) = Cli::try_parse_from(["dmm"]) else {
+            panic!("a CLI-only build must not accept an absent command");
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        assert!(matches!(
+            Cli::try_parse_from(["dmm", "games"]).unwrap().command,
+            Some(Command::Games)
+        ));
+    }
 }

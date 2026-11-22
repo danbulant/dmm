@@ -5,16 +5,17 @@ use std::path::PathBuf;
 use anyhow::Result;
 use rune::tok::Theme;
 use rune::{El, SurfaceFit, TextEdit, Tx, col, row};
-use rune_kit::{Dialog, Kit, Placement, Select, SelectAppearance, Switch, TextInput};
+use rune_kit::{Dialog, Kit, Placement, Select, SelectAppearance, Switch};
 
 use dmm::games::GameKind;
 use dmm::library::{Inspection, Library, ManagedMod, SavedFavorite};
 use dmm::sources::Source;
 
-use super::{
-    Origin, Screen, Size, Snapshot, State, Update, browse, button, heading, muted, open_library,
-    panel,
+use super::components::{
+    button, card_title, field, heading, mod_card, muted, open_page, panel, preview, source_name,
+    styled_field,
 };
+use super::{Origin, Screen, Size, Snapshot, State, Update, open_library};
 
 const PAGE_SIZE: usize = 24;
 
@@ -200,22 +201,16 @@ pub(super) fn local_mods(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> E
                 )),
         );
     }
-    content = content.child(
-        super::inputs::field(
-            TextInput::new(&s.local.search)
-                .placeholder("Search installed and saved mods…")
-                .height(36.0)
-                .width(None)
-                .on_edit(|s: &mut State| &mut s.local.search)
-                .on_change(|s, _| refresh_filters(s))
-                .build(k),
-            &s.local.search,
-            k,
-            t,
-        )
-        .key("local-search")
-        .w_full(),
-    );
+    content = content.child(styled_field(
+        "local-search",
+        &s.local.search,
+        field(&s.local.search, "Search installed and saved mods…", |s| {
+            &mut s.local.search
+        })
+        .on_change(|s, _| refresh_filters(s)),
+        k,
+        t,
+    ));
     content = content.child(
         row()
             .w_full()
@@ -253,20 +248,16 @@ pub(super) fn local_mods(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> E
                 ]
                 .into_iter()
                 .map(|(key, label, edit, access)| {
-                    super::inputs::field(
-                        TextInput::new(edit)
-                            .label(label)
-                            .placeholder(label)
+                    styled_field(
+                        key,
+                        edit,
+                        field(edit, label, access)
                             .height(32.0)
                             .width(Some(130.0))
-                            .on_edit(access)
-                            .on_change(|s, _| refresh_filters(s))
-                            .build(k),
-                        edit,
+                            .on_change(|s, _| refresh_filters(s)),
                         k,
                         t,
                     )
-                    .key(key)
                 }),
             ),
     );
@@ -276,7 +267,7 @@ pub(super) fn local_mods(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> E
     let mut grid = row().w_full().flex_wrap().gaps(12.0, 12.0);
     for entry in entries.into_iter().skip(page * PAGE_SIZE).take(PAGE_SIZE) {
         grid = grid.child(match entry {
-            Entry::Installed(instance, record) => mod_card(s, t, k, instance, record),
+            Entry::Installed(instance, record) => installed_card(s, t, k, instance, record),
             Entry::Saved(bookmark) => saved_card(s, t, bookmark),
         });
     }
@@ -517,16 +508,10 @@ fn saved_card(s: &State, t: Theme, bookmark: &SavedFavorite) -> El {
     let detail_id = id.clone();
     let install_id = id.clone();
     let saved_id = id.clone();
-    col()
+    mod_card(t)
         .key(format!("saved-card-{key}"))
-        .w(248.0)
-        .padding(9.0)
-        .gap(7.0)
-        .radius(12.0)
-        .fill(t.card)
-        .border(1.0, t.card_border)
-        .child(super::browse::preview(s, image, 112.0, SurfaceFit::Fill, t))
-        .child(heading(&bookmark.name, t).truncate().help(&bookmark.name))
+        .child(preview(s, image, 112.0, SurfaceFit::Fill, t))
+        .child(card_title(&bookmark.name, t))
         .child(muted(format!("Saved · {} · {}", id.source, id.game), t).truncate())
         .child(
             row()
@@ -559,24 +544,18 @@ fn saved_card(s: &State, t: Theme, bookmark: &SavedFavorite) -> El {
         )
 }
 
-fn mod_card(s: &State, t: Theme, k: &Kit, instance: &str, managed: &ManagedMod) -> El {
+fn installed_card(s: &State, t: Theme, k: &Kit, instance: &str, managed: &ManagedMod) -> El {
     let slug = managed.slug.as_str();
     let details = managed.details();
     let release = managed.release();
     let name = installed_title(managed);
     let image = installed_image(managed);
     let source = record_source(managed);
-    let mut card = col()
+    let mut card = mod_card(t)
         .key(format!("installed-card-{instance}-{slug}"))
-        .w(248.0)
-        .padding(9.0)
-        .gap(7.0)
-        .radius(12.0)
-        .fill(t.card)
-        .border(1.0, t.card_border)
-        .child(super::browse::preview(s, image, 112.0, SurfaceFit::Fill, t))
-        .child(heading(name, t).truncate().help(name))
-        .child(muted(browse::source_name(source), t).truncate());
+        .child(preview(s, image, 112.0, SurfaceFit::Fill, t))
+        .child(card_title(name, t))
+        .child(muted(source_name(source), t).truncate());
     if let Some(category) = details.and_then(|details| details.category.as_deref()) {
         card = card.child(muted(category, t).truncate());
     } else if let Some(release) = release {
@@ -682,7 +661,7 @@ pub(super) fn installed_actions(s: &State, t: Theme, instance: &str, managed: &M
             t,
             false,
             true,
-            move |state, tx| browse::open_page(state, tx, &url),
+            move |state, tx| open_page(state, tx, &url),
         ));
     }
     if let Some(release) = managed.release() {

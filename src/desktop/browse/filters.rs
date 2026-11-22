@@ -3,10 +3,11 @@ use std::collections::{HashMap, HashSet};
 use dmm::sources::{Category, FilterCatalog, Maturity, Sort, Source, TimeWindow};
 use rune::tok::Theme;
 use rune::{El, ScrollSpec, col, row};
-use rune_kit::{Checkbox, Kit, Placement, SegmentedControl, Select, SelectAppearance, TextInput};
+use rune_kit::{Checkbox, Kit, Placement, SegmentedControl, Select, SelectAppearance};
 
-use super::{Catalog, State, button, muted, nonempty, panel, search_field, sort_name};
-use crate::desktop::inputs;
+use super::explore::{search_field, sort_name};
+use super::{Catalog, State, nonempty};
+use crate::desktop::components::{button, field, muted, panel, styled_field};
 
 const SORTS: [Sort; 4] = [
     Sort::Relevance,
@@ -350,24 +351,24 @@ fn categories(s: &State, catalog: &FilterCatalog, t: Theme, k: &Kit) -> El {
         .collect();
     let group = b.category_group.as_deref();
     let query = b.find_category.text.trim().to_lowercase();
-    let region = col().gap(8.0).child(muted("Categories", t)).child(
-        inputs::field(
-            TextInput::new(&b.find_category)
-                .placeholder("Find a category, character or Bangboo…")
-                .width(None)
-                .height(34.0)
-                .on_edit(|s: &mut State| &mut s.browser.find_category)
-                .on_change(|s: &mut State, tx| {
-                    s.sync_previews();
-                    tx.scroll_to_instant("category-scroll", 0.0, 0.0);
-                })
-                .build(k),
+    let region = col()
+        .gap(8.0)
+        .child(muted("Categories", t))
+        .child(styled_field(
+            "category-find",
             &b.find_category,
+            field(
+                &b.find_category,
+                "Find a category, character or Bangboo…",
+                |s| &mut s.browser.find_category,
+            )
+            .on_change(|s: &mut State, tx| {
+                s.sync_previews();
+                tx.scroll_to_instant("category-scroll", 0.0, 0.0);
+            }),
             k,
             t,
-        )
-        .key("category-find"),
-    );
+        ));
     let selected_path = b.category.as_deref().and_then(|id| by_id.get(id)).copied();
     let (trail, selected_trail) = if let Some(category) = selected_path {
         let mut trail = vec![category];

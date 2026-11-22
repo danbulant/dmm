@@ -17,7 +17,7 @@ use rune::tok::Theme;
 use rune::{El, Pixels, SurfaceFit, Waker, el};
 use url::Url;
 
-use super::muted;
+use super::components::muted;
 use disk::ThumbnailCache;
 
 const MAX_BYTES: u64 = 8 * 1024 * 1024;

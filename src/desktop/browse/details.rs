@@ -4,8 +4,11 @@ use rune::tok::{Theme, type_};
 use rune::{El, Icon, ScrollSpec, SurfaceFit, col, el, row, text};
 use rune_kit::{Checkbox, Dialog, ImageZoom, Kit, Preview};
 
-use super::{Detail, Screen, State, button, field, muted, open_page, page_url, panel, source_name};
-use crate::desktop::{Size, source_icon};
+use super::{Detail, Screen, State};
+use crate::desktop::Size;
+use crate::desktop::components::{
+    button, form_field, muted, open_page, page_url, panel, source_icon, source_name,
+};
 
 static ZOOM_PLUS: Icon = Icon {
     name: "dmm-zoom-plus",
@@ -591,10 +594,11 @@ fn install_options(s: &State, detail: &Detail, t: Theme, k: &Kit) -> El {
                 .w_full()
                 .gap(5.0)
                 .child(muted("Destination override (optional)", t))
-                .child(field(
+                .child(form_field(
                     "remote-into",
                     "Default: detected game folder layout",
                     &s.browser.install_into,
+                    k,
                     t,
                     |s| &mut s.browser.install_into,
                 )),

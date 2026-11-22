@@ -2,9 +2,10 @@ use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::{sync::mpsc::Receiver, time::Duration};
 
+use dmm::games::GameKind;
 #[cfg(target_os = "linux")]
-use dmm::games::steam_xxmi::{InstallStage, SteamXxmi};
-use dmm::games::{GameKind, is_zzmi_mods};
+use dmm::games::zzz::steam_xxmi::{InstallStage, SteamXxmi};
+use dmm::games::zzz::validate_installation_root;
 use dmm::library::LaunchSettings;
 use rune::tok::Theme;
 use rune::{El, FileDialogOptions, TextEdit, col, row};
@@ -14,8 +15,9 @@ use rune::{Tx, el};
 use rune_kit::{Dialog, Loader};
 use rune_kit::{Kit, RadioGroup, RadioItem};
 
+use super::components::{button, form_field, heading, muted, open_page, panel};
 use super::installations::{self, Installation};
-use super::{Snapshot, State, Update, button, field, game_name, heading, muted, panel};
+use super::{Snapshot, State, Update};
 
 #[derive(Default)]
 pub(super) struct SetupForm {
@@ -62,7 +64,7 @@ impl SetupForm {
 
 pub(super) fn view(s: &State, t: Theme, k: &Kit) -> El {
     let kind = s.game_kind();
-    let title = game_name(kind);
+    let title = kind.display_name();
     let ready = s.busy.is_none();
     let mut body = col().gap(14.0).child(
         row()
@@ -173,7 +175,7 @@ pub(super) fn view(s: &State, t: Theme, k: &Kit) -> El {
             }
             if !any {
                 body = body.child(button("setup:xxmi-guide", "Set up XXMI ↗", t, true, true,
-                    |s, tx| super::browse::open_page(s, tx, "https://github.com/SpectrumQT/XXMI-Launcher#installation")))
+                    |s, tx| open_page(s, tx, "https://github.com/SpectrumQT/XXMI-Launcher#installation")))
                     .child(muted(if cfg!(target_os = "windows") {
                         "Run the official installer, install the Zenless Zone Zero importer in XXMI, then rescan."
                     } else {
@@ -181,7 +183,7 @@ pub(super) fn view(s: &State, t: Theme, k: &Kit) -> El {
                     }, t).wrap());
             }
             if s.snapshot.selected.is_some() {
-                body = body.child(launch_settings(s, t));
+                body = body.child(launch_settings(s, t, k));
                 body = body.child(button(
                     "setup:start-xxmi",
                     "Start XXMI for this installation",
@@ -198,7 +200,7 @@ pub(super) fn view(s: &State, t: Theme, k: &Kit) -> El {
         }
     }
     if s.setup.manual {
-        body = body.child(manual_form(s, t));
+        body = body.child(manual_form(s, t, k));
     }
     body.children(
         s.discovery_notices
@@ -214,7 +216,7 @@ fn steam_setup(s: &State, t: Theme) -> El {
     if s.protontricks.is_none() {
         body = body.child(muted("Install Protontricks, then rescan. DMM uses it to select Steam’s Proton runtime rather than creating a Wine prefix.", t).wrap())
             .child(button("setup:protontricks", "Get Protontricks ↗", t, false, true, |s, tx| {
-                super::browse::open_page(s, tx, "https://github.com/Matoking/protontricks#installation")
+                open_page(s, tx, "https://github.com/Matoking/protontricks#installation")
             }));
     }
     let available = s.busy.is_none() && s.protontricks.is_some();
@@ -349,7 +351,7 @@ fn close_steam_setup_tx(s: &mut State, _: &mut Tx) {
     s.setup.steam_dialog = None;
 }
 
-fn manual_form(s: &State, t: Theme) -> El {
+fn manual_form(s: &State, t: Theme, k: &Kit) -> El {
     let kind = s.game_kind();
     let place = if kind == GameKind::Zzmi {
         "ZZMI Mods folder"
@@ -357,9 +359,9 @@ fn manual_form(s: &State, t: Theme) -> El {
         "Game installation folder"
     };
     panel(t).child(heading("Add installation manually", t))
-        .child(field("setup:name", "Installation label", &s.setup.name, t, |s| &mut s.setup.name))
-        .child(field("setup:root", place, &s.setup.root, t, |s| &mut s.setup.root))
-        .child(field("setup:descriptor", "Optional game profile TOML", &s.setup.descriptor, t, |s| &mut s.setup.descriptor))
+        .child(form_field("setup:name", "Installation label", &s.setup.name, k, t, |s| &mut s.setup.name))
+        .child(form_field("setup:root", place, &s.setup.root, k, t, |s| &mut s.setup.root))
+        .child(form_field("setup:descriptor", "Optional game profile TOML", &s.setup.descriptor, k, t, |s| &mut s.setup.descriptor))
         .child(row().gap(8.0).items_center().flex_wrap()
             .child(button("setup:pick-root", "Choose folder…", t, false, s.busy.is_none(), move |_, tx| {
                 tx.open_folder(FileDialogOptions { title: format!("Choose {place}"), ..Default::default() }, move |s: &mut State, result, _| {
@@ -376,7 +378,7 @@ fn manual_form(s: &State, t: Theme) -> El {
                 move |s, _| register_game(s, kind))))
 }
 
-fn launch_settings(s: &State, t: Theme) -> El {
+fn launch_settings(s: &State, t: Theme, k: &Kit) -> El {
     let mut body = col().gap(8.0).child(
         button(
             "setup:launch-settings",
@@ -397,18 +399,20 @@ fn launch_settings(s: &State, t: Theme) -> El {
     if !s.setup.launch {
         return body;
     }
-    body = body.child(field(
+    body = body.child(form_field(
         "setup:xxmi",
         "XXMI Launcher.exe (blank: detect)",
         &s.setup.xxmi,
+        k,
         t,
         |s| &mut s.setup.xxmi,
     ));
     if cfg!(target_os = "linux") {
-        body = body.child(field(
+        body = body.child(form_field(
             "setup:wine-prefix",
             "WINEPREFIX (blank: detect)",
             &s.setup.wine_prefix,
+            k,
             t,
             |s| &mut s.setup.wine_prefix,
         ));
@@ -449,11 +453,8 @@ fn register_game(s: &mut State, kind: GameKind) {
     };
     s.submit("Adding installation…", move |dir| {
         let root = root.canonicalize()?;
-        if steam_roots.iter().any(|steam| root.starts_with(steam)) {
-            anyhow::ensure!(
-                is_zzmi_mods(&root),
-                "Choose the ZZMI Mods folder, not the Steam game installation."
-            );
+        if kind == GameKind::Zzmi {
+            validate_installation_root(&root, &steam_roots)?;
         }
         let library = super::open_library(&dir)?;
         library.register(&name, kind, &root, descriptor.as_deref())?;

@@ -1,6 +1,9 @@
 use std::rc::Rc;
+use std::sync::mpsc;
 
-use dmm::sources::{ModFile, ModImage, Requirement, SearchResult};
+use dmm::sources::{
+    ModDetails, ModFile, ModImage, Requirement, SearchPage, SearchQuery, SearchResult,
+};
 use rune::{Env, Runtime};
 #[cfg(target_os = "linux")]
 use rune::{Key, KeyEvent, Mods};

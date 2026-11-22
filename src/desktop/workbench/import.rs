@@ -5,25 +5,33 @@ use rune::tok::Theme;
 use rune::{El, FileDialogOptions, TextEdit, Tx, col, row};
 use rune_kit::{Kit, Switch};
 
-use super::{Snapshot, State, Update, button, heading, muted, nonempty_path, panel};
-use crate::desktop::{field, open_library};
+use super::{Snapshot, State, Update, nonempty_path};
+use crate::desktop::components::{button, form_field, heading, muted, panel};
+use crate::desktop::open_library;
 
 pub(super) fn local_import(s: &State, t: Theme, k: &Kit, instance: &str) -> El {
     let mut body = col().gap(8.0).child(heading("Install from local files", t));
-    body = body.child(field(
+    body = body.child(form_field(
         "local:path",
         "Archive or folder path",
         &s.local.input,
+        k,
         t,
         |s| &mut s.local.input,
     ));
-    body = body.child(field("local:slug", "Mod name", &s.local.slug, t, |s| {
-        &mut s.local.slug
-    }));
-    body = body.child(field(
+    body = body.child(form_field(
+        "local:slug",
+        "Mod name",
+        &s.local.slug,
+        k,
+        t,
+        |s| &mut s.local.slug,
+    ));
+    body = body.child(form_field(
         "local:destination",
         "Optional destination override",
         &s.local.destination,
+        k,
         t,
         |s| &mut s.local.destination,
     ));
