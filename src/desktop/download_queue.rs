@@ -55,6 +55,7 @@ struct Entry {
     id: RemoteMod,
     instance: String,
     name: String,
+    image: Option<String>,
     file_count: usize,
     estimated_bytes: Option<u64>,
     received_before_file: u64,
@@ -63,12 +64,34 @@ struct Entry {
     phase: Phase,
 }
 
+pub(super) struct PendingMod<'a> {
+    pub id: &'a RemoteMod,
+    pub name: &'a str,
+    pub image: Option<&'a str>,
+    pub status: &'static str,
+}
+
 impl Entry {
     fn pending(&self) -> bool {
         matches!(
             self.phase,
             Phase::Queued(_) | Phase::Running(_) | Phase::Waiting(_)
         )
+    }
+
+    fn status(&self) -> &'static str {
+        match &self.phase {
+            Phase::Queued(Action::DiscardNexus) => "Cancelling…",
+            Phase::Queued(_) => "Queued",
+            Phase::Running(control) if control.is_cancelled() => "Cancelling…",
+            Phase::Running(control) if control.is_applying() => "Installing…",
+            Phase::Running(_) if self.transfer.is_some() => "Downloading…",
+            Phase::Running(_) => "Preparing download…",
+            Phase::Waiting(_) => "Needs Nexus download",
+            Phase::Complete => "Installed",
+            Phase::Cancelled => "Cancelled",
+            Phase::Failed(_) => "Failed",
+        }
     }
 
     fn received(&self) -> u64 {
@@ -131,10 +154,25 @@ impl Queue {
         self.running.is_some()
     }
 
-    fn contains(&self, instance: &str, id: &RemoteMod) -> bool {
+    pub(super) fn contains(&self, instance: &str, id: &RemoteMod) -> bool {
         self.items
             .iter()
             .any(|item| item.pending() && item.instance == instance && item.id == *id)
+    }
+
+    pub(super) fn pending_mods<'a>(
+        &'a self,
+        instance: &str,
+    ) -> impl Iterator<Item = PendingMod<'a>> {
+        self.items
+            .iter()
+            .filter(move |item| item.instance == instance && item.pending())
+            .map(|item| PendingMod {
+                id: &item.id,
+                name: &item.name,
+                image: item.image.as_deref(),
+                status: item.status(),
+            })
     }
 
     pub(super) fn start(&mut self, state: &Path, wake: Waker) -> Result<Vec<PathBuf>> {
@@ -178,18 +216,20 @@ impl Queue {
             "This mod is already in the download queue"
         );
         let details = &request.details;
+        let image = details
+            .images
+            .first()
+            .map(|image| image.thumbnail.as_ref().unwrap_or(&image.url).clone());
         let recovery_path = recovery.record(&Bookmark {
             item: details.id.clone(),
             name: details.name.clone(),
-            image: details
-                .images
-                .first()
-                .map(|image| image.thumbnail.as_ref().unwrap_or(&image.url).clone()),
+            image: image.clone(),
         })?;
         self.items.push(Entry {
             id: details.id.clone(),
             instance,
             name: details.name.clone(),
+            image,
             file_count: request.files.len(),
             estimated_bytes: request
                 .files
@@ -221,6 +261,7 @@ impl Queue {
                 id,
                 instance,
                 name,
+                image: None,
                 file_count: 0,
                 estimated_bytes: None,
                 transfer: None,
@@ -422,6 +463,14 @@ impl State {
             .selected
             .as_ref()
             .is_some_and(|game| self.queue.contains(&game.name, id))
+    }
+
+    pub(super) fn pending_install(&self, id: &RemoteMod) -> Option<&'static str> {
+        let instance = self.snapshot.selected.as_ref()?;
+        self.queue
+            .pending_mods(&instance.name)
+            .find(|item| item.id == id)
+            .map(|item| item.status)
     }
 
     pub(super) fn enqueue_install(

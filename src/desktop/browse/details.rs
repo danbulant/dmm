@@ -9,6 +9,7 @@ use crate::desktop::Size;
 use crate::desktop::components::{
     button, form_field, muted, open_page, page_url, panel, source_icon, source_name,
 };
+use crate::desktop::mod_card::bookmark;
 
 static ZOOM_PLUS: Icon = Icon {
     name: "dmm-zoom-plus",
@@ -36,7 +37,6 @@ pub(in crate::desktop) fn header(s: &State, detail: &Detail, t: Theme, k: &Kit) 
     }
     let available = s.matches_instance(&info.id);
     let has_files = !info.files.is_empty();
-    let saved = s.snapshot.is_saved(&info.id);
     let mut header = row()
         .key("detail-header")
         .w_full()
@@ -67,25 +67,22 @@ pub(in crate::desktop) fn header(s: &State, detail: &Detail, t: Theme, k: &Kit) 
                 )
                 .child(meta),
         );
+    let thumbnail = info
+        .images
+        .first()
+        .map(|image| image.thumbnail.as_deref().unwrap_or(&image.url));
+    header = header.child(bookmark(
+        s,
+        "details-save",
+        &info.id,
+        &info.name,
+        thumbnail,
+        t,
+        k,
+    ));
     if s.local_detail.is_some() {
         return header;
     }
-    header = header.child(button(
-        "details-save",
-        if saved { "Unsave" } else { "Save" },
-        t,
-        saved,
-        s.busy.is_none(),
-        {
-            let id = info.id.clone();
-            let name = info.name.clone();
-            let image = info
-                .images
-                .first()
-                .map(|image| image.thumbnail.as_deref().unwrap_or(&image.url).to_owned());
-            move |s, _| s.toggle_bookmark(id.clone(), name.clone(), image.clone(), saved)
-        },
-    ));
     let queued = s.queued_for_selected(&info.id);
     header = header.child(
         button(
@@ -169,21 +166,7 @@ pub(in crate::desktop) fn body(s: &State, detail: &Detail, t: Theme) -> El {
         }
         view = view.child(requirements);
     }
-    let id = info.id.clone();
-    let name = info.name.clone();
-    let image = info
-        .images
-        .first()
-        .map(|image| image.thumbnail.as_deref().unwrap_or(&image.url).to_owned());
-    let saved = s.snapshot.is_saved(&id);
-    let mut actions = row().gap(8.0).flex_wrap().child(button(
-        "details-save-body",
-        if saved { "Saved" } else { "Save" },
-        t,
-        saved,
-        s.busy.is_none(),
-        move |s, _| s.toggle_bookmark(id.clone(), name.clone(), image.clone(), saved),
-    ));
+    let mut actions = row().gap(8.0).flex_wrap();
     if let Some(url) = info.url.clone() {
         actions = actions.child(button(
             "details-source",

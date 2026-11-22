@@ -4,14 +4,23 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use dmm::games::GameKind;
+use dmm::sources::{SearchQuery, Source};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct Preferences {
     pub game: GameKind,
     pub enable_new_mods: bool,
+    pub browse: Vec<BrowsePreferences>,
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct BrowsePreferences {
+    pub game_kind: GameKind,
+    pub source: Source,
+    pub provider_game: String,
+    pub query: SearchQuery,
 }
 
 impl Default for Preferences {
@@ -19,6 +28,7 @@ impl Default for Preferences {
         Self {
             game: GameKind::Cyberpunk,
             enable_new_mods: false,
+            browse: Vec::new(),
         }
     }
 }
@@ -33,10 +43,10 @@ impl Preferences {
         serde_json::from_reader(file).context("decoding desktop preferences")
     }
 
-    pub fn save(self, dir: &Path) -> Result<()> {
+    pub fn save(&self, dir: &Path) -> Result<()> {
         fs::create_dir_all(dir)?;
         let mut file = NamedTempFile::new_in(dir)?;
-        serde_json::to_writer(file.as_file_mut(), &self)?;
+        serde_json::to_writer(file.as_file_mut(), self)?;
         file.persist(dir.join("desktop.json"))?;
         Ok(())
     }
@@ -55,6 +65,7 @@ mod tests {
         Preferences {
             game: GameKind::Zzmi,
             enable_new_mods: true,
+            ..initial
         }
         .save(dir.path())?;
         let restored = Preferences::load(dir.path())?;

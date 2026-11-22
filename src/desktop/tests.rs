@@ -167,7 +167,7 @@ fn an_in_flight_search_cannot_replace_newer_filter_results() {
         )))
         .unwrap();
     state.poll(0.0, &mut Tx::default());
-    assert_eq!(state.browser.results.unwrap().total, Some(12));
+    assert_eq!(state.browser.results.as_ref().unwrap().total, Some(12));
 }
 
 #[test]
@@ -505,7 +505,7 @@ fn local_grid_presents_bookmarks_and_requires_confirmation_before_removing_an_in
     };
     assert!(
         runtime
-            .presented("saved-card-nexus-cyberpunk2077-11")
+            .presented("local-remote-nexus-cyberpunk2077-11")
             .is_some()
     );
     let mut backend = Backend {
@@ -543,8 +543,112 @@ fn local_grid_presents_bookmarks_and_requires_confirmation_before_removing_an_in
     assert!(!game.join("archive/pc/mod/mod.archive").exists());
     assert!(
         runtime
-            .presented("saved-card-nexus-cyberpunk2077-11")
+            .presented("local-remote-nexus-cyberpunk2077-11")
             .is_some()
     );
+    Ok(())
+}
+
+#[test]
+fn bookmark_and_queue_actions_work_across_explore_and_local_cards() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("state");
+    let game = dir.path().join("game");
+    std::fs::create_dir(&game)?;
+    let mut state = details_fixture();
+    let info = state.browser.detail.take().unwrap().info;
+    let id = info.id.clone();
+    let image = info.images[0].thumbnail.clone();
+    state.state_dir = data.clone();
+    let library = Library::open(&data)?;
+    library.register("cyberpunk", GameKind::Cyberpunk, &game, None)?;
+    state.snapshot = Snapshot::load(&library, Some("cyberpunk"))?;
+    drop(library);
+    state.browser.results = Some(Rc::new(SearchPage {
+        items: vec![SearchResult {
+            id: id.clone(),
+            name: info.name.clone(),
+            author: info.author.clone(),
+            category: info.category.clone(),
+            summary: None,
+            image: image.clone(),
+            version: None,
+            updated_at: None,
+            published_at: None,
+            url: None,
+            downloads: None,
+            endorsements: None,
+            likes: None,
+            adult: Some(false),
+        }],
+        page: 1,
+        total: Some(1),
+        total_pages: Some(1),
+        has_more: false,
+    }));
+    let mut dispatched = state.queue.fixture(&data)?;
+    let (jobs, requests) = mpsc::channel();
+    let (responses, results) = mpsc::channel();
+    state.worker = Some(Worker { jobs, results });
+    let mut backend = Backend {
+        state_dir: data,
+        online: None,
+    };
+    let mut runtime = Runtime::new(state, view, (1050.0, 760.0), Env::new(true, 1.0));
+    runtime.poll = Some(State::poll);
+    runtime.frame(0.0);
+
+    let click = |runtime: &mut Runtime<State>, key| {
+        let (x, y) = runtime
+            .find(key)
+            .unwrap_or_else(|| panic!("{key} not found"));
+        runtime.pointer_down(x, y);
+        runtime.pointer_up(x, y);
+        runtime.frame(1.0 / 60.0);
+    };
+    click(&mut runtime, "result-nexus-cyberpunk2077-42:bookmark");
+    responses.send(requests.try_recv()?(&mut backend))?;
+    runtime.frame(1.0 / 60.0);
+    assert!(runtime.state.snapshot.is_saved(&id));
+    assert_eq!(runtime.state.snapshot.favorites[0].image, image);
+    assert!(runtime.state.browser.detail.is_none());
+    click(&mut runtime, "nav-Local mods");
+    assert!(
+        runtime
+            .presented("local-remote-nexus-cyberpunk2077-42:install")
+            .is_some()
+    );
+
+    let files = vec![info.files[0].clone()];
+    assert!(
+        runtime
+            .state
+            .enqueue_install("cyberpunk".into(), info, files, None, true)
+    );
+    assert!(dispatched());
+    runtime.invalidate();
+    runtime.frame(1.0 / 60.0);
+    assert!(
+        runtime
+            .presented("local-remote-nexus-cyberpunk2077-42:download")
+            .is_some()
+    );
+    assert!(runtime.presented("active-download").is_some());
+    click(&mut runtime, "local-remote-nexus-cyberpunk2077-42:bookmark");
+    responses.send(requests.try_recv()?(&mut backend))?;
+    runtime.frame(1.0 / 60.0);
+    assert!(!runtime.state.snapshot.is_saved(&id));
+    click(&mut runtime, "local-remote-nexus-cyberpunk2077-42:download");
+    assert!(runtime.state.screen == Screen::Downloads);
+    assert!(runtime.presented("queue-nexus-link").is_none());
+
+    runtime.state.snapshot.nexus_pages.push(Url::parse(
+        "https://www.nexusmods.com/cyberpunk2077/mods/42?tab=files&file_id=1",
+    )?);
+    runtime.invalidate();
+    runtime.frame(1.0 / 60.0);
+    click(&mut runtime, "queue-nexus-link");
+    assert!(runtime.state.handoff_open);
+    assert!(runtime.presented("open-handoff-0").is_some());
     Ok(())
 }

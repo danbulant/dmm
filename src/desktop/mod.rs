@@ -5,6 +5,7 @@ mod download_queue;
 mod download_recovery;
 mod game_setup;
 mod installations;
+mod mod_card;
 mod preferences;
 mod previews;
 mod shell;
@@ -17,6 +18,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
 use std::sync::mpsc;
+use std::time::Instant;
 
 use anyhow::Result;
 use dmm::acquisition::pending_pages;
@@ -258,11 +260,15 @@ impl State {
         }
         match Preferences::load(&self.state_dir) {
             Ok(preferences) => {
+                let game = preferences.game;
                 self.preferences = preferences;
-                self.public_game = preferences.game;
-                self.public_sources = public_origins(preferences.game);
-                self.browser.source = preferences.game.preferred_source();
+                self.public_game = game;
+                self.public_sources = public_origins(game);
+                self.browser.source = game.preferred_source();
                 self.browser.reset_origin();
+                if let Some(origin) = self.origin().cloned() {
+                    self.restore_browse_preferences(&origin);
+                }
             }
             Err(error) => self.notice = format!("{error:#}"),
         }
@@ -544,6 +550,9 @@ impl State {
             .or_else(|| self.available_sources().first())
             .map_or(preferred, |o| o.source);
         self.browser.reset_origin();
+        if let Some(origin) = self.origin().cloned() {
+            self.restore_browse_preferences(&origin);
+        }
         self.sync_previews();
         tx.scroll_to_instant("main-scroll", 0.0, 0.0);
         if self.screen == Screen::Explore {
@@ -603,6 +612,7 @@ impl State {
                 &self.local,
                 &self.snapshot,
                 sources,
+                &self.queue,
             ));
         } else {
             previews.show([]);
@@ -650,7 +660,18 @@ impl State {
     }
 
     fn poll(&mut self, now: f64, tx: &mut Tx) -> bool {
-        let mut changed = self.previews.as_mut().is_some_and(Previews::poll);
+        let mut changed = false;
+        if let Some(due) = self.browser.preference_save_due {
+            let remaining = due.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.browser.preference_save_due = None;
+                self.save_preferences();
+                changed = true;
+            } else {
+                tx.wake_after(remaining);
+            }
+        }
+        changed |= self.previews.as_mut().is_some_and(Previews::poll);
         changed |= self
             .browser
             .detail
@@ -775,5 +796,15 @@ impl State {
             | self
                 .browser
                 .poll_search_progress(self.catalog_busy == Some("Searching mods…"), tx)
+    }
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        if self.browser.preference_save_due.is_some()
+            && let Err(error) = self.preferences.save(&self.state_dir)
+        {
+            eprintln!("Could not save desktop preferences while closing: {error:#}");
+        }
     }
 }

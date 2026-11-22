@@ -4,17 +4,18 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use rune::tok::Theme;
-use rune::{El, SurfaceFit, TextEdit, Tx, col, row};
-use rune_kit::{Dialog, Kit, Placement, Select, SelectAppearance, Switch};
+use rune::{El, TextEdit, Tx, col, row};
+use rune_kit::{Dialog, Kit, Placement, Select, SelectAppearance};
 
 use dmm::games::GameKind;
-use dmm::library::{Inspection, Library, ManagedMod, SavedFavorite};
-use dmm::sources::Source;
+use dmm::library::{Inspection, Library, ManagedMod};
+use dmm::sources::{RemoteMod, Source};
 
 use super::components::{
-    button, card_title, field, heading, mod_card, muted, open_page, panel, preview, source_name,
-    styled_field,
+    button, field, heading, muted, open_page, panel, source_name, styled_field,
 };
+use super::download_queue::Queue;
+use super::mod_card::{Card, byline, remote_key};
 use super::{Origin, Screen, Size, Snapshot, State, Update, open_library};
 
 const PAGE_SIZE: usize = 24;
@@ -261,19 +262,21 @@ pub(super) fn local_mods(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> E
                 }),
             ),
     );
-    let entries = entries(&s.local, &s.snapshot, s.available_sources());
+    let entries = entries(&s.local, &s.snapshot, s.available_sources(), &s.queue);
     let pages = entries.len().div_ceil(PAGE_SIZE);
     let page = s.local.page.min(pages.saturating_sub(1));
     let mut grid = row().w_full().flex_wrap().gaps(12.0, 12.0);
     for entry in entries.into_iter().skip(page * PAGE_SIZE).take(PAGE_SIZE) {
         grid = grid.child(match entry {
             Entry::Installed(instance, record) => installed_card(s, t, k, instance, record),
-            Entry::Saved(bookmark) => saved_card(s, t, bookmark),
+            Entry::Remote { id, name, image } => remote_card(s, t, k, id, name, image),
         });
     }
     if pages == 0 {
-        content = content
-            .child(panel(t).child(muted("No installed or saved mods match these filters.", t)));
+        content = content.child(panel(t).child(muted(
+            "No installed, saved, or queued mods match these filters.",
+            t,
+        )));
     } else {
         content = content.child(grid);
         if pages > 1 {
@@ -377,16 +380,52 @@ fn filter_menu(s: &State, k: &Kit, layer: &mut Vec<El>, menu: FilterMenu) -> El 
 
 enum Entry<'a> {
     Installed(&'a str, &'a ManagedMod),
-    Saved(&'a SavedFavorite),
+    Remote {
+        id: &'a RemoteMod,
+        name: &'a str,
+        image: Option<&'a str>,
+    },
 }
 
-fn entries<'a>(form: &LocalForm, snapshot: &'a Snapshot, origins: &[Origin]) -> Vec<Entry<'a>> {
+fn entries<'a>(
+    form: &LocalForm,
+    snapshot: &'a Snapshot,
+    origins: &[Origin],
+    queue: &'a Queue,
+) -> Vec<Entry<'a>> {
     let mut entries = Vec::new();
     let q = form.search.text.trim().to_lowercase();
     let tag = form.tag_filter.text.trim().to_lowercase();
     let category = form.category_filter.text.trim().to_lowercase();
     let character = form.character_filter.text.trim().to_lowercase();
     let group = form.group_filter.text.trim().to_lowercase();
+    let remote_names_only = [&tag, &category, &character, &group]
+        .iter()
+        .all(|value| value.is_empty());
+    if remote_names_only
+        && matches!(form.status, Status::Any | Status::Saved)
+        && let Some(instance) = &snapshot.selected
+    {
+        entries.extend(
+            queue
+                .pending_mods(&instance.name)
+                .filter(|item| {
+                    (form.status != Status::Saved || snapshot.is_saved(item.id))
+                        && form.site_filter.is_none_or(|site| site == item.id.source)
+                        && contains(item.name, &q)
+                        && !snapshot.mods.iter().any(|record| {
+                            record
+                                .release()
+                                .is_some_and(|release| release.id == *item.id)
+                        })
+                })
+                .map(|item| Entry::Remote {
+                    id: item.id,
+                    name: item.name,
+                    image: item.image,
+                }),
+        );
+    }
     if let Some(instance) = &snapshot.selected {
         for record in &snapshot.mods {
             let state_matches = match form.status {
@@ -428,11 +467,7 @@ fn entries<'a>(form: &LocalForm, snapshot: &'a Snapshot, origins: &[Origin]) -> 
             }
         }
     }
-    if matches!(form.status, Status::Any | Status::Saved)
-        && [&tag, &category, &character, &group]
-            .iter()
-            .all(|value| value.is_empty())
-    {
+    if remote_names_only && matches!(form.status, Status::Any | Status::Saved) {
         entries.extend(
             snapshot
                 .favorites
@@ -444,13 +479,21 @@ fn entries<'a>(form: &LocalForm, snapshot: &'a Snapshot, origins: &[Origin]) -> 
                         .site_filter
                         .is_none_or(|site| site == favorite.item.source)
                         && contains(&favorite.name, &q)
+                        && !snapshot
+                            .selected
+                            .as_ref()
+                            .is_some_and(|instance| queue.contains(&instance.name, &favorite.item))
                         && !snapshot.mods.iter().any(|record| {
                             record
                                 .release()
                                 .is_some_and(|release| release.id == favorite.item)
                         })
                 })
-                .map(Entry::Saved),
+                .map(|item| Entry::Remote {
+                    id: &item.item,
+                    name: &item.name,
+                    image: item.image.as_deref(),
+                }),
         );
     }
     entries
@@ -483,8 +526,9 @@ pub(super) fn preview_requests<'a>(
     form: &LocalForm,
     snapshot: &'a Snapshot,
     origins: &[Origin],
+    queue: &'a Queue,
 ) -> impl Iterator<Item = (&'a str, Size)> + use<'a> {
-    let entries = entries(form, snapshot, origins);
+    let entries = entries(form, snapshot, origins, queue);
     let page = form
         .page
         .min(entries.len().div_ceil(PAGE_SIZE).saturating_sub(1));
@@ -495,141 +539,64 @@ pub(super) fn preview_requests<'a>(
         .filter_map(|entry| {
             let url = match entry {
                 Entry::Installed(_, record) => installed_image(record),
-                Entry::Saved(bookmark) => bookmark.image.as_deref(),
+                Entry::Remote { image, .. } => image,
             }?;
             Some((url, Size::Card))
         })
 }
 
-fn saved_card(s: &State, t: Theme, bookmark: &SavedFavorite) -> El {
-    let id = bookmark.item.clone();
-    let key = format!("{}-{}-{}", id.source, id.game, id.id);
-    let image = bookmark.image.as_deref();
-    let detail_id = id.clone();
-    let install_id = id.clone();
-    let saved_id = id.clone();
-    mod_card(t)
-        .key(format!("saved-card-{key}"))
-        .child(preview(s, image, 112.0, SurfaceFit::Fill, t))
-        .child(card_title(&bookmark.name, t))
-        .child(muted(format!("Saved · {} · {}", id.source, id.game), t).truncate())
-        .child(
-            row()
-                .gap(6.0)
-                .flex_wrap()
-                .child(button(
-                    format!("local-saved-open-{key}"),
-                    "Details",
-                    t,
-                    false,
-                    s.details_busy.is_none(),
-                    move |s, _| s.details(detail_id.clone()),
-                ))
-                .child(button(
-                    format!("local-saved-install-{key}"),
-                    "Install",
-                    t,
-                    false,
-                    s.details_busy.is_none() && s.queue.available() && s.matches_instance(&id),
-                    move |s, _| s.details_for_install(install_id.clone()),
-                ))
-                .child(button(
-                    format!("local-saved-remove-{key}"),
-                    "Unsave",
-                    t,
-                    false,
-                    s.busy.is_none(),
-                    move |s, _| s.unsave(saved_id.clone()),
-                )),
-        )
+fn local_remote_key(id: &RemoteMod) -> String {
+    format!("local-remote-{}", remote_key(id))
+}
+
+fn remote_card(
+    s: &State,
+    t: Theme,
+    k: &Kit,
+    id: &RemoteMod,
+    name: &str,
+    image: Option<&str>,
+) -> El {
+    Card {
+        key: local_remote_key(id),
+        name,
+        image,
+        byline: source_name(id.source).into(),
+        metadata: String::new(),
+        remote: Some(id),
+        installed: None,
+    }
+    .view(s, t, k)
 }
 
 fn installed_card(s: &State, t: Theme, k: &Kit, instance: &str, managed: &ManagedMod) -> El {
-    let slug = managed.slug.as_str();
     let details = managed.details();
     let release = managed.release();
-    let name = installed_title(managed);
-    let image = installed_image(managed);
-    let source = record_source(managed);
-    let mut card = mod_card(t)
-        .key(format!("installed-card-{instance}-{slug}"))
-        .child(preview(s, image, 112.0, SurfaceFit::Fill, t))
-        .child(card_title(name, t))
-        .child(muted(source_name(source), t).truncate());
-    if let Some(category) = details.and_then(|details| details.category.as_deref()) {
-        card = card.child(muted(category, t).truncate());
-    } else if let Some(release) = release {
-        card = card.child(muted(&release.filename, t).truncate());
+    let metadata: Vec<_> = managed
+        .group
+        .as_deref()
+        .into_iter()
+        .chain(
+            details
+                .into_iter()
+                .flat_map(|details| details.tags.iter().map(String::as_str)),
+        )
+        .take(3)
+        .collect();
+    Card {
+        key: format!("installed-card-{instance}-{}", managed.slug),
+        name: installed_title(managed),
+        image: installed_image(managed),
+        byline: byline(
+            details.and_then(|d| d.author.as_deref()),
+            details.and_then(|d| d.category.as_deref()),
+            source_name(record_source(managed)),
+        ),
+        metadata: metadata.join(" · "),
+        remote: release.map(|release| &release.id),
+        installed: Some(managed),
     }
-    let tags = details
-        .map(|details| details.tags.as_slice())
-        .unwrap_or(&[]);
-    if !tags.is_empty() {
-        let labels = tags
-            .iter()
-            .take(3)
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let more = tags.len().saturating_sub(3);
-        let label = if more == 0 {
-            labels
-        } else {
-            format!("{labels} · +{more}")
-        };
-        card = card.child(muted(label, t).truncate());
-    }
-    if let Some(group) = &managed.group {
-        card = card.child(muted(format!("Group: {group}"), t).truncate());
-    }
-    let open_slug = managed.slug.clone();
-    card = card.child(button(
-        format!("mod:{instance}:{slug}:details"),
-        "Details and files",
-        t,
-        false,
-        true,
-        move |s, tx| s.open_installed_details(&open_slug, tx),
-    ));
-    if let Some(id) = release.map(|release| release.id.clone())
-        && s.snapshot.is_saved(&id)
-    {
-        card = card.child(button(
-            format!("mod:{instance}:{slug}:unsave"),
-            "Unsave",
-            t,
-            false,
-            s.busy.is_none(),
-            move |s, _| s.unsave(id.clone()),
-        ));
-    }
-    let toggle_slug = managed.slug.clone();
-    let toggle_game = instance.to_owned();
-    let enabled = managed.enabled;
-    card.child(
-        row()
-            .w_full()
-            .items_center()
-            .justify_between()
-            .child(muted(if enabled { "Enabled" } else { "Disabled" }, t))
-            .child(
-                Switch::new(enabled)
-                    .label(format!("Enable {name}"))
-                    .hide_label()
-                    .disabled(s.busy.is_some())
-                    .on_toggle(move |state: &mut State| {
-                        change_mod(
-                            state,
-                            &toggle_game,
-                            &toggle_slug,
-                            "Updating mod…",
-                            move |lib, game, slug| lib.toggle(game, slug, !enabled, false, false),
-                        );
-                    })
-                    .build(k)
-                    .key(format!("mod:{instance}:{slug}:enabled")),
-            ),
-    )
+    .view(s, t, k)
 }
 
 pub(super) fn installed_actions(s: &State, t: Theme, instance: &str, managed: &ManagedMod) -> El {
@@ -778,7 +745,7 @@ pub(super) fn overlays(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) {
         .build(k, layer);
 }
 
-fn change_mod(
+pub(super) fn change_mod(
     state: &mut State,
     game: &str,
     slug: &str,

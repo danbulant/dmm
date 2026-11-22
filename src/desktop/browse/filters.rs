@@ -39,7 +39,7 @@ pub(super) fn toolbar(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
         })
         .build(k, layer)
         .border(1.0, k.c.border_base);
-    let mut toolbar = row()
+    row()
         .w_full()
         .gap(8.0)
         .items_center()
@@ -56,18 +56,7 @@ pub(super) fn toolbar(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
             )
             .expanded(s.browser.show_filters),
         )
-        .children(active(s, t));
-    if s.browser.source == Source::Nexus && s.snapshot.nexus_pages.is_empty() {
-        toolbar = toolbar.child(button(
-            "nxm-toggle",
-            "Nexus link",
-            t,
-            s.handoff_open,
-            s.busy.is_none(),
-            |s, _| s.handoff_open = true,
-        ));
-    }
-    toolbar
+        .children(active(s, t))
 }
 
 fn active(s: &State, t: Theme) -> Vec<El> {

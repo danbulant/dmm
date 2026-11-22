@@ -1,13 +1,13 @@
-use dmm::sources::{RemoteMod, SearchPage, SearchResult, Sort, Source};
+use dmm::sources::{SearchPage, SearchResult, Sort, Source};
 use rune::tok::{Theme, type_};
-use rune::{El, SurfaceFit, TextEdit, col, el, oklch, row, text};
+use rune::{El, TextEdit, col, el, oklch, row, text};
 use rune_kit::Kit;
 
 use super::{State, filters};
 use crate::desktop::components::{
-    button, card_title, field, heading, mod_card, muted, panel, preview, source_icon, source_name,
-    styled_field,
+    button, field, heading, muted, panel, source_icon, source_name, styled_field,
 };
+use crate::desktop::mod_card::{Card, byline, remote_key};
 
 pub(in crate::desktop) fn explore(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
     let game = s.game_kind().display_name().to_uppercase();
@@ -61,7 +61,7 @@ pub(in crate::desktop) fn explore(s: &State, t: Theme, k: &Kit, layer: &mut Vec<
         view = view.child(filters::options(s, t, k));
     }
     if let Some(page) = &s.browser.results {
-        view.child(results(s, page, t))
+        view.child(results(s, page, t, k))
     } else {
         let message = if s.browser.show_search_progress {
             "Searching the provider catalog…"
@@ -125,7 +125,7 @@ fn source_button(s: &State, source: Source, t: Theme) -> El {
         )
         .on_press_tx(move |s: &mut State, tx| s.change_source(source, tx))
 }
-fn results(s: &State, page: &SearchPage, t: Theme) -> El {
+fn results(s: &State, page: &SearchPage, t: Theme, k: &Kit) -> El {
     let enabled = s.catalog_busy.is_none() && s.browser.pending_search.is_none();
     let position = page.total_pages.map_or_else(
         || format!("Page {}", page.page),
@@ -171,9 +171,9 @@ fn results(s: &State, page: &SearchPage, t: Theme) -> El {
         let mut grid = row().w_full().flex_wrap().gaps(12.0, 12.0);
         for item in &page.items {
             grid = grid.child(if s.browser.may_show_previous_cards() {
-                card(s, item, t)
+                card(s, item, t, k)
             } else {
-                el().w(248.0).h(210.0).radius(12.0).fill(t.card)
+                el().w(248.0).h(248.0).radius(12.0).fill(t.card)
             });
         }
         grid
@@ -190,40 +190,13 @@ fn results(s: &State, page: &SearchPage, t: Theme) -> El {
         .child(nav)
 }
 
-fn card(s: &State, item: &SearchResult, t: Theme) -> El {
-    let key = id_key(&item.id);
-    let id = item.id.clone();
-    let enabled = s.details_busy.is_none();
-    let saved = s.snapshot.is_saved(&id);
-    let queued = s.queued_for_selected(&id);
-    let installed = s
-        .snapshot
-        .mods
-        .iter()
-        .find(|record| record.release().is_some_and(|release| release.id == id));
-    let mut state = Vec::new();
-    if let Some(record) = installed {
-        state.push(if record.enabled {
-            "Enabled"
-        } else {
-            "Disabled"
-        });
-    }
-    if saved {
-        state.push("Saved");
-    }
-    if queued {
-        state.push("Queued");
-    }
-    if item.adult == Some(true) {
-        state.push("NSFW");
-    }
+fn card(s: &State, item: &SearchResult, t: Theme, k: &Kit) -> El {
     let mut meta = Vec::new();
     let sort = s
         .browser
         .shown_query
         .as_ref()
-        .map_or(Sort::Relevance, |query| query.sort);
+        .map_or(Sort::Newest, |query| query.sort);
     match sort {
         Sort::Popularity => {
             let count = match item.id.source {
@@ -255,89 +228,30 @@ fn card(s: &State, item: &SearchResult, t: Theme) -> El {
     {
         meta.push(format!("Updated {updated}"));
     }
-    let mut card = mod_card(t)
-        .key(format!("result-{key}"))
-        .role("button")
-        .label(&item.name)
-        .focusable(enabled)
-        .disabled(!enabled)
-        .hover_group()
-        .child(preview(
-            s,
-            item.image.as_deref(),
-            128.0,
-            SurfaceFit::Fill,
-            t,
-        ))
-        .child(card_title(&item.name, t))
-        .child(
-            muted(
-                item.author
-                    .as_deref()
-                    .or(item.category.as_deref())
-                    .unwrap_or("Mod"),
-                t,
-            )
-            .w_full()
-            .truncate(),
-        );
-    if !state.is_empty() {
-        card = card.child(muted(state.join("  ·  "), t).w_full().truncate());
+    if item.adult == Some(true) {
+        meta.push("NSFW".into());
     }
-    if !meta.is_empty() {
-        card = card.child(muted(meta.join("  ·  "), t).w_full().truncate());
+    Card {
+        key: format!("result-{}", remote_key(&item.id)),
+        name: &item.name,
+        image: item.image.as_deref(),
+        byline: byline(item.author.as_deref(), item.category.as_deref(), "Mod"),
+        metadata: meta.join(" · "),
+        remote: Some(&item.id),
+        installed: s.installed_for(&item.id),
     }
-    let card_id = item.id.clone();
-    let saved_name = item.name.clone();
-    let saved_image = item.image.clone();
-    let actions = row()
-        .pin(None, Some(16.0), Some(16.0), None)
-        .group_opacity(0.0, 1.0)
-        .gap(6.0)
-        .child(button(
-            format!("result-save-{key}"),
-            if saved { "Unsave" } else { "Save" },
-            t,
-            saved,
-            s.busy.is_none(),
-            move |s, _| {
-                s.toggle_bookmark(id.clone(), saved_name.clone(), saved_image.clone(), saved)
-            },
-        ))
-        .child(button(
-            format!("result-install-{key}"),
-            if queued { "Queued" } else { "Install" },
-            t,
-            false,
-            enabled && !queued && s.queue.available() && s.matches_instance(&item.id),
-            {
-                let id = item.id.clone();
-                move |s, _| s.details_for_install(id.clone())
-            },
-        ));
-    card = card.child(actions);
-    if enabled {
-        card = card
-            .hover(t.hover)
-            .on_press(move |s: &mut State| s.details(card_id.clone()));
-    }
-    card
+    .view(s, t, k)
 }
 
 fn short_date(value: &str) -> Option<&str> {
     let date = value.get(..10)?;
     (date.as_bytes().get(4) == Some(&b'-') && date.as_bytes().get(7) == Some(&b'-')).then_some(date)
 }
-
-fn id_key(id: &RemoteMod) -> String {
-    format!("{}-{}-{}", id.source, id.game, id.id)
-}
-
 pub(super) fn sort_name(sort: Sort) -> &'static str {
     match sort {
         Sort::Relevance => "Relevance",
         Sort::Popularity => "Popular",
-        Sort::Newest => "Newest",
+        Sort::Newest => "Recent",
         Sort::Updated => "Recently updated",
     }
 }

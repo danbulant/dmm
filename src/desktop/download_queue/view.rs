@@ -1,6 +1,10 @@
+use std::collections::HashSet;
+
 use rune::tok::{Theme, type_};
-use rune::{El, ScrollSpec, col, row, text};
+use rune::{El, ScrollSpec, TextStyle, col, row, text};
+use rune_kit::shell::SidebarRow;
 use rune_kit::{Dialog, Kit, Progress};
+use url::Url;
 
 use super::{Action, Entry, Phase, Transfer};
 use crate::desktop::components::{button, field, heading, muted, open_page, panel, styled_field};
@@ -19,26 +23,38 @@ pub(in crate::desktop) fn page(s: &State, t: Theme, k: &Kit) -> El {
         .items
         .iter()
         .fold(0u64, |total, item| total.saturating_add(item.received()));
-    let nexus_files = s.snapshot.nexus_pages.len();
-    let nexus_label = if nexus_files == 0 {
-        "Enter Nexus link".to_owned()
-    } else {
-        format!("Nexus links needed ({nexus_files})")
-    };
-    let mut view = col().w_full().gap(14.0)
+    let has_handoff = handoff_links(s).next().is_some();
+    let can_handoff = queue.available();
+    let mut view = col().w_full().gap(16.0)
         .child(row().w_full().gap(12.0).items_center()
             .child(heading("Downloads", t).grow(1.0))
-            .child(button("queue-nexus-link", nexus_label, t, false, s.queue.available() && s.snapshot.selected.is_some(), |s, _| s.handoff_open = true)))
+            .children(has_handoff.then(|| button(
+                "queue-nexus-link",
+                "Finish Nexus downloads",
+                t,
+                false,
+                can_handoff,
+                |s, _| s.handoff_open = true,
+            ))))
         .child(muted(format!("{pending} pending  ·  {installed} installed  ·  {stopped} stopped  ·  {} transferred", bytes(transferred)), t));
-    if queue.items.is_empty() {
-        return view.child(panel(t).child(muted(
-            if nexus_files > 0 {
-                "Finish the pending Nexus downloads by opening the file pages and entering their links."
-            } else {
-                "Mods you install from Explore or Local mods will appear here."
-            },
+    if has_handoff {
+        view = view.child(muted(
+            "For a waiting install, open each Nexus file page, choose Mod Manager Download, then paste its nxm:// link.",
             t,
-        )));
+        ).wrap());
+    }
+    if queue.items.is_empty() {
+        return view.child(panel(t)
+            .child(text(if has_handoff { "Nexus links are ready" } else { "No downloads yet" })
+                .font(TextStyle::new(16.0, 650.0)).color(t.text))
+            .child(muted(
+                if has_handoff {
+                    "Finish the pending Nexus download by opening its file page and entering the nxm:// link."
+                } else {
+                    "Mods you install from Explore or Local mods will appear here."
+                },
+                t,
+            ).wrap()));
     }
     if pending > 0 {
         view = view.child(heading("In progress", t)).children(
@@ -51,7 +67,7 @@ pub(in crate::desktop) fn page(s: &State, t: Theme, k: &Kit) -> El {
         );
     }
     if installed + stopped > 0 {
-        view = view.child(heading("This session", t)).children(
+        view = view.child(heading("Completed and stopped", t)).children(
             queue
                 .items
                 .iter()
@@ -65,25 +81,38 @@ pub(in crate::desktop) fn page(s: &State, t: Theme, k: &Kit) -> El {
 }
 
 fn entry(s: &State, index: usize, item: &Entry, t: Theme, k: &Kit) -> El {
+    let game = s
+        .snapshot
+        .instances
+        .iter()
+        .find(|game| game.name == item.instance)
+        .map_or(item.instance.as_str(), |game| game.kind.display_name());
     let mut line = row().w_full().items_center().gap(12.0).child(
         col()
             .grow(1.0)
             .shrink()
             .min_w(0.0)
-            .gap(4.0)
+            .gap(5.0)
             .child(
                 text(&item.name)
-                    .font(type_::TITLE)
+                    .font(TextStyle::new(16.0, 650.0))
                     .color(t.text)
                     .truncate()
                     .help(&item.name),
             )
-            .child(muted(format!("{}  ·  {}", item.instance, description(item)), t).wrap()),
+            .child(muted(format!("{game}  ·  {}", file_summary(item)), t).wrap()),
+    );
+    line = line.child(
+        muted(item.status(), t)
+            .px(8.0)
+            .py(4.0)
+            .radius(6.0)
+            .fill(t.control_off),
     );
     if let Phase::Waiting(_) = item.phase {
         line = line.child(button(
             format!("queue-nexus-{index}"),
-            "Nexus link",
+            "Paste Nexus link",
             t,
             true,
             true,
@@ -102,11 +131,17 @@ fn entry(s: &State, index: usize, item: &Entry, t: Theme, k: &Kit) -> El {
     }
     let mut card = panel(t).key(format!("queue-entry-{index}")).child(line);
     if let Some(transfer) = &item.transfer {
-        card = card.child(muted(&transfer.file_name, t).wrap());
+        card = card.child(
+            text(filename(transfer))
+                .font(type_::LABEL)
+                .color(t.text)
+                .truncate()
+                .help(&transfer.file_name),
+        );
         if matches!(item.phase, Phase::Running(_)) {
-            card = card.child(muted(metrics(transfer), t).wrap()).child(
+            card = card.child(transfer_metrics(transfer, t)).child(
                 Progress::new(fraction(transfer))
-                    .label("File download progress")
+                    .label(format!("Download progress for {}", transfer.file_name))
                     .build(k),
             );
         }
@@ -144,66 +179,56 @@ fn entry(s: &State, index: usize, item: &Entry, t: Theme, k: &Kit) -> El {
 pub(in crate::desktop) fn sidebar(s: &State, t: Theme, k: &Kit) -> El {
     let pending = s.queue.items.iter().filter(|item| item.pending()).count();
     let active = s.queue.running.and_then(|index| s.queue.items.get(index));
-    let waiting = s
-        .queue
-        .items
-        .iter()
-        .filter(|item| matches!(item.phase, Phase::Waiting(_)))
-        .count();
-    let label = match (active, pending, waiting) {
-        (Some(_), _, _) => format!("Downloads · {pending} pending"),
-        (None, _, 1..) => format!("Downloads · {waiting} waiting"),
-        (None, 1.., _) => format!("Downloads · {pending} pending"),
-        _ if !s.snapshot.nexus_pages.is_empty() => "Downloads · Nexus links needed".into(),
-        _ => "Downloads".into(),
-    };
+    let mut nav = SidebarRow::new("Downloads")
+        .selected(s.screen == Screen::Downloads)
+        .on_select(State::open_downloads);
+    if pending > 0 {
+        nav = nav.badge(pending.to_string());
+    }
     let mut card = col()
         .key("download-sidebar")
         .w_full()
-        .gap(5.0)
-        .child(button(
-            "nav-Downloads",
-            label,
-            t,
-            s.screen == Screen::Downloads,
-            true,
-            State::open_downloads,
-        ));
+        .gap(6.0)
+        .child(nav.build(k).key("nav-Downloads"));
     if let Some(item) = active {
-        card = card.child(
-            text(&item.name)
-                .font(type_::LABEL)
-                .color(t.text)
-                .truncate()
-                .help(&item.name),
-        );
-        match (&item.phase, &item.transfer) {
-            (Phase::Running(control), _) if control.is_applying() || control.is_cancelled() => {
-                card = card.child(muted(description(item), t).truncate());
+        let mut transfer_card = col()
+            .key("active-download")
+            .w_full()
+            .padding(9.0)
+            .gap(5.0)
+            .radius(8.0)
+            .fill(k.c.layer_01)
+            .border(1.0, t.card_border)
+            .child(
+                text(&item.name)
+                    .font(type_::LABEL)
+                    .color(t.text)
+                    .truncate()
+                    .help(&item.name),
+            );
+        let transfer = match (&item.phase, &item.transfer) {
+            (Phase::Running(control), Some(transfer))
+                if !control.is_applying() && !control.is_cancelled() =>
+            {
+                Some(transfer)
             }
-            (_, Some(transfer)) => {
-                card = card
-                    .child(
-                        muted(&transfer.file_name, t)
-                            .truncate()
-                            .help(&transfer.file_name),
-                    )
-                    .child(
-                        muted(
-                            format!("File {} of {}", transfer.current, transfer.total),
-                            t,
-                        )
-                        .truncate(),
-                    )
-                    .child(muted(metrics(transfer), t).truncate())
-                    .child(Progress::new(fraction(transfer)).build(k));
-            }
-            _ => {
-                card = card
-                    .child(muted(description(item), t).truncate())
-                    .child(Progress::new(None).build(k));
-            }
+            _ => None,
+        };
+        if let Some(file) = transfer {
+            transfer_card = transfer_card
+                .child(muted(filename(file), t).truncate().help(&file.file_name))
+                .child(
+                    Progress::new(fraction(file))
+                        .label("File download progress")
+                        .build(k),
+                )
+                .child(transfer_metrics(file, t));
+        } else {
+            transfer_card = transfer_card
+                .child(muted(item.status(), t).truncate())
+                .child(Progress::new(None).label(item.status()).build(k));
         }
+        card = card.child(transfer_card);
     }
     card
 }
@@ -231,28 +256,9 @@ fn can_cancel(item: &Entry) -> bool {
     }
 }
 
-fn description(item: &Entry) -> String {
-    let status = match &item.phase {
-        Phase::Queued(Action::DiscardNexus) => "Cancelling…".into(),
-        Phase::Queued(_) => "Queued".into(),
-        Phase::Running(control) if control.is_applying() => "Installing…".into(),
-        Phase::Running(control) if control.is_cancelled() => "Cancelling…".into(),
-        Phase::Running(_) => item.transfer.as_ref().map_or_else(
-            || "Preparing download…".into(),
-            |transfer| {
-                format!(
-                    "Downloading file {} of {}",
-                    transfer.current, transfer.total
-                )
-            },
-        ),
-        Phase::Waiting(_) => "Waiting for Nexus".into(),
-        Phase::Complete => "Installed".into(),
-        Phase::Cancelled => "Cancelled".into(),
-        Phase::Failed(_) => "Failed".into(),
-    };
+fn file_summary(item: &Entry) -> String {
     if item.file_count == 0 {
-        return status;
+        return "Nexus download".into();
     }
     let count = item.file_count;
     let unit = if count == 1 { "file" } else { "files" };
@@ -265,7 +271,7 @@ fn description(item: &Entry) -> String {
                 .and_then(|file| file.total_bytes)
         })
         .map_or_else(|| "size unknown".into(), bytes);
-    format!("{status}  ·  {count} {unit}  ·  {size} total")
+    format!("{count} {unit}  ·  {size} total")
 }
 
 fn fraction(transfer: &Transfer) -> Option<f32> {
@@ -275,13 +281,29 @@ fn fraction(transfer: &Transfer) -> Option<f32> {
         .map(|total| (transfer.received_bytes as f32 / total as f32).min(1.0))
 }
 
-fn metrics(transfer: &Transfer) -> String {
-    let received = bytes(transfer.received_bytes);
-    let speed = bytes(transfer.bytes_per_second);
-    match transfer.total_bytes {
-        Some(total) => format!("{received} / {}  ·  {speed}/s", bytes(total)),
-        None => format!("{received}  ·  {speed}/s"),
+fn filename(transfer: &Transfer) -> String {
+    if transfer.total > 1 {
+        format!(
+            "{}/{}  {}",
+            transfer.current, transfer.total, transfer.file_name
+        )
+    } else {
+        transfer.file_name.clone()
     }
+}
+
+fn transfer_metrics(transfer: &Transfer, t: Theme) -> El {
+    let received = match transfer.total_bytes {
+        Some(total) => format!("{} / {}", bytes(transfer.received_bytes), bytes(total)),
+        None => bytes(transfer.received_bytes),
+    };
+    row()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap(6.0)
+        .child(muted(received, t).shrink().min_w(0.0).truncate())
+        .child(muted(format!("{}/s", bytes(transfer.bytes_per_second)), t).truncate())
 }
 
 fn bytes(value: u64) -> String {
@@ -298,23 +320,43 @@ fn bytes(value: u64) -> String {
     unreachable!()
 }
 
+fn handoff_links(s: &State) -> impl Iterator<Item = &Url> {
+    let mut seen = HashSet::new();
+    s.queue
+        .items
+        .iter()
+        .flat_map(|entry| match &entry.phase {
+            Phase::Waiting(links) => links.as_slice(),
+            _ => &[],
+        })
+        .chain(&s.snapshot.nexus_pages)
+        .filter(move |&url| seen.insert(url))
+}
+
 fn handoff(s: &State, t: Theme, k: &Kit) -> El {
-    let enabled = s.snapshot.selected.is_some();
+    let waiting = s
+        .queue
+        .items
+        .iter()
+        .any(|item| matches!(item.phase, Phase::Waiting(_)));
+    let enabled = s.queue.available() && (s.snapshot.selected.is_some() || waiting);
     let mut links = col().w_full().gap(6.0);
-    for (index, url) in s.snapshot.nexus_pages.iter().enumerate() {
+    let mut pages = handoff_links(s).peekable();
+    let has_pages = pages.peek().is_some();
+    for (index, url) in pages.enumerate() {
         let url = url.clone();
         links = links.child(button(
             format!("open-handoff-{index}"),
             format!("Open Nexus file {} ↗", index + 1),
             t,
             false,
-            enabled,
+            true,
             move |s, tx| open_page(s, tx, url.as_str()),
         ));
     }
     let view = panel(t)
-        .child(muted("On Nexus, click Mod Manager Download for each file, then paste each nxm:// link below.", t).wrap())
-        .children((!s.snapshot.nexus_pages.is_empty()).then(|| {
+        .child(muted("Use your free Nexus account in the browser: open each file page, choose Mod Manager Download, then paste its nxm:// link here.", t).wrap())
+        .children(has_pages.then(|| {
             col().w_full().max_h(220.0).scroll(ScrollSpec { stick_bottom: false }).child(links)
         }));
     let view = view.children((!s.notice.is_empty()).then(|| muted(&s.notice, t).wrap()));

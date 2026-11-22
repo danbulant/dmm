@@ -15,6 +15,8 @@ use dmm::sources::{
 use rune::{TextEdit, Tx};
 use rune_kit::ImageZoom;
 
+use super::preferences::BrowsePreferences;
+
 use super::{Origin, Screen, Snapshot, State, Update};
 pub(super) use explore::explore;
 
@@ -49,6 +51,7 @@ pub(super) struct Browser {
     pub(super) detail: Option<Detail>,
     install_into: TextEdit,
     pub(super) nxm: TextEdit,
+    pub(super) preference_save_due: Option<Instant>,
 }
 
 impl Default for Browser {
@@ -56,7 +59,7 @@ impl Default for Browser {
         Self {
             source: Source::Nexus,
             query: TextEdit::default(),
-            sort: Sort::Relevance,
+            sort: Sort::Newest,
             sort_menu: false,
             category: None,
             category_group: None,
@@ -79,6 +82,7 @@ impl Default for Browser {
             detail: None,
             nxm: TextEdit::default(),
             install_into: TextEdit::default(),
+            preference_save_due: None,
         }
     }
 }
@@ -123,6 +127,7 @@ impl Detail {
 
 impl Browser {
     pub(super) fn reset_origin(&mut self) {
+        self.sort = Sort::Newest;
         self.category = None;
         self.category_group = None;
         self.catalog = Catalog::Idle;
@@ -130,6 +135,7 @@ impl Browser {
         self.search_revision += 1;
         self.sort_menu = false;
         self.find_category = TextEdit::default();
+        self.maturity = Maturity::Safe;
         self.provider_filters = ProviderFilters::default();
         if self.source == Source::GameBanana {
             self.provider_filters.content_ratings.push("-".to_owned());
@@ -143,6 +149,30 @@ impl Browser {
         self.show_search_progress = false;
         self.detail = None;
         self.show_filters = false;
+    }
+
+    pub(super) fn restore_preferences(&mut self, preferences: &BrowsePreferences) {
+        self.sort = preferences.query.sort;
+        self.category = preferences.query.category.clone();
+        self.maturity = preferences.query.maturity;
+        self.provider_filters = preferences.query.filters.clone();
+        self.author = TextEdit::new(
+            preferences
+                .query
+                .filters
+                .author
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        self.language = TextEdit::new(
+            preferences
+                .query
+                .filters
+                .language
+                .as_deref()
+                .unwrap_or_default(),
+        );
+        self.tag = TextEdit::new(preferences.query.filters.tag.as_deref().unwrap_or_default());
     }
 
     fn catalog(&self) -> Option<&FilterCatalog> {
@@ -312,13 +342,87 @@ impl State {
     }
 
     pub(super) fn search(&mut self) {
+        self.store_browse_preferences();
         self.run_query(self.query_for_controls(), Duration::ZERO, false);
         self.drive_explore();
     }
 
     fn search_after_edit(&mut self, tx: &mut Tx) {
+        self.store_browse_preferences();
         self.run_query(self.query_for_controls(), SEARCH_DEBOUNCE, false);
         tx.wake_after(SEARCH_DEBOUNCE);
+    }
+
+    pub(super) fn restore_browse_preferences(&mut self, origin: &Origin) {
+        let Some(saved) = self
+            .preferences
+            .browse
+            .iter()
+            .find(|saved| {
+                saved.game_kind == self.game_kind()
+                    && saved.source == origin.source
+                    && saved.provider_game == origin.game
+            })
+            .cloned()
+        else {
+            return;
+        };
+        self.browser.restore_preferences(&saved);
+    }
+
+    fn store_browse_preferences(&mut self) {
+        let Some(origin) = self.origin().cloned() else {
+            return;
+        };
+        let mut query = self.query_for_controls();
+        query.text.clear();
+        query.page = 1;
+        let saved = BrowsePreferences {
+            game_kind: self.game_kind(),
+            source: origin.source,
+            provider_game: origin.game,
+            query,
+        };
+        let has_saved_settings = self.preferences.browse.iter().any(|entry| {
+            entry.game_kind == saved.game_kind
+                && entry.source == saved.source
+                && entry.provider_game == saved.provider_game
+        });
+        if !has_saved_settings {
+            let mut default_filters = ProviderFilters::default();
+            if saved.source == Source::GameBanana {
+                default_filters.content_ratings.push("-".to_owned());
+            }
+            let default_query = SearchQuery {
+                text: String::new(),
+                page: 1,
+                category: None,
+                sort: Sort::Newest,
+                maturity: if saved.source == Source::Nexus {
+                    Maturity::Safe
+                } else {
+                    Maturity::All
+                },
+                filters: default_filters,
+            };
+            if saved.query == default_query {
+                return;
+            }
+        }
+        let existing = self.preferences.browse.iter_mut().find(|entry| {
+            entry.game_kind == saved.game_kind
+                && entry.source == saved.source
+                && entry.provider_game == saved.provider_game
+        });
+        if let Some(existing) = existing {
+            if existing == &saved {
+                return;
+            }
+            *existing = saved;
+        } else {
+            self.preferences.browse.push(saved);
+        }
+        self.browser.preference_save_due = Some(Instant::now() + Duration::from_millis(500));
     }
 
     fn query_for_controls(&self) -> SearchQuery {
@@ -374,7 +478,20 @@ impl State {
         let Some(origin) = self.origin().cloned() else {
             return false;
         };
-        if self.browser.show_filters && matches!(self.browser.catalog, Catalog::Idle) {
+        let needs_filter_labels = self.browser.category.is_some()
+            || self.browser.provider_filters.release_type.is_some()
+            || self
+                .browser
+                .provider_filters
+                .content_ratings
+                .iter()
+                .any(|rating| rating != "-");
+        if (self.browser.show_filters
+            || (self.browser.results.is_some()
+                && self.browser.pending_search.is_none()
+                && needs_filter_labels))
+            && matches!(self.browser.catalog, Catalog::Idle)
+        {
             let submitted = self.submit_catalog("Loading provider filters…", move |worker| {
                 let result = worker
                     .online()
@@ -429,6 +546,9 @@ impl State {
         if self.browser.source != source {
             self.browser.source = source;
             self.browser.reset_origin();
+            if let Some(origin) = self.origin().cloned() {
+                self.restore_browse_preferences(&origin);
+            }
             self.sync_previews();
             tx.scroll_to_instant("main-scroll", 0.0, 0.0);
             self.search();
@@ -533,7 +653,13 @@ impl State {
         self.change_bookmark(move |library| library.unsave(&id));
     }
 
-    fn toggle_bookmark(&mut self, id: RemoteMod, name: String, image: Option<String>, saved: bool) {
+    pub(super) fn toggle_bookmark(
+        &mut self,
+        id: RemoteMod,
+        name: String,
+        image: Option<String>,
+        saved: bool,
+    ) {
         if saved {
             self.unsave(id);
         } else {
@@ -660,16 +786,59 @@ fn nonempty(s: &str) -> Option<&str> {
 mod tests {
     use rune::{Env, Runtime};
 
+    use super::super::preferences::Preferences;
     use super::*;
 
     #[test]
+    fn explore_restores_each_source_on_reopen_even_when_closed_before_debounce()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut state = State::new(dir.path().to_owned());
+        assert_eq!(state.query_for_controls().sort, Sort::Newest);
+        state.browser.sort = Sort::Popularity;
+        state.browser.maturity = Maturity::Adult;
+        state.browser.author = TextEdit::new("creator");
+        state.browser.query = TextEdit::new("temporary terms");
+        state.set_publish_window(Some(TimeWindow::Month));
+        state.change_source(Source::GameBanana, &mut Tx::default());
+        assert_eq!(state.query_for_controls().sort, Sort::Newest);
+        assert_eq!(state.query_for_controls().filters.content_ratings, ["-"]);
+        state.browser.sort = Sort::Updated;
+        state.browser.provider_filters.content_ratings = vec!["iv".into()];
+        state.browser.provider_filters.release_type = Some("indie".into());
+        state.category(Some("2700".into()));
+        drop(state);
+
+        let mut state = State::new(dir.path().to_owned());
+        state.preferences = Preferences::load(dir.path())?;
+        let nexus = state.origin().unwrap().clone();
+        state.restore_browse_preferences(&nexus);
+        let query = state.query_for_controls();
+        assert_eq!(query.sort, Sort::Popularity);
+        assert_eq!(query.maturity, Maturity::Adult);
+        assert_eq!(query.filters.author.as_deref(), Some("creator"));
+        assert_eq!(query.filters.published_within, Some(TimeWindow::Month));
+        assert!(query.text.is_empty());
+
+        state.change_source(Source::GameBanana, &mut Tx::default());
+        let query = state.query_for_controls();
+        assert_eq!(query.sort, Sort::Updated);
+        assert_eq!(query.category.as_deref(), Some("2700"));
+        assert_eq!(query.filters.content_ratings, ["iv"]);
+        assert_eq!(query.filters.release_type.as_deref(), Some("indie"));
+        assert!(query.filters.author.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn clearing_filters_queues_page_one_without_overwriting_sfw_or_all() {
+        let dir = tempfile::tempdir().unwrap();
         for (before, after) in [
             (Maturity::Safe, Maturity::Safe),
             (Maturity::All, Maturity::All),
             (Maturity::Adult, Maturity::All),
         ] {
-            let mut state = State::new(PathBuf::from("unused"));
+            let mut state = State::new(dir.path().to_owned());
             state.catalog_busy = Some("Searching mods…");
             state.browser.maturity = before;
             state.browser.query = TextEdit::new("suit");
@@ -681,10 +850,11 @@ mod tests {
             let (_, pending) = state
                 .browser
                 .pending_search
+                .as_ref()
                 .expect("clear must schedule a query");
             assert_eq!(
                 pending,
-                SearchQuery {
+                &SearchQuery {
                     text: "suit".into(),
                     page: 1,
                     maturity: after,
@@ -718,7 +888,8 @@ mod tests {
 
     #[test]
     fn gamebanana_unrated_is_default_and_survives_clear() {
-        let mut state = State::new(PathBuf::from("unused"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = State::new(dir.path().to_owned());
         state.browser.source = Source::GameBanana;
         state.browser.reset_origin();
         assert_eq!(
