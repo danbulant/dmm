@@ -11,6 +11,7 @@ use super::{
 
 const BASE: &str = "https://gamebanana.com/apiv11/";
 const WEB: &str = "https://gamebanana.com/mods/";
+const INDEX_PER_PAGE: u64 = 30;
 
 fn endpoint(path: &str) -> Result<Url> {
     Url::parse(BASE)?
@@ -73,6 +74,7 @@ fn search_single(client: &Client, game: &str, query: &SearchQuery) -> Result<Sea
         || query.filters.release_type.is_some()
         || !query.filters.content_ratings.is_empty()
         || query.sort == Sort::Likes;
+    let requested_per_page = if listing { INDEX_PER_PAGE } else { 15 };
     let mut url = endpoint(if listing {
         "Mod/Index"
     } else {
@@ -82,7 +84,7 @@ fn search_single(client: &Client, game: &str, query: &SearchQuery) -> Result<Sea
         let mut params = url.query_pairs_mut();
         params
             .append_pair("_nPage", &page.to_string())
-            .append_pair("_nPerpage", "15");
+            .append_pair("_nPerpage", &requested_per_page.to_string());
         if listing {
             params
                 .append_pair("_aFilters[Generic_Game]", &game)
@@ -182,7 +184,7 @@ fn search_single(client: &Client, game: &str, query: &SearchQuery) -> Result<Sea
         .and_then(numeric);
     let per_page = optional_num(metadata, "_nPerpage")
         .filter(|&per_page| per_page > 0)
-        .unwrap_or(15);
+        .unwrap_or(requested_per_page);
     let has_more = metadata
         .get("_bIsComplete")
         .and_then(Value::as_bool)
