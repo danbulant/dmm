@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use dmm::games::GameKind;
 use dmm::library::{Library, ManagedMod};
 use dmm::sources::{
     FilterCatalog, Maturity, ModDetails, ModFile, ProviderFilters, RemoteMod, SearchPage,
@@ -49,6 +50,7 @@ pub(super) struct Browser {
     pub(super) results: Option<Rc<SearchPage>>,
     pub(super) shown_query: Option<SearchQuery>,
     pub(super) detail: Option<Detail>,
+    pub(super) install_dialog: Option<InstallDialog>,
     install_into: TextEdit,
     pub(super) nxm: TextEdit,
     pub(super) preference_save_due: Option<Instant>,
@@ -80,6 +82,7 @@ impl Default for Browser {
             results: None,
             shown_query: None,
             detail: None,
+            install_dialog: None,
             nxm: TextEdit::default(),
             install_into: TextEdit::default(),
             preference_save_due: None,
@@ -101,18 +104,18 @@ enum Catalog {
     Failed,
 }
 
-pub(super) struct Detail {
+pub(super) struct InstallDialog {
     pub(super) info: ModDetails,
-    pub(super) image: usize,
-    description: String,
-    selected_files: BTreeSet<u64>,
-    missing_previous_files: bool,
-    install_open: bool,
-    full_image_open: bool,
-    pub(super) zoom: ImageZoom,
+    pub(super) selected_files: BTreeSet<u64>,
+    pub(super) missing_previous_files: bool,
+    screen: Screen,
+    game: GameKind,
+    instance: Option<String>,
+    origin: Option<Origin>,
+    local_detail: Option<String>,
 }
 
-impl Detail {
+impl InstallDialog {
     pub(super) fn picked_files(&self) -> impl Iterator<Item = &ModFile> {
         self.info
             .files
@@ -120,6 +123,31 @@ impl Detail {
             .filter(|file| self.selected_files.contains(&file.id))
     }
 
+    pub(super) fn belongs_to(&self, state: &State) -> bool {
+        self.screen == state.screen
+            && self.game == state.game_kind()
+            && self.instance.as_deref()
+                == state
+                    .snapshot
+                    .selected
+                    .as_ref()
+                    .map(|instance| instance.name.as_str())
+            && self.origin.as_ref() == state.origin()
+            && self.local_detail.as_deref() == state.local_detail.as_deref()
+    }
+}
+
+pub(super) struct Detail {
+    pub(super) info: ModDetails,
+    pub(super) image: usize,
+    description: String,
+    selected_files: BTreeSet<u64>,
+    missing_previous_files: bool,
+    full_image_open: bool,
+    pub(super) zoom: ImageZoom,
+}
+
+impl Detail {
     pub(super) fn poll_zoom(&mut self, now: f64, tx: &mut Tx) -> bool {
         self.full_image_open && self.zoom.poll(now, tx)
     }
@@ -148,6 +176,7 @@ impl Browser {
         self.searching_since = None;
         self.show_search_progress = false;
         self.detail = None;
+        self.install_dialog = None;
         self.show_filters = false;
     }
 
@@ -251,7 +280,6 @@ impl Browser {
             info,
             image: 0,
             description,
-            install_open: false,
             full_image_open: false,
             zoom: ImageZoom::new(),
         });
@@ -700,8 +728,8 @@ impl State {
             .find(|record| record.release().is_some_and(|release| release.id == *id))
     }
 
-    pub(super) fn show_online_details(&mut self, info: ModDetails) {
-        let installed_files = self.installed_for(&info.id).map(|record| {
+    fn installed_file_ids(&self, id: &RemoteMod) -> Option<BTreeSet<u64>> {
+        self.installed_for(id).map(|record| {
             if record.releases().is_empty() {
                 record
                     .release()
@@ -713,9 +741,53 @@ impl State {
                     .releases()
                     .iter()
                     .map(|release| release.file_id)
-                    .collect::<BTreeSet<_>>()
+                    .collect()
             }
-        });
+        })
+    }
+
+    pub(super) fn open_install_dialog(&mut self, info: ModDetails) {
+        let mut main = info.files.iter().filter(|file| file.primary);
+        let primary = main.next().filter(|_| main.next().is_none());
+        let selected_files = if info.files.len() == 1 {
+            info.files.first()
+        } else {
+            primary
+        }
+        .map(|file| file.id)
+        .into_iter()
+        .collect();
+        let installed_files = self.installed_file_ids(&info.id);
+        let mut dialog = InstallDialog {
+            info,
+            selected_files,
+            missing_previous_files: false,
+            screen: self.screen,
+            game: self.game_kind(),
+            instance: self
+                .snapshot
+                .selected
+                .as_ref()
+                .map(|instance| instance.name.clone()),
+            origin: self.origin().cloned(),
+            local_detail: self.local_detail.clone(),
+        };
+        if let Some(ids) = installed_files {
+            dialog.missing_previous_files = ids
+                .iter()
+                .any(|id| !dialog.info.files.iter().any(|file| file.id == *id));
+            dialog.selected_files = if dialog.missing_previous_files {
+                BTreeSet::new()
+            } else {
+                ids
+            };
+        }
+        self.browser.install_into = TextEdit::default();
+        self.browser.install_dialog = Some(dialog);
+    }
+
+    pub(super) fn show_online_details(&mut self, info: ModDetails) {
+        let installed_files = self.installed_file_ids(&info.id);
         self.browser.show_details(info);
         if let Some(ids) = installed_files
             && let Some(detail) = &mut self.browser.detail
@@ -732,26 +804,26 @@ impl State {
     }
 
     fn install_selected(&mut self) {
-        let Some(detail) = &self.browser.detail else {
+        let Some(dialog) = &self.browser.install_dialog else {
             return;
         };
-        if !self.matches_instance(&detail.info.id) {
+        if !dialog.belongs_to(self) || !self.matches_instance(&dialog.info.id) {
             return;
         }
         let Some(target) = self.snapshot.selected.as_ref().map(|i| i.name.clone()) else {
             return;
         };
-        let files: Vec<_> = detail.picked_files().cloned().collect();
+        let files: Vec<_> = dialog.picked_files().cloned().collect();
         if files.is_empty() {
             return;
         }
-        let info = detail.info.clone();
+        let info = dialog.info.clone();
         let into = nonempty(&self.browser.install_into.text).map(PathBuf::from);
         let keep_disabled = self
             .installed_for(&info.id)
             .map_or(!self.preferences.enable_new_mods, |record| !record.enabled);
         if self.enqueue_install(target, info, files, into, keep_disabled) {
-            details::close_install(self);
+            self.browser.install_dialog = None;
         }
     }
 
@@ -788,6 +860,64 @@ mod tests {
 
     use super::super::preferences::Preferences;
     use super::*;
+
+    #[test]
+    fn install_dialog_survives_search_and_detail_state_changes_but_not_context_changes() {
+        let mut state = State::new(PathBuf::from("unused"));
+        let info = ModDetails {
+            id: RemoteMod {
+                source: Source::Nexus,
+                game: "cyberpunk2077".into(),
+                id: 42,
+            },
+            name: "Wardrobe".into(),
+            author: None,
+            category: None,
+            tags: Vec::new(),
+            summary: None,
+            description: None,
+            version: None,
+            updated_at: None,
+            created_at: None,
+            url: None,
+            adult: Some(false),
+            images: Vec::new(),
+            requirements: Vec::new(),
+            files: vec![ModFile {
+                id: 1,
+                name: "wardrobe.zip".into(),
+                version: None,
+                updated_at: None,
+                size: None,
+                downloads: None,
+                primary: true,
+                category: None,
+                description: None,
+                url: None,
+            }],
+        };
+        state.open_install_dialog(info.clone());
+        assert!(state.browser.detail.is_none());
+
+        state.browser.query = TextEdit::new("new search");
+        state.search();
+        assert!(
+            state
+                .browser
+                .install_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.belongs_to(&state))
+        );
+
+        state.browser.show_details(info.clone());
+        assert!(state.browser.install_dialog.is_some());
+        state.set_screen(Screen::Local, &mut Tx::default());
+        assert!(state.browser.install_dialog.is_none());
+        state.set_screen(Screen::Explore, &mut Tx::default());
+        state.open_install_dialog(info);
+        state.apply_game(GameKind::Zzmi, Snapshot::default(), &mut Tx::default());
+        assert!(state.browser.install_dialog.is_none());
+    }
 
     #[test]
     fn explore_restores_each_source_on_reopen_even_when_closed_before_debounce()

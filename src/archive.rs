@@ -1,3 +1,6 @@
+mod rar;
+
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::CStr;
 #[cfg(not(windows))]
@@ -57,6 +60,8 @@ unsafe extern "C" {
     fn archive_read_data(archive: *mut ArchiveHandle, buffer: *mut u8, size: usize) -> isize;
     fn archive_read_data_skip(archive: *mut ArchiveHandle) -> c_int;
     fn archive_error_string(archive: *mut ArchiveHandle) -> *const c_char;
+    fn archive_format(archive: *mut ArchiveHandle) -> c_int;
+    fn archive_entry_pathname(entry: *mut ArchiveEntry) -> *const c_char;
     fn archive_entry_pathname_utf8(entry: *mut ArchiveEntry) -> *const c_char;
     fn archive_entry_strmode(entry: *mut ArchiveEntry) -> *const c_char;
     fn archive_entry_size_is_set(entry: *mut ArchiveEntry) -> c_int;
@@ -73,6 +78,8 @@ unsafe extern "C" {
 
 const ARCHIVE_OK: c_int = 0;
 const ARCHIVE_EOF: c_int = 1;
+const ARCHIVE_FORMAT_BASE_MASK: c_int = 0xFF_0000;
+const ARCHIVE_FORMAT_ZIP: c_int = 0x05_0000;
 
 pub struct ArchiveTree {
     _temp_dir: TempDir,
@@ -174,17 +181,20 @@ fn unpack_with_limits(
         );
     }
 
-    let temp_dir = Builder::new()
-        .prefix("dmm-import-")
-        .tempdir_in(scratch)
-        .with_context(|| {
-            format!(
-                "cannot create private import directory in {}",
-                scratch.display()
-            )
-        })?;
-    let mut state = ExtractState::new(temp_dir.path(), max_files, max_entries, max_bytes);
+    let temp = || {
+        Builder::new()
+            .prefix("dmm-import-")
+            .tempdir_in(scratch)
+            .with_context(|| {
+                format!(
+                    "cannot create private import directory in {}",
+                    scratch.display()
+                )
+            })
+    };
+    let mut temp_dir = temp()?;
     let mut files = if metadata.is_dir() {
+        let mut state = ExtractState::new(temp_dir.path(), max_files, max_entries, max_bytes);
         copy_directory(input, Path::new(""), &mut state)?;
         state.files
     } else {
@@ -192,8 +202,21 @@ fn unpack_with_limits(
             metadata.is_file(),
             "input must be a regular archive file or directory"
         );
-        extract_archive(input, &mut state)?;
-        state.files
+        let mut state = ExtractState::new(temp_dir.path(), max_files, max_entries, max_bytes);
+        match extract_archive(input, &mut state) {
+            Ok(()) => state.files,
+            Err(libarchive_error) if rar::is_rar(input)? => {
+                drop(state);
+                temp_dir = temp()?;
+                let mut retry =
+                    ExtractState::new(temp_dir.path(), max_files, max_entries, max_bytes);
+                rar::extract(input, &mut retry).with_context(|| {
+                    format!("libarchive failed ({libarchive_error:#}); UnRAR fallback failed")
+                })?;
+                retry.files
+            }
+            Err(error) => return Err(error),
+        }
     };
     files.sort();
     Ok(ArchiveTree {
@@ -429,8 +452,23 @@ impl ArchiveReader {
     fn read_data(&mut self, buffer: &mut [u8]) -> anyhow::Result<usize> {
         let count =
             unsafe { archive_read_data(self.0.as_ptr(), buffer.as_mut_ptr(), buffer.len()) };
-        ensure!(count >= 0, "{}", self.error_message("read archive data"));
+        ensure!(
+            count >= 0,
+            "{}",
+            Self::integrity_guidance(self.error_message("read archive data"))
+        );
         usize::try_from(count).context("invalid archive read length")
+    }
+
+    fn integrity_guidance(message: String) -> String {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("checksum") || lower.contains("crc") {
+            format!(
+                "{message}; archive integrity verification failed. Download the archive again; if the error persists, test it with the original archive tool and repackage only after it verifies."
+            )
+        } else {
+            message
+        }
     }
 
     fn skip_data(&mut self) -> anyhow::Result<()> {
@@ -444,7 +482,7 @@ impl ArchiveReader {
         if status == ARCHIVE_OK {
             Ok(())
         } else {
-            bail!("{}", self.error_message(action));
+            bail!("{}", Self::integrity_guidance(self.error_message(action)));
         }
     }
 
@@ -469,16 +507,77 @@ impl Drop for ArchiveReader {
     }
 }
 
+#[cfg(unix)]
+struct ArchiveLocale {
+    previous: libc::locale_t,
+    utf8: libc::locale_t,
+}
+
+#[cfg(unix)]
+impl ArchiveLocale {
+    fn utf8() -> Option<Self> {
+        // libarchive uses LC_CTYPE for pathname conversions, even when asked for UTF-8.
+        // Keep the locale thread-local so imports never change other app threads.
+        for name in [c"C.UTF-8", c"UTF-8", c"en_US.UTF-8"] {
+            let utf8 = unsafe {
+                libc::newlocale(libc::LC_CTYPE_MASK, name.as_ptr(), std::ptr::null_mut())
+            };
+            if utf8.is_null() {
+                continue;
+            }
+            let previous = unsafe { libc::uselocale(utf8) };
+            if previous.is_null() {
+                unsafe { libc::freelocale(utf8) };
+                return None;
+            }
+            return Some(Self { previous, utf8 });
+        }
+        None
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ArchiveLocale {
+    fn drop(&mut self) {
+        unsafe {
+            libc::uselocale(self.previous);
+            libc::freelocale(self.utf8);
+        }
+    }
+}
+
 fn extract_archive(input: &Path, state: &mut ExtractState<'_>) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    let _locale = ArchiveLocale::utf8();
     let mut archive = ArchiveReader::open(input)
         .with_context(|| format!("cannot open archive {}", input.display()))?;
     while let Some(entry) = archive.next_entry()? {
         let entry = entry.as_ptr();
         let pathname = unsafe { archive_entry_pathname_utf8(entry) };
-        ensure!(!pathname.is_null(), "archive entry has no UTF-8 pathname");
-        let name = unsafe { CStr::from_ptr(pathname) }
-            .to_str()
-            .context("archive entry pathname is not UTF-8")?;
+        let name = if !pathname.is_null() {
+            Cow::Borrowed(
+                unsafe { CStr::from_ptr(pathname) }
+                    .to_str()
+                    .context("archive entry pathname is not UTF-8")?,
+            )
+        } else {
+            let pathname = unsafe { archive_entry_pathname(entry) };
+            ensure!(
+                !pathname.is_null(),
+                "archive entry has no recoverable pathname"
+            );
+            let bytes = unsafe { CStr::from_ptr(pathname) }.to_bytes();
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                Cow::Borrowed(text)
+            } else {
+                ensure!(
+                    unsafe { archive_format(archive.0.as_ptr()) } & ARCHIVE_FORMAT_BASE_MASK
+                        == ARCHIVE_FORMAT_ZIP,
+                    "archive entry pathname is not UTF-8"
+                );
+                Cow::Owned(decode_cp437(bytes))
+            }
+        };
         ensure!(
             unsafe { archive_entry_symlink(entry) }.is_null(),
             "symbolic links are not allowed in archives"
@@ -491,13 +590,13 @@ fn extract_archive(input: &Path, state: &mut ExtractState<'_>) -> anyhow::Result
         let mode = unsafe { archive_entry_strmode(entry) };
         ensure!(!mode.is_null(), "missing archive entry type");
         let file_type = unsafe { *mode } as u8;
-        if matches!(name, "." | "./" | ".\\") && file_type == b'd' {
+        if matches!(name.as_ref(), "." | "./" | ".\\") && file_type == b'd' {
             state.record_entry()?;
             archive.skip_data()?;
             continue;
         }
-        let portable =
-            archive_portable_path(name).with_context(|| format!("unsafe archive path {name:?}"))?;
+        let portable = archive_portable_path(&name)
+            .with_context(|| format!("unsafe archive path {name:?}"))?;
         match file_type {
             b'-' => {
                 state.begin_file()?;
@@ -549,6 +648,28 @@ fn extract_archive(input: &Path, state: &mut ExtractState<'_>) -> anyhow::Result
     }
     Ok(())
 }
+
+fn decode_cp437(bytes: &[u8]) -> String {
+    let mut decoded = String::with_capacity(bytes.len());
+    for &byte in bytes {
+        if byte < 0x80 {
+            decoded.push(char::from(byte));
+        } else {
+            decoded.push(CP437[usize::from(byte - 0x80)]);
+        }
+    }
+    decoded
+}
+
+const CP437: [char; 128] = [
+    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', 'É', 'æ', 'Æ',
+    'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ', 'á', 'í', 'ó', 'ú', 'ñ', 'Ñ',
+    'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»', '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕',
+    '╣', '║', '╗', '╝', '╜', '╛', '┐', '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦',
+    '╠', '═', '╬', '╧', '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐',
+    '▀', 'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩', '≡', '±',
+    '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', ' ',
+];
 
 fn archive_portable_path(name: &str) -> anyhow::Result<String> {
     ensure!(
@@ -638,7 +759,7 @@ pub(crate) fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{archive_portable_path, portable_path, unpack_with_limits};
+    use super::{archive_portable_path, portable_path, unpack, unpack_with_limits};
     use std::fs;
     use std::path::Path;
     use tempfile::Builder;
@@ -648,6 +769,19 @@ mod tests {
             .prefix("dmm-archive-test-")
             .tempdir_in(env!("CARGO_MANIFEST_DIR"))
             .unwrap()
+    }
+
+    #[test]
+    fn extracts_zip_with_a_legacy_cp437_filename() -> anyhow::Result<()> {
+        let temp = workspace_tempdir();
+        let path = temp.path().join("legacy.zip");
+        fs::write(&path, b"PK\x03\x04\x14\0\0\0\0\0\x24\x9e\x76\x5d\x83\x16\xdc\x8c\x01\0\0\0\x01\0\0\0\x0c\0\0\0caf\x82/mod.inix\
+PK\x01\x02\x14\x03\x14\0\0\0\0\0\x24\x9e\x76\x5d\x83\x16\xdc\x8c\x01\0\0\0\x01\0\0\0\x0c\0\0\0\0\0\0\0\0\0\x80\x01\0\0\0\0caf\x82/mod.ini\
+PK\x05\x06\0\0\0\0\x01\0\x01\0\x3a\0\0\0\x2b\0\0\0\0\0")?;
+        let archive = unpack(&path, temp.path())?;
+        assert_eq!(archive.files, [Path::new("café/mod.ini")]);
+        assert_eq!(fs::read(archive.root().join("café/mod.ini"))?, b"x");
+        Ok(())
     }
 
     #[test]

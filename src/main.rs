@@ -116,6 +116,9 @@ enum Command {
     /// Finish an authorized Nexus handoff from a copied or OS-delivered nxm:// URL.
     AcceptNxm {
         uri: String,
+        /// Deliver an OS-opened link to the live desktop queue; never mutate its library separately.
+        #[arg(long)]
+        from_handler: bool,
     },
     /// List source updates, or install unambiguous updates with --apply.
     Updates {
@@ -179,6 +182,22 @@ fn main() -> Result<()> {
             print(&remote::client()?.categories(source, &game)?)
         }
         Some(Command::Details(identity)) => print(&remote::client()?.details(&identity.into())?),
+        Some(Command::AcceptNxm {
+            uri,
+            from_handler: true,
+        }) => {
+            #[cfg(all(feature = "rune-ui", target_os = "linux"))]
+            {
+                desktop::forward_nexus_handler(&state, &uri)
+            }
+            #[cfg(not(all(feature = "rune-ui", target_os = "linux")))]
+            {
+                let _ = uri;
+                anyhow::bail!(
+                    "Nexus desktop-link handling is supported only by the Linux desktop build"
+                )
+            }
+        }
         Some(command) => with_library(&state, command),
         #[cfg(not(feature = "rune-ui"))]
         None => unreachable!("Clap requires a subcommand in CLI-only builds"),
@@ -259,7 +278,12 @@ fn with_library(state: &Path, command: Command) -> Result<()> {
             remote::search(&library, search.into(), instance.as_deref())
         }
         Command::InstallRemote(request) => remote::install(&mut library, request),
-        Command::AcceptNxm { uri } => remote::accept_nxm(&mut library, &uri),
+        Command::AcceptNxm { uri, from_handler } => {
+            if from_handler {
+                anyhow::bail!("OS-delivered Nexus links must be routed to the running desktop");
+            }
+            remote::accept_nxm(&mut library, &uri)
+        }
         Command::Updates { instance, apply } => remote::updates(&mut library, &instance, apply),
         Command::Save(identity) => {
             let id: RemoteMod = identity.into();

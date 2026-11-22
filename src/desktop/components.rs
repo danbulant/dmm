@@ -210,3 +210,17 @@ pub(super) fn source_name(source: Source) -> &'static str {
         Source::Local => "Local file",
     }
 }
+
+pub(super) fn bytes(value: u64) -> String {
+    if value < 1024 {
+        return format!("{value} B");
+    }
+    let mut amount = value as f64;
+    for unit in ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"] {
+        amount /= 1024.0;
+        if amount < 1024.0 {
+            return format!("{amount:.1} {unit}");
+        }
+    }
+    unreachable!("u64 byte counts fit in EiB")
+}

@@ -325,7 +325,12 @@ impl Previews {
         t: Theme,
     ) -> El {
         let frame = frame.fill(t.control_off).center();
-        match self.image(size, url) {
+        let image = self.image(size, url).or_else(|| {
+            (size == Size::Thumbnail)
+                .then(|| self.image(Size::Card, url))
+                .flatten()
+        });
+        match image {
             Some(image) => frame.pixels_fit(&image.pixels, fit),
             None if size == Size::Thumbnail => frame,
             None if url.is_some() => frame.child(muted("Loading preview…", t)),
@@ -355,7 +360,7 @@ fn image_host(url: &Url) -> bool {
 }
 
 fn freshness(headers: &HeaderMap) -> Duration {
-    let mut seconds = 3600_u64;
+    let mut seconds = None::<u64>;
     for control in headers
         .get_all(CACHE_CONTROL)
         .iter()
@@ -367,7 +372,8 @@ fn freshness(headers: &HeaderMap) -> Duration {
                 return Duration::ZERO;
             }
             if name.eq_ignore_ascii_case("max-age") {
-                seconds = seconds.min(value.trim_matches('"').parse().unwrap_or(0));
+                let max_age = value.trim_matches('"').parse().unwrap_or(0);
+                seconds = Some(seconds.map_or(max_age, |prior| prior.min(max_age)));
             }
         }
     }
@@ -376,7 +382,7 @@ fn freshness(headers: &HeaderMap) -> Duration {
         .and_then(|age| age.to_str().ok())
         .and_then(|age| age.parse().ok())
         .unwrap_or(0);
-    Duration::from_secs(seconds.saturating_sub(age))
+    Duration::from_secs(seconds.unwrap_or(3600).min(7 * 86_400).saturating_sub(age))
 }
 
 fn load(
@@ -388,7 +394,7 @@ fn load(
 ) -> Result<Decoded> {
     let url = Url::parse(raw_url)?;
     ensure!(image_host(&url), "image not hosted by a mod provider");
-    let cache = cache.filter(|_| matches!(size, Size::Card | Size::Thumbnail));
+    let cache = cache.filter(|_| size != Size::Gallery);
     if let Some((bytes, ttl)) = cache.and_then(|cache| cache.get(raw_url, saved))
         && let Ok(decoded) = decode(bytes, size, ttl, None)
     {
@@ -445,4 +451,27 @@ fn decode(
         bytes,
         expires: Instant::now() + ttl,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn category_icon_uses_the_disk_cache_after_reopen() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let url = "https://images.gamebanana.com/categories/character.png";
+        let cache = ThumbnailCache::open(dir.path())?;
+        cache.put(url, &image::RgbaImage::new(64, 32), Duration::from_secs(60))?;
+        drop(cache);
+
+        let cache = ThumbnailCache::open(dir.path())?;
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:0")?)
+            .timeout(Duration::from_millis(100))
+            .build()?;
+        let icon = load(&client, Some(&cache), url, Size::Icon, false)?;
+        assert_eq!((icon.width, icon.height), (48, 24));
+        Ok(())
+    }
 }

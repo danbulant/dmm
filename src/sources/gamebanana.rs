@@ -55,6 +55,15 @@ pub(super) fn search(client: &Client, game: &str, query: &SearchQuery) -> Result
     search_single(client, game, query)
 }
 
+fn listing_sort(sort: Sort) -> &'static str {
+    match sort {
+        Sort::Relevance | Sort::Newest => "Generic_Newest",
+        Sort::Popularity => "Generic_MostDownloaded",
+        Sort::Likes => "Generic_MostLiked",
+        Sort::Updated => "Generic_LatestUpdated",
+    }
+}
+
 fn search_single(client: &Client, game: &str, query: &SearchQuery) -> Result<SearchPage> {
     let game = id_for_game(game)?.to_string();
     let page = query.page.max(1);
@@ -62,7 +71,8 @@ fn search_single(client: &Client, game: &str, query: &SearchQuery) -> Result<Sea
     let listing = text.is_empty()
         || query.category.is_some()
         || query.filters.release_type.is_some()
-        || !query.filters.content_ratings.is_empty();
+        || !query.filters.content_ratings.is_empty()
+        || query.sort == Sort::Likes;
     let mut url = endpoint(if listing {
         "Mod/Index"
     } else {
@@ -74,14 +84,9 @@ fn search_single(client: &Client, game: &str, query: &SearchQuery) -> Result<Sea
             .append_pair("_nPage", &page.to_string())
             .append_pair("_nPerpage", "15");
         if listing {
-            let order = match query.sort {
-                Sort::Relevance | Sort::Newest => "Generic_Newest",
-                Sort::Popularity => "Generic_MostDownloaded",
-                Sort::Updated => "Generic_LatestUpdated",
-            };
             params
                 .append_pair("_aFilters[Generic_Game]", &game)
-                .append_pair("_sSort", order);
+                .append_pair("_sSort", listing_sort(query.sort));
             if !text.is_empty() {
                 params.append_pair("_aFilters[Generic_Name]", &format!("contains,{text}"));
             }
@@ -103,7 +108,7 @@ fn search_single(client: &Client, game: &str, query: &SearchQuery) -> Result<Sea
         } else {
             let order = match query.sort {
                 Sort::Relevance => "best_match",
-                Sort::Popularity => "popularity",
+                Sort::Popularity | Sort::Likes => "popularity",
                 Sort::Newest => "date",
                 Sort::Updated => "udate",
             };
@@ -198,7 +203,7 @@ fn content_rating(value: &Value) -> Option<bool> {
 }
 
 fn tags(value: &Value) -> Vec<String> {
-    value
+    let mut tags: Vec<String> = value
         .get("_aTags")
         .and_then(Value::as_array)
         .into_iter()
@@ -214,7 +219,21 @@ fn tags(value: &Value) -> Vec<String> {
                 .filter(|title| !title.is_empty());
             Some(title.map_or_else(|| value.to_owned(), |title| format!("{title}: {value}")))
         })
-        .collect()
+        .collect();
+    let parent = value
+        .get("_aSuperCategory")
+        .and_then(|value| optional_string(value, "_sName"));
+    if parent.as_deref() == Some("Character Skins")
+        && let Some(name) = value
+            .get("_aCategory")
+            .and_then(|value| optional_string(value, "_sName"))
+    {
+        let tag = format!("Character: {name}");
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+    tags
 }
 
 pub(super) fn details(client: &Client, id: &RemoteMod) -> Result<ModDetails> {
@@ -487,9 +506,15 @@ mod tests {
     use crate::sources::ProviderFilters;
 
     use super::{
-        Maturity, SearchQuery, collect_categories, content_rating, parse_file, preview_images,
-        requirements, search, tags,
+        Maturity, SearchQuery, Sort, collect_categories, content_rating, listing_sort, parse_file,
+        preview_images, requirements, search, tags,
     };
+
+    #[test]
+    fn likes_sort_uses_gamebanana_list_filter_wire_alias() {
+        assert_eq!(listing_sort(Sort::Likes), "Generic_MostLiked");
+        assert_eq!(listing_sort(Sort::Popularity), "Generic_MostDownloaded");
+    }
 
     #[test]
     fn rejects_unsupported_maturity_and_unrated_combinations() {
@@ -564,6 +589,23 @@ mod tests {
             ["Character: Mario", "Genre: Platformer"]
         );
         assert!(tags(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn character_subcategory_is_saved_even_without_explicit_provider_tags() {
+        let profile = json!({
+            "_aTags": [],
+            "_aCategory": {"_sName": "Corin Wickes"},
+            "_aSuperCategory": {"_sName": "Character Skins"},
+        });
+        assert_eq!(tags(&profile), ["Character: Corin Wickes"]);
+        assert!(
+            tags(&json!({
+                "_aCategory": {"_sName": "UI"},
+                "_aSuperCategory": {"_sName": "Other"},
+            }))
+            .is_empty()
+        );
     }
     #[test]
     fn decodes_gamebanana_file_metadata_and_previews() {

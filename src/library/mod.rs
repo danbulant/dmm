@@ -90,6 +90,8 @@ pub struct ManagedMod {
     pub group: Option<String>,
     pub current: usize,
     pub versions: Vec<Version>,
+    #[serde(skip)]
+    pub installed_size: Option<u64>,
     backups: BTreeMap<String, FileState>,
 }
 
@@ -337,6 +339,24 @@ impl Library {
             [instance],
         )
     }
+
+    pub fn mods_with_sizes(&self, instance: &str) -> Result<Vec<ManagedMod>> {
+        let mut mods = self.mods(instance)?;
+        let mut blob_sizes = BTreeMap::new();
+        for managed in &mut mods {
+            managed.installed_size = managed.versions.get(managed.current).and_then(|version| {
+                version.files.values().try_fold(0u64, |total, state| {
+                    let size = *blob_sizes.entry(state.hash.as_str()).or_insert_with(|| {
+                        fs::metadata(self.blobs.join(&state.hash))
+                            .ok()
+                            .map(|meta| meta.len())
+                    });
+                    total.checked_add(size?)
+                })
+            });
+        }
+        Ok(mods)
+    }
     pub fn remote_slug(&self, instance: &str, id: &RemoteMod) -> Result<Option<String>> {
         Ok(self
             .mods(instance)?
@@ -453,6 +473,7 @@ impl Library {
             group: None,
             current: 0,
             versions: Vec::new(),
+            installed_size: None,
             backups: BTreeMap::new(),
         });
         if options.keep_disabled {
@@ -587,6 +608,7 @@ impl Library {
             group: None,
             current: 0,
             versions: Vec::new(),
+            installed_size: None,
             backups: BTreeMap::new(),
         });
         if options.keep_disabled {

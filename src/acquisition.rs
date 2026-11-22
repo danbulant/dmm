@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     env,
     error::Error,
     fmt,
@@ -333,6 +333,30 @@ pub fn redeem_remote(
     Ok(RemoteOutcome::Installed)
 }
 
+struct DownloadRate(VecDeque<(Instant, u64)>);
+
+impl DownloadRate {
+    const WINDOW: Duration = Duration::from_secs(3);
+
+    fn new(start: Instant) -> Self {
+        Self(VecDeque::from([(start, 0)]))
+    }
+
+    fn sample(&mut self, now: Instant, bytes: u64) -> u64 {
+        while self
+            .0
+            .get(1)
+            .is_some_and(|(time, _)| now.duration_since(*time) >= Self::WINDOW)
+        {
+            self.0.pop_front();
+        }
+        let (start, prior) = self.0[0];
+        self.0.push_back((now, bytes));
+        let seconds = now.duration_since(start).as_secs_f64().max(0.2);
+        (bytes.saturating_sub(prior) as f64 / seconds) as u64
+    }
+}
+
 fn fetch_progress(
     client: &SourceClient,
     url: &Url,
@@ -343,27 +367,27 @@ fn fetch_progress(
     total: usize,
     file_name: &str,
 ) -> Result<()> {
-    let mut last_event = Instant::now();
+    let mut rate = DownloadRate::new(Instant::now());
+    let mut last_event = None;
     let mut last_bytes = 0;
     let mut last_total = None;
     client.fetch_observed(url, output, |received, total_bytes| {
         control.check()?;
         let now = Instant::now();
-        if received == 0
-            || total_bytes.is_some_and(|total| received == total)
-            || now.duration_since(last_event) >= Duration::from_millis(150)
+        if last_event.is_none_or(|last| now.duration_since(last) >= Duration::from_millis(200))
+            || total_bytes != last_total
+            || (received != last_bytes && total_bytes == Some(received))
         {
-            let speed = received.saturating_sub(last_bytes) as f64
-                / now.duration_since(last_event).as_secs_f64().max(0.001);
+            let speed = rate.sample(now, received);
             progress(InstallProgress::Downloading {
                 current,
                 total,
                 file_name: file_name.to_owned(),
                 received_bytes: received,
                 total_bytes,
-                bytes_per_second: speed as u64,
+                bytes_per_second: speed,
             });
-            last_event = now;
+            last_event = Some(now);
             last_bytes = received;
             last_total = total_bytes;
         }
@@ -371,16 +395,14 @@ fn fetch_progress(
     })?;
     let received = output.metadata()?.len();
     if received != last_bytes || last_total != Some(received) {
-        let now = Instant::now();
-        let speed = received.saturating_sub(last_bytes) as f64
-            / now.duration_since(last_event).as_secs_f64().max(0.001);
+        let speed = rate.sample(Instant::now(), received);
         progress(InstallProgress::Downloading {
             current,
             total,
             file_name: file_name.to_owned(),
             received_bytes: received,
             total_bytes: Some(received),
-            bytes_per_second: speed as u64,
+            bytes_per_second: speed,
         });
     }
     Ok(())
@@ -668,7 +690,22 @@ pub fn install_archive_with_details(
 }
 #[cfg(test)]
 mod tests {
-    use super::{InstallControl, InstallError};
+    use super::{DownloadRate, Duration, InstallControl, InstallError, Instant};
+
+    #[test]
+    fn download_rate_smooths_bursts_and_falls_to_zero_after_a_stall() {
+        let start = Instant::now();
+        let mut rate = DownloadRate::new(start);
+        let sample = |rate: &mut DownloadRate, millis, bytes| {
+            rate.sample(start + Duration::from_millis(millis), bytes)
+        };
+        assert_eq!(sample(&mut rate, 1000, 2000), 2000);
+        assert_eq!(sample(&mut rate, 2000, 4000), 2000);
+        assert_eq!(sample(&mut rate, 2250, 4000), 1777);
+        assert_eq!(sample(&mut rate, 3000, 6000), 2000);
+        assert_eq!(sample(&mut rate, 4000, 6000), 1333);
+        assert_eq!(sample(&mut rate, 6000, 6000), 0);
+    }
 
     #[test]
     fn cancellation_and_apply_boundary_are_atomic() {

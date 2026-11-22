@@ -53,6 +53,7 @@ pub enum Sort {
     #[default]
     Relevance,
     Popularity,
+    Likes,
     Newest,
     Updated,
 }
@@ -64,6 +65,7 @@ impl FromStr for Sort {
         match value.to_ascii_lowercase().as_str() {
             "relevance" | "best_match" => Ok(Self::Relevance),
             "popularity" => Ok(Self::Popularity),
+            "likes" | "endorsements" => Ok(Self::Likes),
             "newest" | "date" => Ok(Self::Newest),
             "updated" | "udate" => Ok(Self::Updated),
             _ => bail!("unknown sort order: {value}"),
@@ -327,7 +329,7 @@ impl SourceClient {
     pub fn details(&self, id: &RemoteMod) -> Result<ModDetails> {
         let public = id.source != Source::Nexus || self.nexus_key.is_none();
         self.cache.get(
-            "details-v5",
+            "details-v6",
             id,
             Duration::from_secs(120),
             public,

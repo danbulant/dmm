@@ -762,6 +762,7 @@ dependencies = [
  "blake3",
  "clap",
  "image",
+ "libc",
  "open",
  "reqwest",
  "ring",

@@ -201,6 +201,16 @@ fn card(s: &State, item: &SearchResult, t: Theme, k: &Kit) -> El {
         Sort::Popularity => {
             let count = match item.id.source {
                 Source::Nexus => item.endorsements.map(|n| format!("{n} endorsements")),
+                Source::GameBanana => item.downloads.map(|n| format!("{n} downloads")),
+                Source::Local => None,
+            };
+            if let Some(value) = count {
+                meta.push(value);
+            }
+        }
+        Sort::Likes => {
+            let count = match item.id.source {
+                Source::Nexus => item.endorsements.map(|n| format!("{n} endorsements")),
                 Source::GameBanana => item.likes.map(|n| format!("{n} likes")),
                 Source::Local => None,
             };
@@ -220,7 +230,9 @@ fn card(s: &State, item: &SearchResult, t: Theme, k: &Kit) -> El {
         }
         Sort::Relevance => {}
     }
-    if let Some(downloads) = item.downloads {
+    if let Some(downloads) = item.downloads
+        && !(sort == Sort::Popularity && item.id.source == Source::GameBanana)
+    {
         meta.push(format!("{downloads} downloads"));
     }
     if sort != Sort::Updated
@@ -247,10 +259,19 @@ fn short_date(value: &str) -> Option<&str> {
     let date = value.get(..10)?;
     (date.as_bytes().get(4) == Some(&b'-') && date.as_bytes().get(7) == Some(&b'-')).then_some(date)
 }
-pub(super) fn sort_name(sort: Sort) -> &'static str {
+pub(super) fn sort_name(sort: Sort, source: Source) -> &'static str {
     match sort {
         Sort::Relevance => "Relevance",
-        Sort::Popularity => "Popular",
+        Sort::Popularity => match source {
+            Source::GameBanana => "Most downloaded",
+            Source::Nexus => "Most endorsed",
+            Source::Local => "Popular",
+        },
+        Sort::Likes => match source {
+            Source::GameBanana => "Most liked",
+            Source::Nexus => "Most endorsed",
+            Source::Local => "Likes",
+        },
         Sort::Newest => "Recent",
         Sort::Updated => "Recently updated",
     }

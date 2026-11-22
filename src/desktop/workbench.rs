@@ -1,5 +1,6 @@
 mod import;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -12,7 +13,7 @@ use dmm::library::{Inspection, Library, ManagedMod};
 use dmm::sources::{RemoteMod, Source};
 
 use super::components::{
-    button, field, heading, muted, open_page, panel, source_name, styled_field,
+    button, bytes, field, heading, muted, open_page, panel, source_name, styled_field,
 };
 use super::download_queue::Queue;
 use super::mod_card::{Card, byline, remote_key};
@@ -49,6 +50,10 @@ const SITES: [(Option<Source>, &str); 4] = [
 enum FilterMenu {
     Status,
     Site,
+    Tag,
+    Category,
+    Character,
+    Group,
 }
 
 pub(super) struct LocalForm {
@@ -58,10 +63,10 @@ pub(super) struct LocalForm {
     pub destination: TextEdit,
     pub replace_unmanaged: bool,
     search: TextEdit,
-    tag_filter: TextEdit,
-    category_filter: TextEdit,
-    character_filter: TextEdit,
-    group_filter: TextEdit,
+    tag_filter: Option<String>,
+    category_filter: Option<String>,
+    character_filter: Option<String>,
+    group_filter: Option<String>,
     site_filter: Option<Source>,
     status: Status,
     filter_menu: Option<FilterMenu>,
@@ -80,10 +85,10 @@ impl Default for LocalForm {
             destination: TextEdit::default(),
             replace_unmanaged: false,
             search: TextEdit::default(),
-            tag_filter: TextEdit::default(),
-            category_filter: TextEdit::default(),
-            character_filter: TextEdit::default(),
-            group_filter: TextEdit::default(),
+            tag_filter: None,
+            category_filter: None,
+            character_filter: None,
+            group_filter: None,
             site_filter: None,
             status: Status::Any,
             filter_menu: None,
@@ -219,48 +224,10 @@ pub(super) fn local_mods(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> E
             .gap(7.0)
             .child(filter_menu(s, k, layer, FilterMenu::Status))
             .child(filter_menu(s, k, layer, FilterMenu::Site))
-            .children(
-                [
-                    (
-                        "local-tag-filter",
-                        "Tag",
-                        &s.local.tag_filter,
-                        (|s: &mut State| &mut s.local.tag_filter)
-                            as fn(&mut State) -> &mut TextEdit,
-                    ),
-                    (
-                        "local-category-filter",
-                        "Category",
-                        &s.local.category_filter,
-                        |s| &mut s.local.category_filter,
-                    ),
-                    (
-                        "local-character-filter",
-                        "Character",
-                        &s.local.character_filter,
-                        |s| &mut s.local.character_filter,
-                    ),
-                    (
-                        "local-group-filter",
-                        "Local group",
-                        &s.local.group_filter,
-                        |s| &mut s.local.group_filter,
-                    ),
-                ]
-                .into_iter()
-                .map(|(key, label, edit, access)| {
-                    styled_field(
-                        key,
-                        edit,
-                        field(edit, label, access)
-                            .height(32.0)
-                            .width(Some(130.0))
-                            .on_change(|s, _| refresh_filters(s)),
-                        k,
-                        t,
-                    )
-                }),
-            ),
+            .child(record_filter_menu(s, k, layer, FilterMenu::Tag))
+            .child(record_filter_menu(s, k, layer, FilterMenu::Category))
+            .child(record_filter_menu(s, k, layer, FilterMenu::Character))
+            .child(record_filter_menu(s, k, layer, FilterMenu::Group)),
     );
     let entries = entries(&s.local, &s.snapshot, s.available_sources(), &s.queue);
     let pages = entries.len().div_ceil(PAGE_SIZE);
@@ -344,6 +311,9 @@ fn filter_menu(s: &State, k: &Kit, layer: &mut Vec<El>, menu: FilterMenu) -> El 
                 .find(|(source, _)| *source == s.local.site_filter)
                 .map(|(_, label)| *label),
         ),
+        FilterMenu::Tag | FilterMenu::Category | FilterMenu::Character | FilterMenu::Group => {
+            unreachable!("record filters use record_filter_menu")
+        }
     };
     Select::new(key, &options)
         .label(label)
@@ -371,7 +341,108 @@ fn filter_menu(s: &State, k: &Kit, layer: &mut Vec<El>, menu: FilterMenu) -> El 
                         s.local.site_filter = *source;
                     }
                 }
+                FilterMenu::Tag
+                | FilterMenu::Category
+                | FilterMenu::Character
+                | FilterMenu::Group => unreachable!(),
             }
+            refresh_filters(s);
+        })
+        .build(k, layer)
+        .border(1.0, k.c.border_base)
+}
+
+fn record_filter_menu(s: &State, k: &Kit, layer: &mut Vec<El>, menu: FilterMenu) -> El {
+    let (key, label, any, current) = match menu {
+        FilterMenu::Tag => (
+            "local-tag-filter",
+            "Tag",
+            "Any tag",
+            s.local.tag_filter.as_deref(),
+        ),
+        FilterMenu::Category => (
+            "local-category-filter",
+            "Category or character",
+            "Any category or character",
+            s.local.category_filter.as_deref(),
+        ),
+        FilterMenu::Character => (
+            "local-character-filter",
+            "Character",
+            "Any character",
+            s.local.character_filter.as_deref(),
+        ),
+        FilterMenu::Group => (
+            "local-group-filter",
+            "Local group",
+            "Any group",
+            s.local.group_filter.as_deref(),
+        ),
+        FilterMenu::Status | FilterMenu::Site => unreachable!(),
+    };
+    let mut values = BTreeSet::new();
+    for record in &s.snapshot.mods {
+        match menu {
+            FilterMenu::Tag => {
+                if let Some(details) = record.details() {
+                    values.extend(
+                        details
+                            .tags
+                            .iter()
+                            .filter(|tag| !tag.starts_with("Character: "))
+                            .cloned(),
+                    );
+                }
+            }
+            FilterMenu::Category => {
+                if let Some(category) = record
+                    .details()
+                    .and_then(|details| details.category.as_ref())
+                {
+                    values.insert(category.clone());
+                }
+            }
+            FilterMenu::Character if record_source(record) == Source::GameBanana => {
+                if let Some(details) = record.details() {
+                    values.extend(
+                        details
+                            .tags
+                            .iter()
+                            .filter_map(|tag| tag.strip_prefix("Character: ").map(str::to_owned)),
+                    );
+                }
+            }
+            FilterMenu::Group => {
+                if let Some(group) = &record.group {
+                    values.insert(group.clone());
+                }
+            }
+            FilterMenu::Character | FilterMenu::Status | FilterMenu::Site => {}
+        }
+    }
+    let mut options = vec![any.to_owned()];
+    options.extend(values);
+    Select::new(key, &options)
+        .label(label)
+        .appearance(SelectAppearance::Field)
+        .placement(Placement::BottomStart)
+        .width(140.0)
+        .current(Some(current.unwrap_or(any)))
+        .open(s.local.filter_menu == Some(menu))
+        .on_toggle(move |s: &mut State| {
+            s.local.filter_menu = (s.local.filter_menu != Some(menu)).then_some(menu)
+        })
+        .on_close(|s: &mut State| s.local.filter_menu = None)
+        .on_choose(move |s: &mut State, chosen, _| {
+            let value = (chosen != any).then(|| chosen.to_owned());
+            match menu {
+                FilterMenu::Tag => s.local.tag_filter = value,
+                FilterMenu::Category => s.local.category_filter = value,
+                FilterMenu::Character => s.local.character_filter = value,
+                FilterMenu::Group => s.local.group_filter = value,
+                FilterMenu::Status | FilterMenu::Site => unreachable!(),
+            }
+            s.local.filter_menu = None;
             refresh_filters(s);
         })
         .build(k, layer)
@@ -395,13 +466,12 @@ fn entries<'a>(
 ) -> Vec<Entry<'a>> {
     let mut entries = Vec::new();
     let q = form.search.text.trim().to_lowercase();
-    let tag = form.tag_filter.text.trim().to_lowercase();
-    let category = form.category_filter.text.trim().to_lowercase();
-    let character = form.character_filter.text.trim().to_lowercase();
-    let group = form.group_filter.text.trim().to_lowercase();
-    let remote_names_only = [&tag, &category, &character, &group]
-        .iter()
-        .all(|value| value.is_empty());
+    let tag = form.tag_filter.as_deref();
+    let category = form.category_filter.as_deref();
+    let character = form.character_filter.as_deref();
+    let group = form.group_filter.as_deref();
+    let remote_names_only =
+        tag.is_none() && category.is_none() && character.is_none() && group.is_none();
     if remote_names_only
         && matches!(form.status, Status::Any | Status::Saved)
         && let Some(instance) = &snapshot.selected
@@ -454,14 +524,26 @@ fn entries<'a>(
                 || details
                     .and_then(|d| d.author.as_deref())
                     .is_some_and(|author| contains(author, &q)))
-                && (tag.is_empty() || tags.iter().any(|value| contains(value, &tag)))
-                && contains(cat, &category)
-                && (contains(cat, &character)
-                    || tags
-                        .iter()
-                        .filter_map(|value| value.strip_prefix("Character: "))
-                        .any(|value| contains(value, &character)))
-                && contains(record.group.as_deref().unwrap_or(""), &group)
+                && tag.is_none_or(|selected| {
+                    tags.iter().any(|value| {
+                        !value.starts_with("Character: ") && value.eq_ignore_ascii_case(selected)
+                    })
+                })
+                && category.is_none_or(|selected| cat.eq_ignore_ascii_case(selected))
+                && character.is_none_or(|selected| {
+                    record_source(record) == Source::GameBanana
+                        && tags.iter().any(|value| {
+                            value
+                                .strip_prefix("Character: ")
+                                .is_some_and(|value| value.eq_ignore_ascii_case(selected))
+                        })
+                })
+                && group.is_none_or(|selected| {
+                    record
+                        .group
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(selected))
+                })
             {
                 entries.push(Entry::Installed(&instance.name, record));
             }
@@ -592,7 +674,16 @@ fn installed_card(s: &State, t: Theme, k: &Kit, instance: &str, managed: &Manage
             details.and_then(|d| d.category.as_deref()),
             source_name(record_source(managed)),
         ),
-        metadata: metadata.join(" · "),
+        metadata: managed.installed_size.map_or_else(
+            || metadata.join(" · "),
+            |size| {
+                if metadata.is_empty() {
+                    bytes(size)
+                } else {
+                    format!("{} · {}", bytes(size), metadata.join(" · "))
+                }
+            },
+        ),
         remote: release.map(|release| &release.id),
         installed: Some(managed),
     }

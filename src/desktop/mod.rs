@@ -6,10 +6,17 @@ mod download_recovery;
 mod game_setup;
 mod installations;
 mod mod_card;
+#[cfg(target_os = "linux")]
+mod nexus_handler;
 mod preferences;
 mod previews;
 mod shell;
 mod workbench;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn forward_nexus_handler(state_dir: &std::path::Path, uri: &str) -> Result<()> {
+    nexus_handler::forward_from_cli(state_dir, uri)
+}
 
 #[cfg(test)]
 mod tests;
@@ -99,7 +106,7 @@ impl Snapshot {
             .cloned();
         let mods = selected
             .as_ref()
-            .map(|i| library.mods(&i.name))
+            .map(|i| library.mods_with_sizes(&i.name))
             .transpose()?
             .unwrap_or_default();
         let profiles: BTreeMap<_, _> = instances
@@ -196,6 +203,8 @@ struct State {
     local: LocalForm,
     local_detail: Option<String>,
     setup: SetupForm,
+    #[cfg(target_os = "linux")]
+    nexus_listener: Option<nexus_handler::Listener>,
 }
 
 impl State {
@@ -209,6 +218,8 @@ impl State {
             detail_revision: 0,
             previews: None,
             busy: None,
+            #[cfg(target_os = "linux")]
+            nexus_listener: None,
             queue: Queue::default(),
             handoff_open: false,
             preferences: Preferences::default(),
@@ -273,8 +284,17 @@ impl State {
             Err(error) => self.notice = format!("{error:#}"),
         }
         self.previews = Previews::start(&self.state_dir, wake.clone()).ok();
-        match self.queue.start(&self.state_dir, wake) {
-            Ok(paths) => self.discover_games(paths),
+        match self.queue.start(&self.state_dir, wake.clone()) {
+            Ok(paths) => {
+                self.discover_games(paths);
+                #[cfg(target_os = "linux")]
+                match nexus_handler::Listener::bind(&self.state_dir) {
+                    Ok(listener) => self.nexus_listener = Some(listener),
+                    Err(error) => {
+                        self.notice = format!("Nexus link handling unavailable: {error:#}")
+                    }
+                }
+            }
             Err(error) => {
                 self.detect_games();
                 self.notice = format!("Cannot start downloads: {error:#}");
@@ -488,6 +508,7 @@ impl State {
         self.local.close_menus();
         self.browser.close_menus();
         self.browser.detail = None;
+        self.browser.install_dialog = None;
         self.local_detail = None;
         self.sync_previews();
         tx.scroll_to_instant("main-scroll", 0.0, 0.0);
@@ -582,15 +603,20 @@ impl State {
         let Some(previews) = &mut self.previews else {
             return;
         };
+        let downloads = self
+            .queue
+            .preview_urls(self.screen == Screen::Downloads)
+            .map(|url| (url, Size::Thumbnail));
         if matches!(
             self.screen,
             Screen::Explore | Screen::Local | Screen::Downloads
         ) && let Some(detail) = &self.browser.detail
         {
             if self.local_detail.is_some() {
-                previews.show_saved(browse::details::preview_requests(detail, true));
+                previews
+                    .show_saved(downloads.chain(browse::details::preview_requests(detail, true)));
             } else {
-                previews.show(browse::details::preview_requests(detail, false));
+                previews.show(downloads.chain(browse::details::preview_requests(detail, false)));
             }
         } else if self.screen == Screen::Explore {
             let cards = self
@@ -601,21 +627,21 @@ impl State {
                 .filter(|_| self.browser.may_show_previous_cards())
                 .filter_map(|item| item.image.as_deref().map(|url| (url, Size::Card)));
             let icons = self.browser.category_icons().map(|url| (url, Size::Icon));
-            previews.show(cards.chain(icons));
+            previews.show(downloads.chain(cards).chain(icons));
         } else if self.screen == Screen::Local {
             let sources = if self.snapshot.selected.is_some() {
                 &self.snapshot.sources
             } else {
                 &self.public_sources
             };
-            previews.show_saved(workbench::preview_requests(
+            previews.show_saved(downloads.chain(workbench::preview_requests(
                 &self.local,
                 &self.snapshot,
                 sources,
                 &self.queue,
-            ));
+            )));
         } else {
-            previews.show([]);
+            previews.show_saved(downloads);
         }
     }
     fn apply_snapshot(&mut self, snapshot: Snapshot, tx: &mut Tx) {
@@ -627,6 +653,10 @@ impl State {
         let next = snapshot.selected.as_ref().map(|i| &i.name);
         let changed = self.public_game != kind || old != next;
         let sources_changed = self.snapshot.sources != snapshot.sources;
+        if changed {
+            self.detail_revision = self.detail_revision.wrapping_add(1);
+            self.browser.install_dialog = None;
+        }
         self.snapshot = snapshot;
         self.public_game = kind;
         if let Some(slug) = &self.local_detail {
@@ -672,6 +702,12 @@ impl State {
             }
         }
         changed |= self.previews.as_mut().is_some_and(Previews::poll);
+        #[cfg(target_os = "linux")]
+        if let Some(listener) = self.nexus_listener.take() {
+            changed |= listener.poll(|uri| self.enqueue_nexus(uri));
+            self.nexus_listener = Some(listener);
+            tx.wake_after(std::time::Duration::from_millis(250));
+        }
         changed |= self
             .browser
             .detail
@@ -762,19 +798,26 @@ impl State {
                     result,
                 )) if self.screen == screen
                     && self.detail_revision == revision
-                    && (screen != Screen::Explore
+                    && (install
+                        || screen != Screen::Explore
                         || self.browser.search_revision == search_revision)
                     && self.local_detail == local_detail =>
                 {
                     match result {
                         Ok(details) => {
                             self.local_detail = None;
-                            self.show_online_details(details);
                             if install {
-                                browse::details::open_install(self);
+                                if self.available_sources().iter().any(|origin| {
+                                    origin.source == details.id.source
+                                        && origin.game == details.id.game
+                                }) {
+                                    self.open_install_dialog(details);
+                                }
+                            } else {
+                                self.show_online_details(details);
+                                self.sync_previews();
+                                tx.scroll_to_instant("main-scroll", 0.0, 0.0);
                             }
-                            self.sync_previews();
-                            tx.scroll_to_instant("main-scroll", 0.0, 0.0);
                         }
                         Err(error) => self.notice = format!("{error:#}"),
                     }

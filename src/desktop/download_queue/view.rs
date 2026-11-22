@@ -1,14 +1,16 @@
 use std::collections::HashSet;
 
 use rune::tok::{Theme, type_};
-use rune::{El, ScrollSpec, TextStyle, col, row, text};
+use rune::{El, ScrollSpec, SurfaceFit, TextStyle, col, el, row, text};
 use rune_kit::shell::SidebarRow;
 use rune_kit::{Dialog, Kit, Progress};
 use url::Url;
 
 use super::{Action, Entry, Phase, Transfer};
-use crate::desktop::components::{button, field, heading, muted, open_page, panel, styled_field};
-use crate::desktop::{Screen, State};
+use crate::desktop::components::{
+    button, bytes, field, heading, muted, open_page, panel, source_icon, styled_field,
+};
+use crate::desktop::{Screen, Size, State};
 
 pub(in crate::desktop) fn page(s: &State, t: Theme, k: &Kit) -> El {
     let queue = &s.queue;
@@ -87,21 +89,26 @@ fn entry(s: &State, index: usize, item: &Entry, t: Theme, k: &Kit) -> El {
         .iter()
         .find(|game| game.name == item.instance)
         .map_or(item.instance.as_str(), |game| game.kind.display_name());
-    let mut line = row().w_full().items_center().gap(12.0).child(
-        col()
-            .grow(1.0)
-            .shrink()
-            .min_w(0.0)
-            .gap(5.0)
-            .child(
-                text(&item.name)
-                    .font(TextStyle::new(16.0, 650.0))
-                    .color(t.text)
-                    .truncate()
-                    .help(&item.name),
-            )
-            .child(muted(format!("{game}  ·  {}", file_summary(item)), t).wrap()),
-    );
+    let mut line = row()
+        .w_full()
+        .items_center()
+        .gap(12.0)
+        .child(thumbnail(s, item, t, 64.0, 45.0).key(format!("queue-thumbnail-{index}")))
+        .child(
+            col()
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .gap(5.0)
+                .child(
+                    text(&item.name)
+                        .font(TextStyle::new(16.0, 650.0))
+                        .color(t.text)
+                        .truncate()
+                        .help(&item.name),
+                )
+                .child(muted(format!("{game}  ·  {}", file_summary(item)), t).wrap()),
+        );
     line = line.child(
         muted(item.status(), t)
             .px(8.0)
@@ -200,11 +207,20 @@ pub(in crate::desktop) fn sidebar(s: &State, t: Theme, k: &Kit) -> El {
             .fill(k.c.layer_01)
             .border(1.0, t.card_border)
             .child(
-                text(&item.name)
-                    .font(type_::LABEL)
-                    .color(t.text)
-                    .truncate()
-                    .help(&item.name),
+                row()
+                    .gap(7.0)
+                    .items_center()
+                    .child(thumbnail(s, item, t, 30.0, 24.0).key("active-download-thumbnail"))
+                    .child(
+                        text(&item.name)
+                            .font(type_::LABEL)
+                            .color(t.text)
+                            .grow(1.0)
+                            .shrink()
+                            .min_w(0.0)
+                            .truncate()
+                            .help(&item.name),
+                    ),
             );
         let transfer = match (&item.phase, &item.transfer) {
             (Phase::Running(control), Some(transfer))
@@ -306,18 +322,24 @@ fn transfer_metrics(transfer: &Transfer, t: Theme) -> El {
         .child(muted(format!("{}/s", bytes(transfer.bytes_per_second)), t).truncate())
 }
 
-fn bytes(value: u64) -> String {
-    if value < 1024 {
-        return format!("{value} B");
+fn thumbnail(s: &State, item: &Entry, t: Theme, width: f32, height: f32) -> El {
+    let frame = el().size(width, height).clip_rounded(6.0).a11y_hidden();
+    if let Some(previews) = &s.previews
+        && item.image.is_some()
+    {
+        previews.surface(
+            item.image.as_deref(),
+            Size::Thumbnail,
+            frame,
+            SurfaceFit::Fill,
+            t,
+        )
+    } else {
+        frame
+            .fill(t.control_off)
+            .center()
+            .child(source_icon(s, item.id.source, 16.0))
     }
-    let mut amount = value as f64;
-    for unit in ["KiB", "MiB", "GiB", "TiB", "PiB"] {
-        amount /= 1024.0;
-        if amount < 1024.0 || unit == "PiB" {
-            return format!("{amount:.1} {unit}");
-        }
-    }
-    unreachable!()
 }
 
 fn handoff_links(s: &State) -> impl Iterator<Item = &Url> {

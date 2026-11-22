@@ -317,7 +317,7 @@ fn details_keeps_install_header_and_opens_file_and_image_overlays() {
     runtime.update(|state, _| {
         let selected: Vec<_> = state
             .browser
-            .detail
+            .install_dialog
             .as_ref()
             .unwrap()
             .picked_files()
@@ -487,6 +487,7 @@ fn local_grid_presents_bookmarks_and_requires_confirmation_before_removing_an_in
     let mut state = State::new(state_dir.clone());
     state.screen = Screen::Local;
     state.snapshot = Snapshot::load(&library, Some("cp"))?;
+    assert_eq!(state.snapshot.mods[0].installed_size, Some(15));
     drop(library);
     let (jobs, requests) = mpsc::channel();
     let (responses, results) = mpsc::channel();
@@ -633,13 +634,22 @@ fn bookmark_and_queue_actions_work_across_explore_and_local_cards() -> Result<()
             .presented("local-remote-nexus-cyberpunk2077-42:download")
             .is_some()
     );
-    assert!(runtime.presented("active-download").is_some());
+    assert!(runtime.presented("active-download-thumbnail").is_some());
+    click(&mut runtime, "launch-game");
+    drop(
+        requests
+            .try_recv()
+            .expect("download must not block a launch request"),
+    );
+    responses.send(Ok(Update::Message("Test launch".into())))?;
+    runtime.frame(1.0 / 60.0);
     click(&mut runtime, "local-remote-nexus-cyberpunk2077-42:bookmark");
     responses.send(requests.try_recv()?(&mut backend))?;
     runtime.frame(1.0 / 60.0);
     assert!(!runtime.state.snapshot.is_saved(&id));
     click(&mut runtime, "local-remote-nexus-cyberpunk2077-42:download");
     assert!(runtime.state.screen == Screen::Downloads);
+    assert!(runtime.presented("queue-thumbnail-0").is_some());
     assert!(runtime.presented("queue-nexus-link").is_none());
 
     runtime.state.snapshot.nexus_pages.push(Url::parse(

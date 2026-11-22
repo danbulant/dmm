@@ -150,8 +150,30 @@ impl Queue {
         self.worker.is_some()
     }
 
-    pub(super) fn running(&self) -> bool {
-        self.running.is_some()
+    pub(super) fn active(&self) -> Option<(&str, bool)> {
+        let item = self.items.get(self.running?)?;
+        let Phase::Running(control) = &item.phase else {
+            return None;
+        };
+        Some((&item.instance, control.is_applying()))
+    }
+
+    pub(super) fn preview_urls(&self, full_page: bool) -> impl Iterator<Item = &str> {
+        let active = self.running.and_then(|index| self.items.get(index));
+        active
+            .into_iter()
+            .chain(
+                self.items
+                    .iter()
+                    .filter(move |item| full_page && item.pending()),
+            )
+            .chain(
+                self.items
+                    .iter()
+                    .rev()
+                    .filter(move |item| full_page && !item.pending()),
+            )
+            .filter_map(|item| item.image.as_deref())
     }
 
     pub(super) fn contains(&self, instance: &str, id: &RemoteMod) -> bool {
@@ -244,7 +266,14 @@ impl Queue {
         Ok(())
     }
 
-    fn redeem(&mut self, instance: String, id: RemoteMod, name: String, uri: String) -> Result<()> {
+    fn redeem(
+        &mut self,
+        instance: String,
+        id: RemoteMod,
+        name: String,
+        image: Option<String>,
+        uri: String,
+    ) -> Result<()> {
         anyhow::ensure!(self.worker.is_some(), "Download queue is unavailable");
         let find = self
             .items
@@ -261,7 +290,7 @@ impl Queue {
                 id,
                 instance,
                 name,
-                image: None,
+                image,
                 file_count: 0,
                 estimated_bytes: None,
                 transfer: None,
@@ -492,6 +521,7 @@ impl State {
         ) {
             Ok(()) => {
                 self.notice.clear();
+                self.sync_previews();
                 true
             }
             Err(error) => {
@@ -519,20 +549,22 @@ impl State {
                 })
                 .context("Select the target game before receiving a Nexus download")?
                 .to_owned();
-            let name = self
+            let favorite = self
                 .snapshot
                 .favorites
                 .iter()
-                .find(|favorite| favorite.item == id)
-                .map_or_else(
-                    || format!("Nexus mod {}", id.id),
-                    |favorite| favorite.name.clone(),
-                );
-            self.queue.redeem(instance, id, name, uri)
+                .find(|favorite| favorite.item == id);
+            let name = favorite.map_or_else(
+                || format!("Nexus mod {}", id.id),
+                |saved| saved.name.clone(),
+            );
+            let image = favorite.and_then(|saved| saved.image.clone());
+            self.queue.redeem(instance, id, name, image, uri)
         })();
         match result {
             Ok(()) => {
                 self.notice.clear();
+                self.sync_previews();
                 true
             }
             Err(error) => {
@@ -543,7 +575,11 @@ impl State {
     }
 
     pub(super) fn poll_queue(&mut self, tx: &mut Tx) -> bool {
+        let previous = self.queue.running;
         let changed = self.queue.poll();
+        if previous != self.queue.running {
+            self.sync_previews();
+        }
         if self.queue.running.is_some() {
             tx.wake_after(Duration::from_millis(250));
         }

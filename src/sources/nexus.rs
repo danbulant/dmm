@@ -89,6 +89,15 @@ fn now_epoch_seconds() -> u64 {
         .as_secs()
 }
 
+fn sort_order(sort: Sort) -> Value {
+    match sort {
+        Sort::Relevance => json!([{"relevance": {"direction": "DESC"}}]),
+        Sort::Popularity | Sort::Likes => json!([{"endorsements": {"direction": "DESC"}}]),
+        Sort::Newest => json!([{"createdAt": {"direction": "DESC"}}]),
+        Sort::Updated => json!([{"updatedAt": {"direction": "DESC"}}]),
+    }
+}
+
 pub(super) fn search(client: &Client, game: &str, query: &SearchQuery) -> Result<SearchPage> {
     let mut filter = json!({
         "gameDomainName": [{"value": game, "op": "EQUALS"}]
@@ -119,12 +128,7 @@ pub(super) fn search(client: &Client, game: &str, query: &SearchQuery) -> Result
     if let Some(value) = maturity {
         filter["adultContent"] = json!([{"value": value, "op": "EQUALS"}]);
     }
-    let sort = match query.sort {
-        Sort::Relevance => json!([{"relevance": {"direction": "DESC"}}]),
-        Sort::Popularity => json!([{"endorsements": {"direction": "DESC"}}]),
-        Sort::Newest => json!([{"createdAt": {"direction": "DESC"}}]),
-        Sort::Updated => json!([{"updatedAt": {"direction": "DESC"}}]),
-    };
+    let sort = sort_order(query.sort);
     let offset = i64::from(query.page.max(1) - 1) * 20;
     let response = graphql(
         client,
@@ -587,9 +591,17 @@ fn browser_file_url(game: &str, id: u64, file: u64) -> Result<Url> {
 
 #[cfg(test)]
 mod tests {
-    use super::{created_at_filter, detail_tags, parse_file, parse_nxm};
-    use crate::sources::TimeWindow;
+    use super::{created_at_filter, detail_tags, parse_file, parse_nxm, sort_order};
+    use crate::sources::{Sort, TimeWindow};
     use serde_json::json;
+
+    #[test]
+    fn likes_sort_uses_nexus_endorsements_graphql_wire_order() {
+        assert_eq!(
+            sort_order(Sort::Likes),
+            json!([{"endorsements": {"direction": "DESC"}}])
+        );
+    }
 
     #[test]
     fn nexus_detail_tags_use_tag_names_and_missing_tags_are_empty() {

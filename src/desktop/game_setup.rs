@@ -25,6 +25,8 @@ pub(super) struct SetupForm {
     launch: bool,
     #[cfg(target_os = "linux")]
     pub(super) steam_dialog: Option<SteamDialog>,
+    #[cfg(target_os = "linux")]
+    pub(super) nexus_handler_dialog: Option<super::nexus_handler::HandlerDialog>,
     name: TextEdit,
     root: TextEdit,
     descriptor: TextEdit,
@@ -161,6 +163,14 @@ pub(super) fn view(s: &State, t: Theme, k: &Kit) -> El {
             body = body.child(muted(format!("Profile error: {error}"), t).wrap());
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        body = body.child(super::nexus_handler::setup_panel(s, t));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        body = body.child(muted("Automatic nxm:// link registration is not available on this platform. Use Downloads to paste the link manually.", t).wrap());
+    }
     match kind {
         GameKind::Cyberpunk => {
             body = body.child(muted("Launch game opens the Steam-registered copy. The selected folder determines where DMM deploys mods.", t).wrap());
@@ -249,6 +259,7 @@ fn steam_setup(s: &State, t: Theme) -> El {
 
 #[cfg(target_os = "linux")]
 pub(super) fn overlays(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) {
+    super::nexus_handler::overlay(s, t, k, layer);
     let Some(dialog) = &s.setup.steam_dialog else {
         return;
     };

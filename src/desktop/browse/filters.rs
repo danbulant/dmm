@@ -2,39 +2,53 @@ use std::collections::{HashMap, HashSet};
 
 use dmm::sources::{Category, FilterCatalog, Maturity, Sort, Source, TimeWindow};
 use rune::tok::Theme;
-use rune::{El, ScrollSpec, col, row};
+use rune::{El, ScrollSpec, col, oklch, row};
 use rune_kit::{Checkbox, Kit, Placement, SegmentedControl, Select, SelectAppearance};
 
 use super::explore::{search_field, sort_name};
 use super::{Catalog, State, nonempty};
 use crate::desktop::components::{button, field, muted, panel, styled_field};
 
-const SORTS: [Sort; 4] = [
+const SORTS: [Sort; 5] = [
     Sort::Relevance,
     Sort::Popularity,
+    Sort::Likes,
     Sort::Newest,
     Sort::Updated,
 ];
 const CONTENT_MODES: [Maturity; 3] = [Maturity::Safe, Maturity::All, Maturity::Adult];
 
 pub(super) fn toolbar(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
-    let names = SORTS.map(sort_name);
+    let sorts = SORTS
+        .into_iter()
+        .filter(|sort| !(s.browser.source == Source::Nexus && *sort == Sort::Popularity))
+        .collect::<Vec<_>>();
+    let names = sorts
+        .iter()
+        .map(|&sort| sort_name(sort, s.browser.source))
+        .collect::<Vec<_>>();
     let sort = Select::new("sort", &names)
         .label("Sort results")
         .appearance(SelectAppearance::Field)
         .placement(Placement::BottomStart)
         .width(165.0)
-        .current(Some(sort_name(s.browser.sort)))
+        .current(Some(sort_name(s.browser.sort, s.browser.source)))
         .open(s.browser.sort_menu)
         .on_toggle(|s: &mut State| s.browser.sort_menu = !s.browser.sort_menu)
         .on_close(|s: &mut State| s.browser.sort_menu = false)
-        .on_choose(|s: &mut State, name, _| {
-            s.browser.sort_menu = false;
-            if let Some(sort) = SORTS.into_iter().find(|&sort| sort_name(sort) == name)
-                && s.browser.sort != sort
-            {
-                s.browser.sort = sort;
-                s.search();
+        .on_choose({
+            let source = s.browser.source;
+            move |s: &mut State, name, _| {
+                s.browser.sort_menu = false;
+                if let Some(sort) = sorts
+                    .iter()
+                    .copied()
+                    .find(|&sort| sort_name(sort, source) == name)
+                    && s.browser.sort != sort
+                {
+                    s.browser.sort = sort;
+                    s.search();
+                }
             }
         })
         .build(k, layer)
@@ -550,7 +564,7 @@ fn category_tile(
 ) -> El {
     let mut tile = row()
         .key(format!("category-{kind}-{}", category.id))
-        .role("button")
+        .role(if kind == "option" { "radio" } else { "button" })
         .label(&category.name)
         .focusable(true)
         .focus_selected(selected)
@@ -559,17 +573,28 @@ fn category_tile(
         .gap(7.0)
         .items_center()
         .radius(7.0)
-        .fill(if selected {
-            t.control_track
-        } else {
-            t.control_off
-        })
-        .border(1.0, t.separator)
+        .fill(if selected { t.hover } else { t.control_off })
+        .border(
+            1.0,
+            if selected {
+                oklch(0.69, 0.13, 282.0)
+            } else {
+                t.separator
+            },
+        )
         .hover(t.hover)
         .on_press_tx(action);
+    if kind == "option" {
+        tile = tile.checked(selected);
+    }
     if let (Some(images), Some(icon)) = (&s.previews, category.icon.as_deref()) {
         tile = tile.child(images.icon(Some(icon), t));
     }
-    tile.child(muted(&category.name, t).shrink().truncate())
-        .help(&category.name)
+    tile.child(
+        muted(&category.name, t)
+            .color(if selected { t.text } else { t.text_secondary })
+            .shrink()
+            .truncate(),
+    )
+    .help(&category.name)
 }

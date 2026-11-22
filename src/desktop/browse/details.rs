@@ -1,10 +1,12 @@
+use std::collections::BTreeSet;
+
 use dmm::games::GameKind;
-use dmm::sources::{ModFile, ModImage};
+use dmm::sources::{ModDetails, ModFile, ModImage};
 use rune::tok::{Theme, type_};
 use rune::{El, Icon, ScrollSpec, SurfaceFit, col, el, row, text};
 use rune_kit::{Checkbox, Dialog, ImageZoom, Kit, Preview};
 
-use super::{Detail, Screen, State};
+use super::{Detail, InstallDialog, Screen, State};
 use crate::desktop::Size;
 use crate::desktop::components::{
     button, form_field, muted, open_page, page_url, panel, source_icon, source_name,
@@ -84,6 +86,7 @@ pub(in crate::desktop) fn header(s: &State, detail: &Detail, t: Theme, k: &Kit) 
         return header;
     }
     let queued = s.queued_for_selected(&info.id);
+    let install_id = info.id.clone();
     header = header.child(
         button(
             "details-install",
@@ -100,8 +103,16 @@ pub(in crate::desktop) fn header(s: &State, detail: &Detail, t: Theme, k: &Kit) 
             move |s, tx| {
                 if queued {
                     s.open_downloads(tx);
-                } else if let Some(detail) = &mut s.browser.detail {
-                    detail.install_open = true;
+                } else {
+                    if let Some(info) = s
+                        .browser
+                        .detail
+                        .as_ref()
+                        .filter(|detail| detail.info.id == install_id)
+                        .map(|detail| detail.info.clone())
+                    {
+                        s.open_install_dialog(info);
+                    }
                 }
             },
         )
@@ -189,7 +200,8 @@ pub(in crate::desktop) fn body(s: &State, detail: &Detail, t: Theme) -> El {
             .wrap(),
         )
         .child(actions);
-    view.child(about).child(files(detail, t, None))
+    view.child(about)
+        .child(files(&detail.info, &detail.selected_files, t, None))
 }
 
 fn section(title: &str, t: Theme) -> El {
@@ -199,16 +211,42 @@ fn section(title: &str, t: Theme) -> El {
         .child(text(title).font(type_::TITLE).color(t.text))
 }
 
-pub(in crate::desktop) fn close_install(s: &mut State) {
-    if let Some(detail) = &mut s.browser.detail {
-        detail.install_open = false;
+pub(in crate::desktop) fn install_overlay(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) {
+    let Some(dialog) = s.browser.install_dialog.as_ref() else {
+        return;
+    };
+    if !dialog.belongs_to(s) {
+        return;
     }
-}
-
-pub(in crate::desktop) fn open_install(s: &mut State) {
-    if let Some(detail) = &mut s.browser.detail {
-        detail.install_open = true;
-    }
+    let content = if s.matches_instance(&dialog.info.id) {
+        install_options(s, dialog, t, k)
+    } else {
+        col()
+            .w_full()
+            .gap(12.0)
+            .child(muted("Choose a main installation for this game in Game setup.", t).wrap())
+            .child(button(
+                "needs-setup",
+                "Open Game setup",
+                t,
+                true,
+                true,
+                |s, tx| s.set_screen(Screen::Setup, tx),
+            ))
+    };
+    let title = if s.installed_for(&dialog.info.id).is_some() {
+        "Reinstall mod"
+    } else {
+        "Install mod"
+    };
+    Dialog::new("mod-install", title)
+        .description(&dialog.info.name)
+        .open(true)
+        .fit()
+        .width(760.0)
+        .on_close(|s: &mut State| s.browser.install_dialog = None)
+        .child(col().w_full().px(16.0).pb(16.0).child(content))
+        .build(k, layer);
 }
 
 fn close_image(s: &mut State) {
@@ -234,37 +272,6 @@ pub(in crate::desktop) fn overlays(
     layer: &mut Vec<El>,
     reduced_motion: bool,
 ) {
-    if detail.install_open {
-        let content = if s.matches_instance(&detail.info.id) {
-            install_options(s, detail, t, k)
-        } else {
-            col()
-                .w_full()
-                .gap(12.0)
-                .child(muted("Choose a main installation for this game in Game setup.", t).wrap())
-                .child(button(
-                    "needs-setup",
-                    "Open Game setup",
-                    t,
-                    true,
-                    true,
-                    |s, tx| s.set_screen(Screen::Setup, tx),
-                ))
-        };
-        let title = if s.installed_for(&detail.info.id).is_some() {
-            "Reinstall mod"
-        } else {
-            "Install mod"
-        };
-        Dialog::new("mod-install", title)
-            .description(&detail.info.name)
-            .open(true)
-            .fit()
-            .width(760.0)
-            .on_close(close_install)
-            .child(col().w_full().px(16.0).pb(16.0).child(content))
-            .build(k, layer);
-    }
     if detail.full_image_open
         && let Some(image) = detail.info.images.get(detail.image)
     {
@@ -464,7 +471,7 @@ fn render(s: &State, url: Option<&str>, size: Size, frame: El, fit: SurfaceFit, 
     }
 }
 
-fn files(detail: &Detail, t: Theme, picker: Option<&Kit>) -> El {
+fn files(info: &ModDetails, selected_files: &BTreeSet<u64>, t: Theme, picker: Option<&Kit>) -> El {
     let mut view = section(
         if picker.is_some() {
             "Choose files"
@@ -473,20 +480,20 @@ fn files(detail: &Detail, t: Theme, picker: Option<&Kit>) -> El {
         },
         t,
     );
-    if detail.info.files.is_empty() {
+    if info.files.is_empty() {
         return view.child(muted("The source did not list downloadable files.", t));
     }
-    for file in &detail.info.files {
+    for file in &info.files {
         let id = file.id;
-        let chosen = detail.selected_files.contains(&id);
+        let chosen = selected_files.contains(&id);
         let title = if let Some(k) = picker {
             Checkbox::new(chosen)
                 .label(&file.name)
                 .on_toggle(move |s: &mut State| {
-                    if let Some(detail) = &mut s.browser.detail
-                        && !detail.selected_files.remove(&id)
+                    if let Some(dialog) = &mut s.browser.install_dialog
+                        && !dialog.selected_files.remove(&id)
                     {
-                        detail.selected_files.insert(id);
+                        dialog.selected_files.insert(id);
                     }
                 })
                 .build(k)
@@ -552,7 +559,7 @@ fn file_metadata(file: &ModFile) -> String {
     items.join("  ·  ")
 }
 
-fn install_options(s: &State, detail: &Detail, t: Theme, k: &Kit) -> El {
+fn install_options(s: &State, detail: &InstallDialog, t: Theme, k: &Kit) -> El {
     let enabled = s.queue.available();
     let mut content = panel(t)
         .children(detail.missing_previous_files.then(|| {
@@ -569,7 +576,7 @@ fn install_options(s: &State, detail: &Detail, t: Theme, k: &Kit) -> El {
                 .scroll(ScrollSpec {
                     stick_bottom: false,
                 })
-                .child(files(detail, t, Some(k))),
+                .child(files(&detail.info, &detail.selected_files, t, Some(k))),
         );
     if s.game_kind() != GameKind::Zzmi {
         content = content.child(

@@ -86,6 +86,7 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
     #[cfg(target_os = "linux")]
     game_setup::overlays(s, t, &k, &mut layer);
     workbench::overlays(s, t, &k, &mut layer);
+    browse::details::install_overlay(s, t, &k, &mut layer);
     download_queue::overlay(s, t, &k, &mut layer);
     rune_kit::root(shell, layer).on_layout(|s: &mut State, [_, _, width, height]| {
         s.window_size = [width, height];
@@ -111,6 +112,30 @@ fn sidebar(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
             .build(k)
             .key(format!("nav-{label}"))
     });
+    let working_on_game = s.snapshot.selected.as_ref().and_then(|game| {
+        s.queue
+            .active()
+            .filter(|(instance, _)| *instance == game.name)
+    });
+    let deploying = working_on_game.is_some_and(|(_, applying)| applying);
+    let launch = button(
+        "launch-game",
+        "Launch game",
+        t,
+        true,
+        s.snapshot.selected.is_some()
+            && s.game_kind() != GameKind::Generic
+            && !deploying
+            && s.busy.is_none(),
+        |s, _| s.launch_game(),
+    );
+    let launch = match working_on_game {
+        Some((_, true)) => launch.help("Wait until DMM finishes writing mod files."),
+        Some((_, false)) => launch.help(
+            "A download is in progress. It may finish and install files while the game is running.",
+        ),
+        None => launch,
+    };
     Sidebar::new()
         .header(header)
         .child(col().key("navigation").gap(2.0).children(navigation))
@@ -118,17 +143,7 @@ fn sidebar(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
             col()
                 .gap(4.0)
                 .child(download_queue::sidebar(s, t, k))
-                .child(button(
-                    "launch-game",
-                    "Launch game",
-                    t,
-                    true,
-                    s.snapshot.selected.is_some()
-                        && s.game_kind() != GameKind::Generic
-                        && !s.queue.running()
-                        && s.busy.is_none(),
-                    |s, _| s.launch_game(),
-                ))
+                .child(launch)
                 .child(status(s, t)),
         )
         .build(k)
