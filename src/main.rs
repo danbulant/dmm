@@ -24,8 +24,9 @@ use remote::{Browse, Identity, RemoteInstall};
     arg_required_else_help = !cfg!(feature = "rune-ui")
 )]
 struct Cli {
-    #[arg(long, global = true, default_value = ".dmm")]
-    state: PathBuf,
+    /// Override the per-user state directory.
+    #[arg(long, global = true)]
+    state: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -171,10 +172,11 @@ impl InstallFlags {
 
 fn main() -> Result<()> {
     let Cli { state, command } = Cli::parse();
+    let state_dir = || state.map_or_else(default_state_dir, Ok);
     match command {
         #[cfg(feature = "rune-ui")]
         None | Some(Command::Gui) => {
-            desktop::run(state);
+            desktop::run(state_dir()?);
             Ok(())
         }
         Some(Command::Detect { kind }) => print(&detect(kind)?),
@@ -188,7 +190,7 @@ fn main() -> Result<()> {
         }) => {
             #[cfg(all(feature = "rune-ui", target_os = "linux"))]
             {
-                desktop::forward_nexus_handler(&state, &uri)
+                desktop::forward_nexus_handler(&state_dir()?, &uri)
             }
             #[cfg(not(all(feature = "rune-ui", target_os = "linux")))]
             {
@@ -198,10 +200,28 @@ fn main() -> Result<()> {
                 )
             }
         }
-        Some(command) => with_library(&state, command),
+        Some(command) => with_library(&state_dir()?, command),
         #[cfg(not(feature = "rune-ui"))]
         None => unreachable!("Clap requires a subcommand in CLI-only builds"),
     }
+}
+
+fn default_state_dir() -> Result<PathBuf> {
+    let base = if cfg!(windows) {
+        absolute_env_path("LOCALAPPDATA")
+            .context("LOCALAPPDATA is not an absolute path; use --state to select a directory")?
+    } else {
+        absolute_env_path("XDG_STATE_HOME")
+            .or_else(|| absolute_env_path("HOME").map(|home| home.join(".local/state")))
+            .context("neither XDG_STATE_HOME nor HOME is an absolute path; use --state to select a directory")?
+    };
+    Ok(base.join("dmm"))
+}
+
+fn absolute_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
 }
 
 fn with_library(state: &Path, command: Command) -> Result<()> {
@@ -324,7 +344,7 @@ mod tests {
         assert!(Cli::try_parse_from(["dmm"]).unwrap().command.is_none());
         let app = Cli::try_parse_from(["dmm", "--state", "other-library"]).unwrap();
         assert!(app.command.is_none());
-        assert_eq!(app.state, PathBuf::from("other-library"));
+        assert_eq!(app.state.as_deref(), Some(Path::new("other-library")));
         assert!(matches!(
             Cli::try_parse_from(["dmm", "gui"]).unwrap().command,
             Some(Command::Gui)

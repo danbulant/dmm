@@ -59,7 +59,7 @@ pub(crate) fn run(state_dir: PathBuf) {
     let mut spec = AppSpec::new(
         "DMM · Mod Manager",
         START_SIZE,
-        || State::new(PathBuf::from(".dmm")),
+        || unreachable!("the state directory is supplied by App::init"),
         view,
     );
     spec.min_size = Some((880.0, 620.0));
