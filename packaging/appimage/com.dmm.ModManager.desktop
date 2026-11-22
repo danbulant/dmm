@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=DMM
+Comment=Manage and install game mods
+Exec=dmm
+Icon=com.dmm.ModManager
+Terminal=false
+Categories=Game;

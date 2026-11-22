@@ -12,6 +12,17 @@ nix develop --command cargo test --locked
 nix develop --command cargo build --locked --no-default-features # CLI only
 ```
 
+The [Build workflow](.github/workflows/build.yml) builds the default desktop and CLI on x64 Linux and Windows for pull requests, pushes to `main`, and manual runs. Download `dmm-linux-x64.AppImage`, `dmm-linux-x64.tar.gz`, or `dmm-windows-x64.zip` from the workflow run. Linux builds target Ubuntu 24.04; the AppImage bundles libarchive and its non-system dependencies. The Windows ZIP includes the required DLLs; keep them next to `dmm.exe`.
+
+Run the AppImage from a dedicated working directory:
+
+```sh
+chmod +x dmm-linux-x64.AppImage
+./dmm-linux-x64.AppImage
+```
+
+If FUSE is unavailable, set `APPIMAGE_EXTRACT_AND_RUN=1`. On NixOS, use `appimage-run` or enable AppImage binfmt support. If you register the Nexus link handler, keep the AppImage at the same path; NixOS needs binfmt support to open it directly from the handler.
+
 Run `./target/debug/dmm --help` to see the CLI. The examples below use `dmm` for that binary. Run from a dedicated working directory or pass `--state /path/to/library` on every invocation. The default is `.dmm` in the current directory. Keep that library separate from your game installations.
 
 ## Desktop app

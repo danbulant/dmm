@@ -230,13 +230,34 @@ fn close_dialog(s: &mut State, _: &mut Tx) {
 }
 
 fn register_for_state(s: &mut State) {
-    let outcome = std::env::current_exe()
-        .map_err(|error| format!("Cannot resolve DMM executable: {error}"))
-        .and_then(|executable| {
-            register(&executable, &s.state_dir).map_err(|error| format!("{error:#}"))
-        });
+    let outcome = (|| -> Result<String> {
+        let executable = std::env::current_exe().context("resolving DMM executable path")?;
+        let executable = handler_executable(
+            executable,
+            std::env::var_os("APPDIR").map(PathBuf::from),
+            std::env::var_os("APPIMAGE").map(PathBuf::from),
+        );
+        register(&executable, &s.state_dir)
+    })()
+    .map_err(|error| format!("{error:#}"));
     if let Some(dialog) = &mut s.setup.nexus_handler_dialog {
         dialog.result = Some(outcome);
+    }
+}
+
+fn handler_executable(
+    executable: PathBuf,
+    appdir: Option<PathBuf>,
+    appimage: Option<PathBuf>,
+) -> PathBuf {
+    if let (Some(appdir), Some(appimage)) = (appdir, appimage)
+        && appdir.is_absolute()
+        && appimage.is_absolute()
+        && executable.starts_with(appdir)
+    {
+        appimage
+    } else {
+        executable
     }
 }
 
@@ -370,6 +391,23 @@ mod tests {
         ));
         assert!(entry.contains("MimeType=x-scheme-handler/nxm;"));
         assert!(entry.contains("Exec=\"/opt/DMM app/dmm\" --state \"/home/user/.local/state/dmm\" accept-nxm --from-handler %u"));
+    }
+
+    #[test]
+    fn handler_uses_the_appimage_only_for_its_bundled_executable() {
+        let appdir = "/tmp/.mount_dmm";
+        let appimage = "/opt/DMM app/dmm.AppImage";
+        for (executable, expected) in [
+            ("/tmp/.mount_dmm/usr/bin/dmm", appimage),
+            ("/usr/bin/dmm", "/usr/bin/dmm"),
+        ] {
+            let resolved = handler_executable(
+                executable.into(),
+                Some(appdir.into()),
+                Some(appimage.into()),
+            );
+            assert_eq!(resolved, Path::new(expected));
+        }
     }
 
     #[test]

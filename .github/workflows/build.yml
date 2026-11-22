@@ -1,0 +1,113 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_TOOLCHAIN: 1.99.0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x64
+            artifact: dmm-linux-x64.tar.gz
+          - os: windows-2025
+            platform: windows-x64
+            artifact: dmm-windows-x64.zip
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install ${{ env.RUSTUP_TOOLCHAIN }} --profile minimal
+
+      - name: Install Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y desktop-file-utils libarchive-dev libfontconfig1-dev libwayland-dev libxcb1-dev libxkbcommon-dev pkg-config
+
+      - name: Locate vcpkg cache
+        if: runner.os == 'Windows'
+        id: vcpkg
+        shell: pwsh
+        run: |
+          "image=$env:ImageVersion" >> $env:GITHUB_OUTPUT
+          "VCPKG_DEFAULT_BINARY_CACHE=$env:RUNNER_TEMP\vcpkg-cache" >> $env:GITHUB_ENV
+
+      - name: Cache vcpkg packages
+        if: runner.os == 'Windows'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-${{ matrix.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.image }}
+          restore-keys: vcpkg-${{ matrix.os }}-${{ runner.arch }}-
+
+      - name: Install Windows libraries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          vcpkg install libarchive:x64-windows --vcpkg-root "$env:VCPKG_INSTALLATION_ROOT"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "RUSTFLAGS=-Lnative=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\lib" >> $env:GITHUB_ENV
+
+      - name: Cache Cargo dependencies and build outputs
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.os }}
+          cache-bin: false
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build release
+        run: cargo build --locked --release
+
+      - name: Package Linux build
+        if: runner.os == 'Linux'
+        run: |
+          ./target/release/dmm --help
+          tar -czf dmm-linux-x64.tar.gz -C target/release dmm
+          bash packaging/appimage/build.sh target/release/dmm dmm-linux-x64.AppImage
+          APPIMAGE_EXTRACT_AND_RUN=1 ./dmm-linux-x64.AppImage --help
+
+      - name: Package Windows build
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/dmm.exe, "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\*.dll" -Destination dist
+          & .\dist\dmm.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path dist/* -DestinationPath dmm-windows-x64.zip
+
+      - name: Upload build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+          archive: false
+          overwrite: true
+
+      - name: Upload Linux AppImage
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: dmm-linux-x64.AppImage
+          if-no-files-found: error
+          archive: false
+          overwrite: true
