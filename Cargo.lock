@@ -776,7 +776,9 @@ dependencies = [
  "tokio",
  "toml",
  "url",
+ "windows",
  "x11rb",
+ "zbus",
 ]
 
 [[package]]

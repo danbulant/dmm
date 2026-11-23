@@ -187,10 +187,16 @@ fn xxmi_folder_lifecycle(kind: GameKind) -> Result<()> {
             .toggle("game", "ellen-alt", true, false, false)
             .is_err()
     );
+    put(&f.root, "ellen/skin.ini", "user-edited settings")?;
     library.toggle("game", "ellen", false, false, false)?;
     library.toggle("game", "ellen-alt", true, false, false)?;
     assert!(!f.root.join("ellen").exists());
     assert!(f.root.join("DISABLED_ellen/textures/body.dds").is_file());
+    assert_eq!(
+        fs::read_to_string(f.root.join("DISABLED_ellen/skin.ini"))?,
+        "user-edited settings"
+    );
+    assert!(library.remove("game", "ellen").is_err());
     assert!(f.root.join("ellen-alt/skin.ini").is_file());
     put(&f.root, "ellen-alt/notes.ini", "unmanaged")?;
     assert!(

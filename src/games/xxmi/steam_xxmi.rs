@@ -131,6 +131,14 @@ impl SteamXxmi {
         self.compatdata.join(PORTABLE_DIR).join(PORTABLE_EXE)
     }
 
+    pub fn steam_play_option(&self) -> Option<String> {
+        if !self.installed || self.kind() != GameKind::Zzmi {
+            return None;
+        }
+        let executable = self.executable();
+        Some(zzz_steam_play_option(executable.to_str()?))
+    }
+
     fn command(
         &self,
         runner: &Protontricks,
@@ -249,6 +257,13 @@ impl SteamXxmi {
             .with_context(|| format!("installing portable launcher to {}", dest.display()))?;
         Ok(())
     }
+}
+
+fn zzz_steam_play_option(executable: &str) -> String {
+    let quoted = executable.replace('\'', "'\\''");
+    format!(
+        r#"bash -c 'launcher=$1; shift; args=("$@"); for i in "${{!args[@]}}"; do if [[ ${{args[i]}} == */HYP.exe ]]; then args[i]=$launcher; exec "${{args[@]}}"; fi; done; echo "HYP.exe not found in Steam launch command" >&2; exit 1' _ '{quoted}' %command%"#
+    )
 }
 
 fn install_lock(compatdata: &Path) -> Result<File> {
@@ -429,6 +444,28 @@ mod tests {
     use std::ffi::OsStr;
 
     use crate::games::xxmi::steam_app;
+
+    #[test]
+    fn steam_play_option_replaces_only_hoyoplay() -> Result<()> {
+        let executable = "/games/Dan's Library/XXMI Launcher.exe";
+        let option = zzz_steam_play_option(executable);
+        let run = |original| {
+            Command::new("bash")
+                .arg("-c")
+                .arg(option.replace("%command%", original))
+                .output()
+        };
+        let replaced = run(r#"printf '%s\n' 'Proton Experimental' waitforexitandrun '/game directory/HYP.exe' --extra"#)?;
+        ensure!(replaced.status.success(), "{}", String::from_utf8_lossy(&replaced.stderr));
+        assert_eq!(
+            String::from_utf8(replaced.stdout)?,
+            format!("Proton Experimental\nwaitforexitandrun\n{executable}\n--extra\n"),
+        );
+        let missing = run("printf untouched")?;
+        assert!(!missing.status.success());
+        assert!(missing.stdout.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn steam_runner_uses_the_exact_game_prefix_and_passes_paths_as_arguments() {

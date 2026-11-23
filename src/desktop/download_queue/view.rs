@@ -1,15 +1,17 @@
 use std::collections::HashSet;
 
+use dmm::games::GameKind;
 use rune::tok::{Theme, type_};
 use rune::{El, ScrollSpec, SurfaceFit, TextStyle, col, el, row, text};
 use rune_kit::shell::SidebarRow;
-use rune_kit::{Dialog, Kit, Progress};
+use rune_kit::{Dialog, Kit, Progress, Switch};
 use url::Url;
 
 use super::{Action, Entry, Phase, Transfer};
 use crate::desktop::components::{
     button, bytes, field, heading, muted, open_page, panel, source_icon, styled_field,
 };
+use crate::desktop::shell::game_icon;
 use crate::desktop::{Screen, Size, State};
 
 pub(in crate::desktop) fn page(s: &State, t: Theme, k: &Kit) -> El {
@@ -39,6 +41,19 @@ pub(in crate::desktop) fn page(s: &State, t: Theme, k: &Kit) -> El {
                 |s, _| s.handoff_open = true,
             ))))
         .child(muted(format!("{pending} pending  ·  {installed} installed  ·  {stopped} stopped  ·  {} transferred", bytes(transferred)), t));
+    #[cfg(any(target_os = "linux", windows))]
+    {
+        view = view.child(
+            Switch::new(s.preferences.notify_downloads_complete)
+                .label("Notify when downloads finish")
+                .on_toggle(|s: &mut State| {
+                    s.preferences.notify_downloads_complete = !s.preferences.notify_downloads_complete;
+                    s.save_preferences();
+                })
+                .build(k)
+                .key("queue-notify-complete"),
+        );
+    }
     if has_handoff {
         view = view.child(muted(
             "For a waiting install, open each Nexus file page, choose Mod Manager Download, then paste its nxm:// link.",
@@ -83,12 +98,14 @@ pub(in crate::desktop) fn page(s: &State, t: Theme, k: &Kit) -> El {
 }
 
 fn entry(s: &State, index: usize, item: &Entry, t: Theme, k: &Kit) -> El {
-    let game = s
-        .snapshot
-        .instances
-        .iter()
+    let kind = s.snapshot.instances.iter()
         .find(|game| game.name == item.instance)
-        .map_or(item.instance.as_str(), |game| game.kind.display_name());
+        .map(|game| game.kind);
+    let game = match kind {
+        Some(kind) => kind.display_name(),
+        None => item.instance.as_str(),
+    };
+    let installed = item.installed_state(&s.snapshot);
     let mut line = row()
         .w_full()
         .items_center()
@@ -107,7 +124,9 @@ fn entry(s: &State, index: usize, item: &Entry, t: Theme, k: &Kit) -> El {
                         .truncate()
                         .help(&item.name),
                 )
-                .child(muted(format!("{game}  ·  {}", file_summary(item)), t).wrap()),
+                .child(row().gap(6.0).items_center()
+                    .child(game_icon(s, kind.unwrap_or(GameKind::Generic), t))
+                    .child(muted(format!("{game}  ·  {}", file_summary(item)), t).wrap())),
         );
     line = line.child(
         muted(item.status(), t)
@@ -116,6 +135,22 @@ fn entry(s: &State, index: usize, item: &Entry, t: Theme, k: &Kit) -> El {
             .radius(6.0)
             .fill(t.control_off),
     );
+    if let Some(mod_state) = installed {
+        let enabled = mod_state.enabled;
+        let locked = s.busy.is_some()
+            || s.queue.active().is_some_and(|(instance, applying)| {
+                applying && instance == item.instance
+            });
+        line = line.child(
+            Switch::new(enabled)
+                .label(format!("Enable {}", item.name))
+                .disabled(locked)
+                .hide_label()
+                .on_toggle(move |s: &mut State| s.toggle_completed_download(index, !enabled))
+                .build(k)
+                .key(format!("queue-enabled-{index}")),
+        ).child(muted(if enabled { "Enabled" } else { "Disabled" }, t));
+    }
     if let Phase::Waiting(_) = item.phase {
         line = line.child(button(
             format!("queue-nexus-{index}"),

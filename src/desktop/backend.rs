@@ -18,11 +18,17 @@ use super::{Origin, Screen, Snapshot};
 
 pub(super) enum Update {
     Library(Snapshot),
+    ModRenamed {
+        instance: String,
+        slug: String,
+        enabled: bool,
+    },
     LocalPlan(Inspection),
     Discovered(Snapshot, Discovery),
     #[cfg(target_os = "linux")]
     SteamXxmiInstalled(Result<SteamXxmi>),
     XxmiStarted(Child, PathBuf),
+    XxmiGameStarted(GameKind, Result<Child>),
     GameChanged(GameKind, Snapshot),
     Message(String),
     Search(u64, SearchQuery, Result<SearchPage>),

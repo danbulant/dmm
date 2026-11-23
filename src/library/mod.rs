@@ -19,7 +19,7 @@ use tempfile::{Builder, TempDir};
 use crate::archive::{ArchiveTree, portable_path, unpack};
 use crate::deploy::{
     Deployment, FileChange, FileState, checked_root, clear_empty_folder, fingerprint, metadata,
-    store_blob, target, verify_folder,
+    store_blob, target, verify_folder, verify_folder_layout,
 };
 use crate::games::xxmi;
 use crate::games::{GameKind, GameProfile, InstallPlan, parse_profile, plan, plan_bundle, profile};
@@ -95,6 +95,13 @@ pub struct ManagedMod {
     #[serde(skip)]
     pub installed_size: Option<u64>,
     backups: BTreeMap<String, FileState>,
+}
+
+pub struct RemoteModState {
+    pub instance: String,
+    pub slug: String,
+    pub id: RemoteMod,
+    pub enabled: bool,
 }
 
 impl ManagedMod {
@@ -373,6 +380,28 @@ impl Library {
         }
         Ok(mods)
     }
+    pub fn remote_mod_states(&self) -> Result<Vec<RemoteModState>> {
+        let mut statement = self.db.prepare(
+            "SELECT instance, slug, id, enabled FROM (
+                 SELECT instance, slug,
+                        json_extract(data, '$.versions[' || json_extract(data, '$.current') || '].release.id') AS id,
+                        json_extract(data, '$.enabled') AS enabled
+                 FROM mods
+             ) WHERE id IS NOT NULL ORDER BY instance, slug",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut mods = Vec::new();
+        while let Some(row) = rows.next()? {
+            mods.push(RemoteModState {
+                instance: row.get(0)?,
+                slug: row.get(1)?,
+                id: serde_json::from_str(row.get_ref(2)?.as_str()?)?,
+                enabled: row.get(3)?,
+            });
+        }
+        Ok(mods)
+    }
+
     pub fn remote_slug(&self, instance: &str, id: &RemoteMod) -> Result<Option<String>> {
         Ok(self
             .mods(instance)?
@@ -676,34 +705,44 @@ impl Library {
         allow_multiple: bool,
     ) -> Result<()> {
         let instance = self.instance(instance)?;
-        let old = self.managed_mod(&instance.name, slug)?;
+        let mut old = self.managed_mod(&instance.name, slug)?;
         if enabled == old.enabled {
             return Ok(());
         }
-        let mut next = old.clone();
-        next.enabled = enabled;
-        let deployment = if instance.kind.is_xxmi() {
+        if instance.kind.is_xxmi() {
             checked_root(&instance.root)?;
-            self.check_claims(&instance, &next, allow_multiple)?;
+            if enabled
+                && !allow_multiple
+                && let Some(group) = &old.group
+            {
+                self.check_active_group(&instance.name, slug, group)?;
+            }
             let before = xxmi::mod_folder(slug, old.enabled);
             let after = xxmi::mod_folder(slug, enabled);
             let files = folder_files(&old)?;
-            verify_folder(&target(&instance.root, &before, false)?, &files)?;
+            verify_folder_layout(&target(&instance.root, &before, false)?, &files)?;
             clear_empty_folder(&target(&instance.root, &after, false)?)?;
-            Deployment::RenameFolder {
-                before,
-                after,
-                files,
-            }
-        } else {
-            self.prepare(
+            old.enabled = enabled;
+            return self.commit_change(
                 &instance,
+                slug,
                 Some(&old),
-                Some(&mut next),
-                replace_unmanaged,
-                allow_multiple,
-            )?
-        };
+                Deployment::RenameFolder {
+                    before,
+                    after,
+                    files,
+                },
+            );
+        }
+        let mut next = old.clone();
+        next.enabled = enabled;
+        let deployment = self.prepare(
+            &instance,
+            Some(&old),
+            Some(&mut next),
+            replace_unmanaged,
+            allow_multiple,
+        )?;
         self.commit_change(&instance, slug, Some(&next), deployment)
     }
 
@@ -808,26 +847,36 @@ impl Library {
         })
     }
 
+    fn check_active_group(&self, instance: &str, slug: &str, group: &str) -> Result<()> {
+        let other: Option<String> = self
+            .db
+            .query_row(
+                "SELECT slug FROM mods WHERE instance = ?1 AND slug != ?2
+                 AND json_extract(data, '$.enabled') AND json_extract(data, '$.group') = ?3
+                 ORDER BY slug LIMIT 1",
+                params![instance, slug, group],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(other) = other {
+            bail!("{other} is active in group {group}; disable it or pass --allow-multiple");
+        }
+        Ok(())
+    }
+
     fn check_claims(
         &self,
         instance: &Instance,
         next: &ManagedMod,
         allow_multiple: bool,
     ) -> Result<()> {
-        let mods = self.mods(&instance.name)?;
         if next.enabled
             && !allow_multiple
             && let Some(group) = &next.group
         {
-            if let Some(other) = mods.iter().find(|other| {
-                other.enabled && other.slug != next.slug && other.group.as_ref() == Some(group)
-            }) {
-                bail!(
-                    "{} is active in group {group}; disable it or pass --allow-multiple",
-                    other.slug
-                );
-            }
+            self.check_active_group(&instance.name, &next.slug, group)?;
         }
+        let mods = self.mods(&instance.name)?;
         let claims = Claims::from_mods(&mods, &next.slug);
         for path in next.versions[next.current].files.keys() {
             if let Some(owner) = claims.conflict(path) {

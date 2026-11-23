@@ -114,6 +114,43 @@ fn reopening_rolls_back_a_partially_applied_deployment() -> Result<()> {
 }
 
 #[test]
+fn reopening_rolls_back_an_xxmi_rename_without_reverting_edits() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path().join("mods");
+    let state = dir.path().join("state");
+    let input = dir.path().join("input");
+    fs::create_dir(&root)?;
+    fs::create_dir(&input)?;
+    fs::write(input.join("skin.ini"), "original")?;
+    let mut lib = Library::open(&state)?;
+    let instance = lib.register("game", GameKind::Zzmi, &root, None)?;
+    lib.install("game", "skin", &input, None, Default::default())?;
+    let before = root.join("skin");
+    let after = root.join("DISABLED_skin");
+    fs::write(before.join("skin.ini"), "edited")?;
+    let pending = Pending {
+        root: instance.root,
+        deployment: Deployment::RenameFolder {
+            before: "skin".into(),
+            after: "DISABLED_skin".into(),
+            files: folder_files(&lib.managed_mod("game", "skin")?)?,
+        },
+    };
+    lib.db.execute(
+        "INSERT INTO pending VALUES (1, ?1)",
+        [serde_json::to_string(&pending)?],
+    )?;
+    fs::rename(&before, &after)?;
+    drop(lib);
+
+    let lib = Library::open(&state)?;
+    assert!(lib.managed_mod("game", "skin")?.enabled);
+    assert!(!after.exists());
+    assert_eq!(fs::read_to_string(before.join("skin.ini"))?, "edited");
+    Ok(())
+}
+
+#[test]
 fn remote_bundle_plans_each_archive_and_records_offline_metadata() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let state = temp.path().join("state");

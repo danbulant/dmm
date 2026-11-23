@@ -13,6 +13,7 @@ use tempfile::NamedTempFile;
 pub(super) struct Preferences {
     pub game: GameKind,
     pub enable_new_mods: bool,
+    pub notify_downloads_complete: bool,
     pub browse: Vec<BrowsePreferences>,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +29,7 @@ impl Default for Preferences {
         Self {
             game: GameKind::Cyberpunk,
             enable_new_mods: false,
+            notify_downloads_complete: false,
             browse: Vec::new(),
         }
     }

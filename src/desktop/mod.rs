@@ -3,6 +3,7 @@ mod browse;
 mod components;
 mod download_queue;
 mod download_recovery;
+mod game_process;
 mod game_setup;
 mod installations;
 mod mod_card;
@@ -30,14 +31,14 @@ use std::process::Child;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use dmm::acquisition::pending_pages;
 use dmm::games::discovery::{DetectedGame, Discovery, discover};
 use dmm::games::xxmi::launch_xxmi;
 #[cfg(target_os = "linux")]
 use dmm::games::xxmi::steam_xxmi::{InstallStage, Protontricks, SteamXxmi};
 use dmm::games::{GameKind, GameProfile, launch_profile, profile};
-use dmm::library::{Instance, LaunchSettings, Library, ManagedMod, SavedFavorite};
+use dmm::library::{Instance, LaunchSettings, Library, ManagedMod, RemoteModState, SavedFavorite};
 use dmm::sources::{RemoteMod, Source};
 use rune::{App, AppSpec, Pixels, Tx, Waker};
 use rune_kit::shell::PaneState;
@@ -46,6 +47,7 @@ use url::Url;
 use backend::{Backend, Update, Worker, open_library};
 use browse::Browser;
 use components::icon;
+use game_process::{RunningGames, running_games};
 use download_queue::Queue;
 use game_setup::SetupForm;
 #[cfg(target_os = "linux")]
@@ -94,6 +96,7 @@ struct Snapshot {
     selected: Option<Instance>,
     profiles: BTreeMap<String, Result<GameProfile, String>>,
     mods: Vec<ManagedMod>,
+    remote_mods: Vec<RemoteModState>,
     favorites: Vec<SavedFavorite>,
     nexus_pages: Vec<Url>,
     sources: Vec<Origin>,
@@ -141,6 +144,7 @@ impl Snapshot {
             selected,
             profiles,
             mods,
+            remote_mods: library.remote_mod_states()?,
             favorites: library.saved_favorites()?,
             nexus_pages,
             sources,
@@ -207,6 +211,45 @@ impl XxmiLaunch {
     }
 }
 
+struct XxmiGameStart {
+    kind: GameKind,
+    launcher: Option<Child>,
+    exited_at: Option<Instant>,
+    seen: Option<Instant>,
+}
+
+impl XxmiGameStart {
+    fn poll(&mut self, running: bool, now: Instant) -> Option<Option<String>> {
+        if running {
+            self.seen.get_or_insert(now);
+        }
+        if let Some(child) = &mut self.launcher {
+            match child.try_wait() {
+                Ok(None) => return None,
+                Ok(Some(status)) => {
+                    self.launcher = None;
+                    self.exited_at = Some(now);
+                    if !status.success() && self.seen.is_none() {
+                        return Some(Some(format!("XXMI exited with {status}. Check XXMI Launcher Log.txt.")));
+                    }
+                }
+                Err(error) => return Some(Some(format!("Could not check the XXMI process: {error}"))),
+            }
+        }
+        if let Some(seen) = self.seen {
+            if now.duration_since(seen) >= Duration::from_secs(15) {
+                return Some(None);
+            }
+            if !running {
+                return Some(Some(format!("{} exited shortly after starting. Check the game log.", self.kind.display_name())));
+            }
+        } else if self.exited_at.is_some_and(|exit| now.duration_since(exit) >= Duration::from_secs(5)) {
+            return Some(Some(format!("{} did not stay running after launch. Check the game and XXMI logs.", self.kind.display_name())));
+        }
+        None
+    }
+}
+
 struct State {
     state_dir: PathBuf,
     worker: Option<Worker>,
@@ -217,6 +260,9 @@ struct State {
     previews: Option<Previews>,
     busy: Option<&'static str>,
     xxmi_launch: XxmiLaunch,
+    running_games: RunningGames,
+    next_game_check: Option<Instant>,
+    xxmi_game_start: Option<XxmiGameStart>,
     queue: Queue,
     handoff_open: bool,
     preferences: Preferences,
@@ -236,6 +282,7 @@ struct State {
     discovery_notices: Vec<(GameKind, String)>,
     cyberpunk_icon: Option<Pixels>,
     zzmi_icon: Option<Pixels>,
+    efmi_icon: Option<Pixels>,
     gamebanana_icon: Option<Pixels>,
     nexus_icon: Option<Pixels>,
     public_game: GameKind,
@@ -260,6 +307,9 @@ impl State {
             previews: None,
             busy: None,
             xxmi_launch: XxmiLaunch::Idle,
+            running_games: RunningGames::default(),
+            next_game_check: None,
+            xxmi_game_start: None,
             #[cfg(target_os = "linux")]
             nexus_listener: None,
             queue: Queue::default(),
@@ -281,6 +331,7 @@ impl State {
             discovery_notices: Vec::new(),
             cyberpunk_icon: icon(include_bytes!("icons/cyberpunk.png")),
             zzmi_icon: icon(include_bytes!("icons/zzmi.png")),
+            efmi_icon: icon(include_bytes!("icons/efmi.jpg")),
             gamebanana_icon: icon(include_bytes!("icons/gamebanana.png")),
             nexus_icon: icon(include_bytes!("icons/nexus.png")),
             public_game: GameKind::Cyberpunk,
@@ -350,6 +401,40 @@ impl State {
         job: impl FnOnce(PathBuf) -> Result<Update> + Send + 'static,
     ) {
         self.submit_job(label, move |worker| job(worker.state_dir.clone()));
+    }
+
+    fn set_mod_enabled(
+        &mut self,
+        instance: String,
+        slug: String,
+        enabled: bool,
+        download: Option<RemoteMod>,
+    ) {
+        let selected = self.snapshot.selected.as_ref().map(|game| game.name.clone());
+        self.submit("Updating mod…", move |dir| {
+            let mut library = open_library(&dir)?;
+            if let Some(id) = download {
+                let current = library.managed_mod(&instance, &slug)?;
+                ensure!(
+                    current.release().is_some_and(|release| release.id == id),
+                    "This download no longer matches the installed mod"
+                );
+            }
+            let whole_folder = library.instance(&instance)?.kind.is_xxmi();
+            library.toggle(&instance, &slug, enabled, false, false)?;
+            if whole_folder {
+                Ok(Update::ModRenamed {
+                    instance,
+                    slug,
+                    enabled,
+                })
+            } else {
+                Ok(Update::Library(Snapshot::load(
+                    &library,
+                    selected.as_deref(),
+                )?))
+            }
+        });
     }
 
     fn submit_details(
@@ -465,22 +550,59 @@ impl State {
         });
     }
 
+    fn game_is_starting(&self) -> bool {
+        self.xxmi_game_start.as_ref().is_some_and(|start| {
+            start.kind == self.game_kind() && start.seen.is_none()
+        })
+    }
+
+    fn poll_games(&mut self, tx: &mut Tx) -> bool {
+        if !cfg!(target_os = "linux") || (!self.game_kind().is_xxmi() && self.xxmi_game_start.is_none()) {
+            self.next_game_check = None;
+            return false;
+        }
+        let now = Instant::now();
+        if let Some(next) = self.next_game_check.filter(|next| *next > now) {
+            tx.wake_after(next.duration_since(now));
+            return false;
+        }
+        let running = running_games();
+        let mut changed = self.running_games != running;
+        self.running_games = running;
+        if let Some(start) = &mut self.xxmi_game_start
+            && let Some(notice) = start.poll(self.running_games.contains(start.kind), now)
+        {
+            self.xxmi_game_start = None;
+            if let Some(notice) = notice {
+                self.notice = notice;
+            }
+            changed = true;
+        }
+        let interval = Duration::from_secs(1);
+        self.next_game_check = Some(now + interval);
+        tx.wake_after(interval);
+        changed
+    }
+
     fn launch_game(&mut self) {
         let Some(instance) = self.snapshot.selected.clone() else {
             return;
         };
+        if instance.kind.is_xxmi()
+            && (self.xxmi_game_start.is_some() || running_games().contains(instance.kind))
+        {
+            self.next_game_check = None;
+            return;
+        }
         let LaunchSettings { xxmi, wine_prefix } = self.snapshot.launch.clone();
         self.submit("Launching game…", move |_| {
-            let profile = instance.profile()?;
-            launch_profile(
-                &profile,
-                &instance.root,
-                xxmi.as_deref(),
-                None,
-                wine_prefix.as_deref(),
-                &[],
-            )?
-            .spawn()?;
+            let command = instance.profile().and_then(|profile| {
+                launch_profile(&profile, &instance.root, xxmi.as_deref(), None, wine_prefix.as_deref(), &[])
+            });
+            if instance.kind.is_xxmi() && cfg!(target_os = "linux") {
+                return Ok(Update::XxmiGameStarted(instance.kind, command.and_then(|command| command.spawn_process())));
+            }
+            command?.spawn()?;
             Ok(Update::Message("Game launch requested".into()))
         });
     }
@@ -831,9 +953,48 @@ impl State {
                     self.save_preferences();
                 }
                 Ok(Update::Library(snapshot)) => self.apply_snapshot(snapshot, tx),
+                Ok(Update::ModRenamed {
+                    instance,
+                    slug,
+                    enabled,
+                }) => {
+                    if self
+                        .snapshot
+                        .selected
+                        .as_ref()
+                        .is_some_and(|game| game.name == instance)
+                        && let Some(record) = self
+                            .snapshot
+                            .mods
+                            .iter_mut()
+                            .find(|record| record.slug == slug)
+                    {
+                        record.enabled = enabled;
+                    }
+                    if let Some(record) = self
+                        .snapshot
+                        .remote_mods
+                        .iter_mut()
+                        .find(|record| record.instance == instance && record.slug == slug)
+                    {
+                        record.enabled = enabled;
+                    }
+                }
                 Ok(Update::LocalPlan(inspection)) => self.local.apply_preview(inspection),
                 Ok(Update::Message(message)) => self.notice = message,
                 Ok(Update::XxmiStarted(child, exe)) => self.xxmi_launch = XxmiLaunch::Running(child, exe),
+                Ok(Update::XxmiGameStarted(kind, result)) => match result {
+                    Ok(launcher) => {
+                        self.xxmi_game_start = Some(XxmiGameStart {
+                            kind,
+                            launcher: Some(launcher),
+                            exited_at: None,
+                            seen: None,
+                        });
+                        self.next_game_check = None;
+                    }
+                    Err(error) => self.notice = format!("Could not launch {}: {error:#}", kind.display_name()),
+                },
                 Ok(Update::Search(revision, query, result))
                     if revision == self.browser.search_revision =>
                 {
@@ -898,6 +1059,7 @@ impl State {
             changed = true;
         }
         changed |= self.xxmi_launch.poll(tx);
+        changed |= self.poll_games(tx);
         changed |= self.poll_queue(tx);
         #[cfg(target_os = "linux")]
         {

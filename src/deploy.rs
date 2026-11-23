@@ -72,13 +72,17 @@ impl Deployment {
                 let from = target(root, from, false)?;
                 let to = target(root, to, false)?;
                 match (metadata(&from)?, metadata(&to)?) {
-                    (Some(_), None) => {
-                        verify_folder(&from, files)?;
+                    (Some(meta), None) if meta.is_dir() => {
+                        if reverse {
+                            verify_folder_layout(&from, files)?;
+                        }
                         fs::rename(&from, &to).with_context(|| {
                             format!("renaming {} to {}", from.display(), to.display())
                         })?;
                     }
-                    (None, Some(_)) => verify_folder(&to, files)?,
+                    (None, Some(meta)) if reverse && meta.is_dir() => {
+                        verify_folder_layout(&to, files)?;
+                    }
                     _ => bail!(
                         "expected exactly one of {} or {}",
                         from.display(),
@@ -265,6 +269,25 @@ pub(crate) fn target(root: &Path, relative: &str, create_parents: bool) -> Resul
 }
 
 pub(crate) fn verify_folder(root: &Path, files: &[(String, FileState)]) -> Result<()> {
+    inspect_folder(root, files, |path, state| {
+        ensure!(
+            fingerprint(path)?.as_ref() == Some(state),
+            "file changed outside DMM: {}",
+            path.display()
+        );
+        Ok(())
+    })
+}
+
+pub(crate) fn verify_folder_layout(root: &Path, files: &[(String, FileState)]) -> Result<()> {
+    inspect_folder(root, files, |_, _| Ok(()))
+}
+
+fn inspect_folder(
+    root: &Path,
+    files: &[(String, FileState)],
+    verify_file: impl Fn(&Path, &FileState) -> Result<()>,
+) -> Result<()> {
     let expected: std::collections::HashMap<_, _> = files
         .iter()
         .map(|(path, state)| (path.as_str(), state))
@@ -279,15 +302,12 @@ pub(crate) fn verify_folder(root: &Path, files: &[(String, FileState)]) -> Resul
                 if meta.is_dir() {
                     dirs.push(path);
                 } else {
+                    ensure!(meta.is_file(), "not a regular file: {}", path.display());
                     let relative = portable_path(path.strip_prefix(root)?)?;
                     let state = expected.get(relative.as_str()).with_context(|| {
                         format!("unmanaged file in mod folder: {}", path.display())
                     })?;
-                    ensure!(
-                        fingerprint(&path)?.as_ref() == Some(*state),
-                        "file changed outside DMM: {}",
-                        path.display()
-                    );
+                    verify_file(&path, state)?;
                     found += 1;
                 }
             }

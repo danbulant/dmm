@@ -184,7 +184,11 @@ pub(super) fn view(s: &State, t: Theme, k: &Kit) -> El {
                 body = body.child(muted(format!("Steam game: {}", game.root.display()), t).wrap());
             }
             #[cfg(target_os = "linux")]
-            if s.steam_xxmi.iter().any(|target| target.kind() == kind) {
+            let steam_setup_available = s.steam_xxmi.iter().any(|target| target.kind() == kind);
+            #[cfg(not(target_os = "linux"))]
+            let steam_setup_available = false;
+            #[cfg(target_os = "linux")]
+            if steam_setup_available {
                 body = body.child(steam_setup(s, t, kind));
             }
             if !any {
@@ -198,29 +202,19 @@ pub(super) fn view(s: &State, t: Theme, k: &Kit) -> El {
             }
             if s.snapshot.selected.is_some() {
                 body = body.child(launch_settings(s, t, k));
-                body = body.child(button(
-                    "setup:start-xxmi",
-                    s.xxmi_launch.label("Start XXMI for this installation"),
-                    t,
-                    false,
-                    ready && !s.xxmi_launch.active(),
-                    |s, _| s.open_xxmi(),
-                ));
+                if !steam_setup_available {
+                    body = body.child(button(
+                        "setup:start-xxmi",
+                        s.xxmi_launch.label("Start XXMI"),
+                        t,
+                        false,
+                        ready && !s.xxmi_launch.active(),
+                        |s, _| s.open_xxmi(),
+                    ));
+                }
             }
-            if matches!(s.xxmi_launch, XxmiLaunch::Running(..))
-                && cfg!(any(target_os = "linux", target_os = "windows"))
-            {
-                body = body.child(button(
-                    "setup:close-xxmi",
-                    "Close XXMI",
-                    t,
-                    false,
-                    ready,
-                    |s, _| s.close_xxmi(),
-                ));
-            }
-            if let XxmiLaunch::Failed(error) = &s.xxmi_launch {
-                body = body.child(muted(error.clone(), t).wrap());
+            if !steam_setup_available {
+                body = body.child(xxmi_feedback(s, t));
             }
         }
         GameKind::Generic => {
@@ -239,6 +233,26 @@ pub(super) fn view(s: &State, t: Theme, k: &Kit) -> El {
     )
 }
 
+fn xxmi_feedback(s: &State, t: Theme) -> El {
+    let mut body = col().gap(6.0);
+    if matches!(s.xxmi_launch, XxmiLaunch::Running(..))
+        && cfg!(any(target_os = "linux", target_os = "windows"))
+    {
+        body = body.child(button(
+            "setup:close-xxmi",
+            if s.busy == Some("Closing XXMI…") { "Closing XXMI…" } else { "Close XXMI" },
+            t,
+            false,
+            s.busy.is_none(),
+            |s, _| s.close_xxmi(),
+        ));
+    }
+    if let XxmiLaunch::Failed(error) = &s.xxmi_launch {
+        body = body.child(muted(error.clone(), t).wrap());
+    }
+    body
+}
+
 #[cfg(target_os = "linux")]
 fn steam_setup(s: &State, t: Theme, kind: GameKind) -> El {
     let mut body = panel(t).child(heading("Steam Proton setup", t));
@@ -250,34 +264,75 @@ fn steam_setup(s: &State, t: Theme, kind: GameKind) -> El {
     }
     let available = s.busy.is_none() && s.protontricks.is_some();
     let title = kind.display_name();
-    let has_launcher = s.steam_xxmi.iter().any(|target| target.kind() == kind && target.installed);
-    if !has_launcher
-        && let Some(target) = s.steam_xxmi.iter().find(|target| target.kind() != kind && target.installed)
-    {
-        let existing = target.clone();
+    let selected = s.snapshot.selected.as_ref();
+    let launcher = s.steam_xxmi.iter().filter(|target| target.installed).min_by_key(|target| {
+        (
+            !selected.is_some_and(|instance| instance.root.starts_with(&target.compatdata)),
+            target.kind() != kind,
+        )
+    });
+    let prefer_selected = selected.is_some_and(|instance| {
+        s.snapshot.launch.xxmi.is_some()
+            || s.snapshot.launch.wine_prefix.is_some()
+            || launcher.is_none_or(|target| !instance.root.starts_with(&target.compatdata))
+    });
+    if let Some(target) = launcher.filter(|_| !prefer_selected) {
+        let reused = target.kind() != kind;
+        let launcher = target.clone();
+        let label = if reused { "Start existing XXMI" } else { "Start XXMI" };
         body = body.child(button(
-            "setup:steam-reuse", s.xxmi_launch.label("Start existing XXMI"), t, true,
+            "setup:steam-start", s.xxmi_launch.label(label), t, true,
             available && !s.xxmi_launch.active(),
-            move |s, _| s.open_steam_xxmi(existing.clone()),
-        )).child(muted(format!("Install the {title} importer in XXMI, then rescan. Reusing this launcher runs the importer in the existing Proton prefix."), t).wrap());
-        for (index, game) in s.steam_xxmi.iter().enumerate().filter(|(_, game)| game.kind() == kind) {
-            body = body.child(xxmi_game_folder(index, game, &target, t));
+            move |s, _| s.open_steam_xxmi(launcher.clone()),
+        )).child(muted(format!("Install the {title} importer in XXMI, then rescan to find its Mods folder."), t).wrap());
+        if reused {
+            for (index, game) in s.steam_xxmi.iter().enumerate().filter(|(_, game)| game.kind() == kind) {
+                body = body.child(xxmi_game_folder(index, game, target, t));
+            }
         }
+    } else if selected.is_some() || s.xxmi_launch.active() {
+        body = body.child(button(
+            "setup:steam-start", s.xxmi_launch.label("Start XXMI"), t, true,
+            s.busy.is_none() && !s.xxmi_launch.active(),
+            |s, _| s.open_xxmi(),
+        ));
     }
+    body = body.child(xxmi_feedback(s, t));
     for (index, target) in s.steam_xxmi.iter().enumerate().filter(|(_, target)| target.kind() == kind) {
         let mut game = col().gap(8.0)
             .child(muted(format!("Proton prefix: {}", target.compatdata.join("pfx").display()), t).wrap());
         game = game.child(xxmi_game_folder(index, target, target, t));
-        if target.installed {
-            let target = target.clone();
-            game = game.child(button(format!("setup:steam-start:{index}"),
-                s.xxmi_launch.label("Start XXMI"), t, true,
-                available && !s.xxmi_launch.active(),
-                move |s, _| s.open_steam_xxmi(target.clone())))
-                .child(muted(format!("Install the {title} importer in XXMI, then rescan to find its Mods folder."), t).wrap());
-        } else if !target.initialized {
+        if let Some(option) = target.steam_play_option() {
+            game = game
+                .child(
+                    muted(
+                        "To open XXMI from Steam, save your current launch options, then paste this command into Steam → Library → Zenless Zone Zero → Properties → General → Launch Options.",
+                        t,
+                    )
+                    .wrap(),
+                )
+                .child(button(
+                    format!("setup:copy-steam-play:{index}"),
+                    "Copy Steam launch option",
+                    t,
+                    false,
+                    true,
+                    move |s, tx| {
+                        tx.copy(option.clone());
+                        s.notice = "Steam launch option copied.".into();
+                    },
+                ))
+                .child(
+                    muted(
+                        "Steam’s Play button will open XXMI in this game’s Proton session instead of HoYoPlay. In XXMI, set Game Launch to Native, then click Start. Restore your previous Steam launch options to open HoYoPlay again.",
+                        t,
+                    )
+                    .wrap(),
+                );
+        }
+        if !target.installed && !target.initialized {
             game = game.child(muted(format!("Launch {title} once in Steam with Proton to create its prefix, then close it and rescan."), t).wrap());
-        } else {
+        } else if !target.installed {
             let target = target.clone();
             game = game.child(button(
                 format!("setup:steam-install:{index}"),

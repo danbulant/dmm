@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-rune-ui = ["dep:image", "dep:rune", "dep:rune-kit", "dep:x11rb", "rune/native-file-dialog"]
+rune-ui = ["dep:image", "dep:rune", "dep:rune-kit", "dep:windows", "dep:x11rb", "dep:zbus", "rune/native-file-dialog"]
 default = ["rune-ui"]
 [dependencies]
 anyhow = "1"
@@ -30,6 +30,10 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 ring = "0.17"
 x11rb = { version = "0.13", optional = true }
+zbus = { version = "5", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", optional = true, features = ["Data_Xml_Dom", "UI_Notifications", "Win32_System_Registry", "Win32_System_WinRT"] }
 
 # Rune's git workspace patches are not inherited by Cargo consumers.
 [patch.crates-io]

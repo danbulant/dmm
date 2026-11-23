@@ -1,5 +1,9 @@
 mod view;
+#[cfg(windows)]
+mod windows_notification;
 
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -11,14 +15,18 @@ use dmm::acquisition::{
     InstallControl, InstallProgress, RemoteOutcome, cancel_pending, nexus_identity, redeem_remote,
     run_remote, source_client,
 };
-use dmm::library::InstallOptions;
+use dmm::library::{InstallOptions, RemoteModState};
 use dmm::sources::{ModDetails, ModFile, RemoteMod, SourceClient};
 use rune::{Tx, Waker};
 use url::Url;
+#[cfg(target_os = "linux")]
+use zbus::{blocking::Proxy, zvariant::Value};
 
 use super::download_recovery::{self, Bookmark, Recovery};
 use super::{Screen, Snapshot, State, Update};
 pub(super) use view::{overlay, page, sidebar};
+#[cfg(windows)]
+use windows_notification::notify_completed_downloads;
 
 struct Request {
     details: ModDetails,
@@ -79,6 +87,15 @@ impl Entry {
         )
     }
 
+    fn installed_state<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a RemoteModState> {
+        if !matches!(self.phase, Phase::Complete) {
+            return None;
+        }
+        snapshot.remote_mods.iter().find(|record| {
+            record.instance == self.instance && record.id == self.id
+        })
+    }
+
     fn status(&self) -> &'static str {
         match &self.phase {
             Phase::Queued(Action::DiscardNexus) => "Cancelling…",
@@ -133,6 +150,8 @@ pub(super) struct Queue {
     running: Option<usize>,
     save: Vec<PathBuf>,
     refresh: bool,
+    #[cfg(any(target_os = "linux", windows))]
+    completed_in_batch: usize,
 }
 
 impl Drop for Queue {
@@ -367,6 +386,10 @@ impl Queue {
         item.phase = match result {
             Ok(Completion::Installed) => {
                 item.recovery_path = None;
+                #[cfg(any(target_os = "linux", windows))]
+                {
+                    self.completed_in_batch += 1;
+                }
                 Phase::Complete
             }
             Ok(Completion::Browser(urls)) => Phase::Waiting(urls),
@@ -377,6 +400,14 @@ impl Queue {
             self.save.extend(item.recovery_path.take());
         }
         self.refresh = true;
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn take_finished_batch(&mut self) -> Option<usize> {
+        if self.completed_in_batch == 0 || self.items.iter().any(Entry::pending) {
+            return None;
+        }
+        Some(std::mem::take(&mut self.completed_in_batch))
     }
 
     fn poll(&mut self) -> bool {
@@ -487,6 +518,22 @@ fn run(
 }
 
 impl State {
+    fn toggle_completed_download(&mut self, index: usize, enabled: bool) {
+        let Some(item) = self.queue.items.get(index) else { return };
+        let Some(record) = item.installed_state(&self.snapshot) else { return };
+        if self.queue.active().is_some_and(|(instance, applying)| {
+            applying && instance == item.instance
+        }) {
+            return;
+        }
+        self.set_mod_enabled(
+            record.instance.clone(),
+            record.slug.clone(),
+            enabled,
+            Some(record.id.clone()),
+        );
+    }
+
     pub(super) fn queued_for_selected(&self, id: &RemoteMod) -> bool {
         self.snapshot
             .selected
@@ -577,6 +624,22 @@ impl State {
     pub(super) fn poll_queue(&mut self, tx: &mut Tx) -> bool {
         let previous = self.queue.running;
         let changed = self.queue.poll();
+        #[cfg(any(target_os = "linux", windows))]
+        if let Some(installed) = self.queue.take_finished_batch()
+            && self.preferences.notify_downloads_complete
+            && let Err(error) = thread::Builder::new().name("dmm-notification".into()).spawn(move || {
+                let body = if installed == 1 {
+                    "1 mod installed.".into()
+                } else {
+                    format!("{installed} mods installed.")
+                };
+                if let Err(error) = notify_completed_downloads(&body) {
+                    eprintln!("Could not send download notification: {error:#}");
+                }
+            })
+        {
+            self.notice = format!("Could not start download notification: {error}");
+        }
         if previous != self.queue.running {
             self.sync_previews();
         }
@@ -606,6 +669,26 @@ impl State {
     pub(super) fn open_downloads(&mut self, tx: &mut Tx) {
         self.set_screen(Screen::Downloads, tx);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn notify_completed_downloads(body: &str) -> Result<()> {
+    let connection = zbus::blocking::Connection::session()?;
+    let notifications = Proxy::new(
+        &connection,
+        "org.freedesktop.Notifications",
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications",
+    )?;
+    let hints = HashMap::<&str, Value<'_>>::from([
+        ("desktop-entry", Value::from("com.dmm.ModManager")),
+    ]);
+    let actions: &[&str] = &[];
+    let _: u32 = notifications.call(
+        "Notify",
+        &("DMM", 0u32, "", "Download queue finished", body, actions, hints, -1i32),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

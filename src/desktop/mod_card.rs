@@ -5,7 +5,7 @@ use rune::{El, Icon, SurfaceFit, col, el, icon, row};
 use rune_kit::{Kit, Switch};
 
 use super::components::{button, card_title, mod_card, muted, preview};
-use super::{Screen, State, workbench};
+use super::{Screen, State};
 
 static BOOKMARK: Icon = Icon {
     name: "dmm-bookmark",
@@ -181,15 +181,14 @@ fn installed_toggle(s: &State, record: &ManagedMod, name: &str, t: Theme, k: &Ki
                 .hide_label()
                 .disabled(s.busy.is_some())
                 .on_toggle(move |state: &mut State| {
-                    workbench::change_mod(
-                        state,
-                        &game,
-                        &slug,
-                        "Updating mod…",
-                        move |library, game, slug| {
-                            library.toggle(game, slug, !enabled, false, false)
-                        },
-                    );
+                    if state
+                        .snapshot
+                        .selected
+                        .as_ref()
+                        .is_some_and(|selected| selected.name == game)
+                    {
+                        state.set_mod_enabled(game.clone(), slug.clone(), !enabled, None);
+                    }
                 })
                 .build(k)
                 .key(key),

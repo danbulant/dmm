@@ -120,12 +120,20 @@ fn sidebar(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
     let deploying = working_on_game.is_some_and(|(_, applying)| applying);
     let launch = button(
         "launch-game",
-        "Launch game",
+        if s.running_games.contains(s.game_kind()) {
+            "Game is running"
+        } else if s.game_is_starting() {
+            "Starting game…"
+        } else {
+            "Launch game"
+        },
         t,
         true,
         s.snapshot.selected.is_some()
             && s.game_kind() != GameKind::Generic
             && !deploying
+            && !s.running_games.contains(s.game_kind())
+            && (!s.game_kind().is_xxmi() || s.xxmi_game_start.is_none())
             && s.busy.is_none(),
         |s, _| s.launch_game(),
     );
@@ -210,11 +218,12 @@ fn game_select(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     menu.build(k, layer)
 }
-fn game_icon(s: &State, kind: GameKind, t: Theme) -> El {
+pub(super) fn game_icon(s: &State, kind: GameKind, t: Theme) -> El {
     let pixels = match kind {
         GameKind::Cyberpunk => s.cyberpunk_icon.as_ref(),
         GameKind::Zzmi => s.zzmi_icon.as_ref(),
-        GameKind::Efmi | GameKind::Generic => None,
+        GameKind::Efmi => s.efmi_icon.as_ref(),
+        GameKind::Generic => None,
     };
     let square = el()
         .size(24.0, 24.0)
