@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Child;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
@@ -8,7 +9,7 @@ use dmm::acquisition::source_client;
 use dmm::games::GameKind;
 use dmm::games::discovery::Discovery;
 #[cfg(target_os = "linux")]
-use dmm::games::zzz::steam_xxmi::SteamXxmi;
+use dmm::games::xxmi::steam_xxmi::SteamXxmi;
 use dmm::library::{Inspection, Library};
 use dmm::sources::{FilterCatalog, ModDetails, SearchPage, SearchQuery, SourceClient};
 use rune::Waker;
@@ -21,6 +22,7 @@ pub(super) enum Update {
     Discovered(Snapshot, Discovery),
     #[cfg(target_os = "linux")]
     SteamXxmiInstalled(Result<SteamXxmi>),
+    XxmiStarted(Child, PathBuf),
     GameChanged(GameKind, Snapshot),
     Message(String),
     Search(u64, SearchQuery, Result<SearchPage>),

@@ -7,15 +7,38 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 
 use super::discovery::detect_steam_app;
-use super::{GameProfile, InstallPlan, LaunchCommand, plan_mod_folder};
+use super::{GameKind, GameProfile, InstallPlan, LaunchCommand, plan_mod_folder};
 
-pub(super) const PROFILE: &str = include_str!("profile.toml");
-const STEAM_APP_ID: u32 = 4_162_040;
+#[derive(Clone, Copy)]
+struct SteamApp {
+    kind: GameKind,
+    id: u32,
+    importer: &'static str,
+}
+
+impl SteamApp {
+    fn compatdata(self, library: &Path) -> PathBuf {
+        library.join("steamapps/compatdata").join(self.id.to_string())
+    }
+}
+
+const STEAM_APPS: [SteamApp; 2] = [
+    SteamApp {
+        kind: GameKind::Zzmi,
+        id: 4_162_040,
+        importer: "ZZMI",
+    },
+    SteamApp {
+        kind: GameKind::Efmi,
+        id: 4_732_690,
+        importer: "EFMI",
+    },
+];
 
 fn validate_destination(destination: Option<&Path>) -> Result<()> {
     ensure!(
         destination.is_none(),
-        "ZZMI mods must install directly under the configured Mods folder"
+        "XXMI mods must install directly under the configured Mods folder"
     );
     Ok(())
 }
@@ -78,17 +101,14 @@ pub fn reserved_slug(slug: &str) -> bool {
     slug.starts_with("disabled")
 }
 
-pub(super) fn detect() -> Result<Vec<PathBuf>> {
+pub(super) fn detect(kind: GameKind) -> Result<Vec<PathBuf>> {
+    let app = steam_app(kind);
+    let steam_roots = detect_game(kind).unwrap_or_default();
     let mut candidates = standard_xxmi_roots()
         .into_iter()
-        .flat_map(|base| [base.join("ZZMI/Mods"), base.join("Mods")])
-        .chain(
-            detect_game()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|root| root.join("ZZMI/Mods")),
-        )
-        .filter(|path| is_zzmi_mods(path))
+        .flat_map(|base| [base.join(app.importer).join("Mods"), base.join("Mods")])
+        .chain(steam_roots.into_iter().map(|root| root.join(app.importer).join("Mods")))
+        .filter(|path| is_importer_mods(path, kind))
         .filter_map(|path| path.canonicalize().ok())
         .collect::<Vec<_>>();
     candidates.sort();
@@ -96,12 +116,21 @@ pub(super) fn detect() -> Result<Vec<PathBuf>> {
     Ok(candidates)
 }
 
-pub fn validate_installation_root(root: &Path, steam_game_roots: &[PathBuf]) -> Result<()> {
-    if steam_game_roots.iter().any(|game| root.starts_with(game)) {
-        ensure!(
-            is_zzmi_mods(root),
+pub fn validate_installation_root(
+    kind: GameKind,
+    root: &Path,
+    steam_game_roots: &[PathBuf],
+) -> Result<()> {
+    match kind {
+        GameKind::Efmi => ensure!(
+            is_importer_mods(root, kind),
+            "Choose the EFMI Mods folder from an installed XXMI importer."
+        ),
+        GameKind::Zzmi if steam_game_roots.iter().any(|game| root.starts_with(game)) => ensure!(
+            is_importer_mods(root, kind),
             "Choose the ZZMI Mods folder, not the Steam game installation."
-        );
+        ),
+        GameKind::Cyberpunk | GameKind::Generic | GameKind::Zzmi => {}
     }
     Ok(())
 }
@@ -120,40 +149,43 @@ pub(super) fn launch(
         .iter()
         .map(OsString::from)
         .collect();
-    xxmi_command(Some(root), xxmi, wine, wine_prefix, args)
+    xxmi_command(Some(root), xxmi, wine, wine_prefix, args).map(|(command, _)| command)
 }
 
-/// Find native Zenless Zone Zero installations registered in Steam.
-pub(super) fn detect_game() -> Result<Vec<PathBuf>> {
-    detect_steam_app(STEAM_APP_ID)
+fn steam_app(kind: GameKind) -> SteamApp {
+    STEAM_APPS
+        .into_iter()
+        .find(|app| app.kind == kind)
+        .expect("not an XXMI game")
 }
 
-/// Whether a Mods directory has the ZZMI package's loader configuration.
-fn is_zzmi_mods(path: &Path) -> bool {
-    path.file_name().is_some_and(|name| name == "Mods")
-        && path.parent().is_some_and(valid_zzmi_package)
+pub(super) fn detect_game(kind: GameKind) -> Result<Vec<PathBuf>> {
+    detect_steam_app(steam_app(kind).id)
 }
 
-fn valid_zzmi_package(package: &Path) -> bool {
-    let ini = package.join("d3dx.ini");
-    if !ini.is_file() || !package.join("Mods").is_dir() {
-        return false;
-    }
-    let Ok(contents) = std::fs::read_to_string(ini) else {
+fn is_importer_mods(path: &Path, kind: GameKind) -> bool {
+    let Some(package) = path.parent() else {
         return false;
     };
-    contents.lines().any(|line| {
-        let line = line.trim();
-        line.split_once('=').is_some_and(|(key, value)| {
-            key.trim().eq_ignore_ascii_case("include_recursive")
-                && value
-                    .split(';')
-                    .next()
-                    .unwrap_or_default()
-                    .trim()
-                    .eq_ignore_ascii_case("Mods")
-        })
-    })
+    if !path.file_name().is_some_and(|name| name == "Mods") || !path.is_dir() {
+        return false;
+    }
+    let Ok(contents) = std::fs::read_to_string(package.join("d3dx.ini")) else {
+        return false;
+    };
+    let mut includes_mods = false;
+    let mut targets_endfield = false;
+    for line in contents.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            let value = value.split(';').next().unwrap_or_default().trim();
+            includes_mods |= key.eq_ignore_ascii_case("include_recursive")
+                && value.eq_ignore_ascii_case("Mods");
+            targets_endfield |= key.eq_ignore_ascii_case("target")
+                && value.eq_ignore_ascii_case("Endfield.exe");
+        }
+    }
+    includes_mods && (targets_endfield == (kind == GameKind::Efmi))
 }
 
 fn standard_xxmi_roots() -> Vec<PathBuf> {
@@ -182,12 +214,12 @@ fn standard_xxmi_roots() -> Vec<PathBuf> {
             for steam in steam_dirs {
                 if let Ok(libraries) = steam.libraries() {
                     for library in libraries.filter_map(std::result::Result::ok) {
-                        roots.push(library.path().join("steamapps/compatdata/4162040/pfx/drive_c/users/steamuser/AppData/Roaming/XXMI Launcher"));
-                        #[cfg(target_os = "linux")]
-                        roots.push(
-                            steam_xxmi::compatdata_dir(library.path())
-                                .join(steam_xxmi::PORTABLE_DIR),
-                        );
+                        for app in STEAM_APPS {
+                            let compatdata = app.compatdata(library.path());
+                            roots.push(compatdata.join("pfx/drive_c/users/steamuser/AppData/Roaming/XXMI Launcher"));
+                            #[cfg(target_os = "linux")]
+                            roots.push(compatdata.join(steam_xxmi::PORTABLE_DIR));
+                        }
                     }
                 }
             }
@@ -230,7 +262,7 @@ pub fn launch_xxmi(
     root: Option<&Path>,
     xxmi: Option<&Path>,
     wine_prefix: Option<&Path>,
-) -> Result<LaunchCommand> {
+) -> Result<(LaunchCommand, PathBuf)> {
     xxmi_command(root, xxmi, None, wine_prefix, Vec::new())
 }
 
@@ -240,7 +272,7 @@ fn xxmi_command(
     wine: Option<&Path>,
     wine_prefix: Option<&Path>,
     arguments: Vec<OsString>,
-) -> Result<LaunchCommand> {
+) -> Result<(LaunchCommand, PathBuf)> {
     let launcher = xxmi
         .map(Path::to_owned)
         .or_else(|| find_launcher(root))
@@ -253,7 +285,7 @@ fn xxmi_command(
             && wine_prefix.is_none()
             && let Some(command) = steam_xxmi::managed_launch(&launcher, &arguments)?
         {
-            return Ok(command);
+            return Ok((command, launcher));
         }
         let wine = wine
             .map(Path::to_owned)
@@ -263,30 +295,30 @@ fn xxmi_command(
             .map(Path::to_owned)
             .or_else(|| std::env::var_os("WINEPREFIX").map(PathBuf::from))
             .or_else(|| wine_prefix_for_launcher(&launcher));
-        let mut args = vec![launcher.into_os_string()];
+        let mut args = vec![launcher.as_os_str().to_owned()];
         args.extend(arguments);
         let env = prefix
             .into_iter()
             .map(|prefix| ("WINEPREFIX".into(), prefix.into_os_string()))
             .collect();
-        Ok(LaunchCommand {
+        Ok((LaunchCommand {
             program: wine.into_os_string(),
             args,
             cwd,
             env,
             url: false,
-        })
+        }, launcher))
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (wine, wine_prefix);
-        Ok(LaunchCommand {
-            program: launcher.into_os_string(),
+        Ok((LaunchCommand {
+            program: launcher.as_os_str().to_owned(),
             args: arguments,
             cwd,
             env: Vec::new(),
             url: false,
-        })
+        }, launcher))
     }
 }
 
@@ -328,12 +360,16 @@ mod tests {
         let mods = package.join("Mods");
         let ini = package.join("d3dx.ini");
         std::fs::create_dir_all(&mods).unwrap();
-        assert!(validate_installation_root(temp.path(), &steam_roots).is_err());
-        assert!(validate_installation_root(&mods, &steam_roots).is_err());
+        assert!(validate_installation_root(GameKind::Zzmi, temp.path(), &steam_roots).is_err());
+        assert!(validate_installation_root(GameKind::Zzmi, &mods, &steam_roots).is_err());
         std::fs::write(&ini, "[Include]\ninclude_recursive = Core\n").unwrap();
-        assert!(validate_installation_root(&mods, &steam_roots).is_err());
+        assert!(validate_installation_root(GameKind::Zzmi, &mods, &steam_roots).is_err());
         std::fs::write(&ini, "[Include]\ninclude_recursive = Mods\n").unwrap();
-        assert!(validate_installation_root(&mods, &steam_roots).is_ok());
+        assert!(validate_installation_root(GameKind::Zzmi, &mods, &steam_roots).is_ok());
+        assert!(validate_installation_root(GameKind::Efmi, &mods, &[]).is_err());
+        std::fs::write(&ini, "[Loader]\ntarget = Endfield.exe\n[Include]\ninclude_recursive = Mods\n").unwrap();
+        assert!(validate_installation_root(GameKind::Efmi, &mods, &[]).is_ok());
+        assert!(validate_installation_root(GameKind::Zzmi, &mods, &steam_roots).is_err());
     }
 
     #[cfg(target_os = "linux")]

@@ -21,7 +21,7 @@ use crate::deploy::{
     Deployment, FileChange, FileState, checked_root, clear_empty_folder, fingerprint, metadata,
     store_blob, target, verify_folder,
 };
-use crate::games::zzz;
+use crate::games::xxmi;
 use crate::games::{GameKind, GameProfile, InstallPlan, parse_profile, plan, plan_bundle, profile};
 
 use crate::sources::{ModDetails, RemoteMod, SearchQuery, Source};
@@ -461,8 +461,8 @@ impl Library {
         validate_slug(slug)?;
         let instance = self.instance(instance)?;
         ensure!(
-            instance.kind != GameKind::Zzmi || !zzz::reserved_slug(slug),
-            "mod name cannot start with the ZZMI disabled prefix"
+            !instance.kind.is_xxmi() || !xxmi::reserved_slug(slug),
+            "mod name cannot start with the XXMI disabled prefix"
         );
         checked_root(&instance.root)?;
         let old = self.lookup(&instance.name, slug)?;
@@ -472,8 +472,8 @@ impl Library {
                 "existing mod has a different source; use another name or remove it first"
             );
             ensure!(
-                !options.keep_disabled || !old.enabled || instance.kind != GameKind::Zzmi,
-                "disable the ZZMI mod before updating it as disabled"
+                !options.keep_disabled || !old.enabled || !instance.kind.is_xxmi(),
+                "disable the XXMI mod before updating it as disabled"
             );
         }
         let scratch = self.scratch()?;
@@ -564,8 +564,8 @@ impl Library {
         validate_slug(slug)?;
         let instance = self.instance(instance)?;
         ensure!(
-            instance.kind != GameKind::Zzmi || !zzz::reserved_slug(slug),
-            "mod name cannot start with the ZZMI disabled prefix"
+            !instance.kind.is_xxmi() || !xxmi::reserved_slug(slug),
+            "mod name cannot start with the XXMI disabled prefix"
         );
         checked_root(&instance.root)?;
         let old = self.lookup(&instance.name, slug)?;
@@ -576,8 +576,8 @@ impl Library {
                 "existing mod has a different source; use another name or remove it first"
             );
             ensure!(
-                !options.keep_disabled || !old.enabled || instance.kind != GameKind::Zzmi,
-                "disable the ZZMI mod before updating it as disabled"
+                !options.keep_disabled || !old.enabled || !instance.kind.is_xxmi(),
+                "disable the XXMI mod before updating it as disabled"
             );
         }
         let destination = options.destination.or_else(|| {
@@ -682,11 +682,11 @@ impl Library {
         }
         let mut next = old.clone();
         next.enabled = enabled;
-        let deployment = if instance.kind == GameKind::Zzmi {
+        let deployment = if instance.kind.is_xxmi() {
             checked_root(&instance.root)?;
             self.check_claims(&instance, &next, allow_multiple)?;
-            let before = zzz::mod_folder(slug, old.enabled);
-            let after = zzz::mod_folder(slug, enabled);
+            let before = xxmi::mod_folder(slug, old.enabled);
+            let after = xxmi::mod_folder(slug, enabled);
             let files = folder_files(&old)?;
             verify_folder(&target(&instance.root, &before, false)?, &files)?;
             clear_empty_folder(&target(&instance.root, &after, false)?)?;
@@ -853,13 +853,13 @@ impl Library {
         let mut backups = after
             .as_deref_mut()
             .map(|next| std::mem::take(&mut next.backups));
-        let zzmi = instance.kind == GameKind::Zzmi;
-        let old_files = deployed(before, zzmi)?;
-        let new_files = deployed(after.as_deref(), zzmi)?;
-        if zzmi {
+        let is_xxmi = instance.kind.is_xxmi();
+        let old_files = deployed(before, is_xxmi)?;
+        let new_files = deployed(after.as_deref(), is_xxmi)?;
+        if is_xxmi {
             let record = before.or(after.as_deref()).context("no mod to deploy")?;
             for enabled in [false, true] {
-                let name = zzz::mod_folder(&record.slug, enabled);
+                let name = xxmi::mod_folder(&record.slug, enabled);
                 let expected = if let Some(old) = before.filter(|old| old.enabled == enabled) {
                     folder_files(old)?
                 } else {
@@ -885,7 +885,7 @@ impl Library {
             } else if existing != baseline {
                 if existing.is_some() {
                     ensure!(
-                        replace_unmanaged && !zzmi,
+                        replace_unmanaged && !is_xxmi,
                         "unmanaged file {}; pass --replace-unmanaged to back it up and replace it",
                         path.display()
                     );
@@ -1089,7 +1089,7 @@ fn folder_files(record: &ManagedMod) -> Result<Vec<(String, FileState)>> {
         .map(|(name, state)| {
             Ok((
                 name.strip_prefix(&prefix)
-                    .context("invalid ZZMI manifest")?
+                    .context("invalid XXMI manifest")?
                     .to_owned(),
                 state.clone(),
             ))
@@ -1097,15 +1097,15 @@ fn folder_files(record: &ManagedMod) -> Result<Vec<(String, FileState)>> {
         .collect()
 }
 
-fn deployed(record: Option<&ManagedMod>, zzmi: bool) -> Result<BTreeMap<String, &FileState>> {
-    let Some(record) = record.filter(|record| record.enabled || zzmi) else {
+fn deployed(record: Option<&ManagedMod>, is_xxmi: bool) -> Result<BTreeMap<String, &FileState>> {
+    let Some(record) = record.filter(|record| record.enabled || is_xxmi) else {
         return Ok(BTreeMap::new());
     };
     record.versions[record.current]
         .files
         .iter()
         .map(|(path, state)| {
-            let path = zzz::deployed_path(path, record.enabled);
+            let path = xxmi::deployed_path(path, record.enabled);
             Ok((path, state))
         })
         .collect()

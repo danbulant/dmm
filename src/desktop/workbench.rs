@@ -9,7 +9,6 @@ use rune::tok::Theme;
 use rune::{El, TextEdit, Tx, col, row};
 use rune_kit::{Dialog, Kit, Placement, Select, SelectAppearance};
 
-use dmm::games::GameKind;
 use dmm::library::{Inspection, Library, ManagedMod};
 use dmm::sources::{RemoteMod, Source};
 
@@ -841,7 +840,7 @@ pub(super) fn installed_actions(s: &State, t: Theme, instance: &str, managed: &M
         && s.snapshot
             .selected
             .as_ref()
-            .is_some_and(|game| game.name == instance && game.kind != GameKind::Zzmi)
+            .is_some_and(|game| game.name == instance && !game.kind.is_xxmi())
     {
         let target = instance.to_owned();
         let backup_slug = slug.clone();

@@ -1,4 +1,6 @@
 use std::rc::Rc;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
 use dmm::sources::{
@@ -315,7 +317,10 @@ fn details_keeps_install_header_and_opens_file_and_image_overlays() {
     assert_eq!(runtime.presented("detail-header").unwrap().0, header);
     click(&mut runtime, "details-install");
     assert!(runtime.presented("mod-install-dialog").is_some());
-    click(&mut runtime, "file-2");
+    let [x, y, width, height] = runtime.presented("file-2").unwrap().0;
+    runtime.pointer_down(x + width - 5.0, y + height - 5.0);
+    runtime.pointer_up(x + width - 5.0, y + height - 5.0);
+    runtime.frame(1.0 / 60.0);
     runtime.update(|state, _| {
         let selected: Vec<_> = state
             .browser
@@ -418,6 +423,38 @@ fn catalog_loading_does_not_block_setup_or_local_import_controls() {
     assert!(runtime.find("local:path").is_none());
     press(&mut runtime, "local:add");
     assert!(runtime.find("local:path").is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn xxmi_launch_rejects_repeats_until_child_exits() {
+    let mut state = State::new(PathBuf::from("unused"));
+    let (jobs, requests) = mpsc::channel();
+    let (responses, results) = mpsc::channel();
+    state.worker = Some(Worker { jobs, results });
+    let mut child = Command::new("cat").stdin(Stdio::piped()).spawn().unwrap();
+    let input = child.stdin.take().unwrap();
+    state.start_xxmi(move || Ok((child, PathBuf::from("unused"))));
+    assert_eq!(state.xxmi_launch.label("Start XXMI"), "Starting XXMI…");
+    let duplicate = || panic!("duplicate launcher was queued");
+    state.start_xxmi(duplicate);
+    let job = requests.try_recv().unwrap();
+    assert!(matches!(requests.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    let mut backend = Backend { state_dir: state.state_dir.clone(), online: None };
+    responses.send(job(&mut backend)).unwrap();
+    let mut tx = Tx::default();
+    state.poll(0.0, &mut tx);
+    assert_eq!(state.xxmi_launch.label("Start XXMI"), "XXMI is running");
+    state.start_xxmi(duplicate);
+    assert!(matches!(requests.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+    drop(input);
+    let XxmiLaunch::Running(child, _) = &mut state.xxmi_launch else {
+        panic!("launcher child was not retained");
+    };
+    assert!(child.wait().unwrap().success());
+    state.poll(0.0, &mut tx);
+    assert_eq!(state.xxmi_launch.label("Start XXMI"), "Start XXMI");
 }
 
 #[cfg(target_os = "linux")]

@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 
-use dmm::games::GameKind;
 use dmm::sources::{ModDetails, ModFile, ModImage};
 use rune::tok::{Theme, type_};
 use rune::{El, Icon, ScrollSpec, SurfaceFit, col, el, row, text};
@@ -489,15 +488,9 @@ fn files(info: &ModDetails, selected_files: &BTreeSet<u64>, t: Theme, picker: Op
         let title = if let Some(k) = picker {
             Checkbox::new(chosen)
                 .label(&file.name)
-                .on_toggle(move |s: &mut State| {
-                    if let Some(dialog) = &mut s.browser.install_dialog
-                        && !dialog.selected_files.remove(&id)
-                    {
-                        dialog.selected_files.insert(id);
-                    }
-                })
                 .build(k)
-                .key(format!("file-{id}"))
+                .focusable(false)
+                .a11y_hidden()
         } else {
             text(&file.name).font(type_::LABEL).color(t.text).wrap()
         };
@@ -518,6 +511,23 @@ fn files(info: &ModDetails, selected_files: &BTreeSet<u64>, t: Theme, picker: Op
             && !description.trim().is_empty()
         {
             entry = entry.child(muted(description, t).wrap());
+        }
+        if let Some(k) = picker {
+            entry = entry
+                .key(format!("file-{id}"))
+                .role("checkbox")
+                .label(&file.name)
+                .checked(chosen)
+                .focusable(true)
+                .hover(t.control_track)
+                .on_press(move |s: &mut State| {
+                    if let Some(dialog) = &mut s.browser.install_dialog
+                        && !dialog.selected_files.remove(&id)
+                    {
+                        dialog.selected_files.insert(id);
+                    }
+                })
+                .focus_ring(2.0, 0.0, k.c.border_focus);
         }
         view = view.child(entry);
     }
@@ -578,7 +588,7 @@ fn install_options(s: &State, detail: &InstallDialog, t: Theme, k: &Kit) -> El {
                 })
                 .child(files(&detail.info, &detail.selected_files, t, Some(k))),
         );
-    if s.game_kind() != GameKind::Zzmi {
+    if !s.game_kind().is_xxmi() {
         content = content.child(
             col()
                 .w_full()

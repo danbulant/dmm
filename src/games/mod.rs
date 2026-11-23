@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -13,7 +13,7 @@ use crate::sources::Source;
 
 pub mod cp;
 pub mod discovery;
-pub mod zzz;
+pub mod xxmi;
 
 const GENERIC_PROFILE: &str = include_str!("../../profiles/generic.toml");
 
@@ -22,6 +22,7 @@ const GENERIC_PROFILE: &str = include_str!("../../profiles/generic.toml");
 pub enum GameKind {
     Cyberpunk,
     Zzmi,
+    Efmi,
     Generic,
 }
 
@@ -32,6 +33,7 @@ impl FromStr for GameKind {
         match value.to_ascii_lowercase().as_str() {
             "cyberpunk" | "cyberpunk2077" => Ok(Self::Cyberpunk),
             "zzmi" => Ok(Self::Zzmi),
+            "efmi" | "endfield" => Ok(Self::Efmi),
             "generic" => Ok(Self::Generic),
             _ => Err(format!("unknown game kind: {value}")),
         }
@@ -43,6 +45,7 @@ impl fmt::Display for GameKind {
         f.write_str(match self {
             Self::Cyberpunk => "cyberpunk",
             Self::Zzmi => "zzmi",
+            Self::Efmi => "efmi",
             Self::Generic => "generic",
         })
     }
@@ -53,13 +56,18 @@ impl GameKind {
         match self {
             Self::Cyberpunk => "Cyberpunk 2077",
             Self::Zzmi => "Zenless Zone Zero",
+            Self::Efmi => "Arknights: Endfield",
             Self::Generic => "Custom game",
         }
     }
 
+    pub const fn is_xxmi(self) -> bool {
+        matches!(self, Self::Zzmi | Self::Efmi)
+    }
+
     pub fn preferred_source(self) -> Source {
         match self {
-            Self::Zzmi => Source::GameBanana,
+            Self::Zzmi | Self::Efmi => Source::GameBanana,
             Self::Cyberpunk | Self::Generic => Source::Nexus,
         }
     }
@@ -128,7 +136,8 @@ struct RawProfile {
 pub fn profile(kind: GameKind) -> Result<GameProfile> {
     let contents = match kind {
         GameKind::Cyberpunk => cp::PROFILE,
-        GameKind::Zzmi => zzz::PROFILE,
+        GameKind::Zzmi => include_str!("zzz/profile.toml"),
+        GameKind::Efmi => include_str!("efmi.toml"),
         GameKind::Generic => GENERIC_PROFILE,
     };
     parse_profile(kind, contents)
@@ -187,7 +196,7 @@ pub fn plan(
     }
     match profile.kind {
         GameKind::Cyberpunk => cp::plan(profile, files, slug, destination),
-        GameKind::Zzmi => zzz::plan(profile, files, slug, destination),
+        GameKind::Zzmi | GameKind::Efmi => xxmi::plan(profile, files, slug, destination),
         GameKind::Generic => plan_mod_folder(
             profile,
             files,
@@ -203,8 +212,8 @@ pub fn plan_bundle(
     slug: &str,
     destination: Option<&Path>,
 ) -> Result<Vec<InstallPlan>> {
-    if profile.kind == GameKind::Zzmi {
-        return zzz::plan_bundle(profile, packages, safe_slug(slug)?, destination);
+    if profile.kind.is_xxmi() {
+        return xxmi::plan_bundle(profile, packages, safe_slug(slug)?, destination);
     }
     packages
         .iter()
@@ -338,7 +347,7 @@ fn safe_slug(slug: &str) -> Result<&str> {
 pub fn detect(kind: GameKind) -> Result<Vec<PathBuf>> {
     match kind {
         GameKind::Cyberpunk => cp::detect(),
-        GameKind::Zzmi => zzz::detect(),
+        GameKind::Zzmi | GameKind::Efmi => xxmi::detect(kind),
         GameKind::Generic => Ok(Vec::new()),
     }
 }
@@ -362,10 +371,15 @@ impl LaunchCommand {
             open::that(value).context("failed to open game launch URL")?;
             return Ok(());
         }
+        self.spawn_process()?;
+        Ok(())
+    }
+
+    pub fn spawn_process(&self) -> Result<Child> {
+        ensure!(!self.url, "a launch URL has no child process to track");
         self.process()
             .spawn()
-            .with_context(|| format!("failed to launch {}", Path::new(&self.program).display()))?;
-        Ok(())
+            .with_context(|| format!("failed to launch {}", Path::new(&self.program).display()))
     }
 
     fn process(&self) -> Command {
@@ -414,7 +428,7 @@ pub fn launch_profile(
     }
     match profile.kind {
         GameKind::Cyberpunk => cp::launch(profile),
-        GameKind::Zzmi => zzz::launch(profile, root, xxmi, wine, wine_prefix),
+        GameKind::Zzmi | GameKind::Efmi => xxmi::launch(profile, root, xxmi, wine, wine_prefix),
         GameKind::Generic => bail!("generic games require a custom launch command"),
     }
 }
@@ -422,6 +436,26 @@ pub fn launch_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endfield_launch_selects_efmi() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let launcher = root.path().join("XXMI Launcher.exe");
+        let command = launch(
+            GameKind::Efmi,
+            root.path(),
+            Some(&launcher),
+            Some(Path::new("wine")),
+            None,
+            &[],
+        )?;
+        let process = command.process();
+        let mut args = process.get_args();
+        #[cfg(target_os = "linux")]
+        assert_eq!(args.next(), Some(launcher.as_os_str()));
+        assert!(args.eq(["--nogui", "--xxmi", "EFMI"].map(std::ffi::OsStr::new)));
+        Ok(())
+    }
 
     #[test]
     fn generic_profile_configures_destination_and_source_ids() {

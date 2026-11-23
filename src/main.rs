@@ -36,11 +36,11 @@ enum Command {
     /// Open the native Rune mod manager (requires the rune-ui feature).
     #[cfg(feature = "rune-ui")]
     Gui,
-    /// Find installed Cyberpunk or ZZMI game roots without changing them.
+    /// Find installed game or XXMI Mods roots without changing them.
     Detect {
         kind: GameKind,
     },
-    /// Register a game root. Select the Mods directory itself for ZZMI.
+    /// Register a game root. Select the Mods directory itself for ZZMI or EFMI.
     AddGame {
         name: String,
         kind: GameKind,

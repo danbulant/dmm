@@ -1,0 +1,11 @@
+id = "efmi"
+name = "Arknights: Endfield"
+
+[sources]
+gamebanana = "21842"
+
+[installation]
+required_file = ".ini"
+
+[launch]
+arguments = ["--nogui", "--xxmi", "EFMI"]

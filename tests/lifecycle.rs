@@ -141,6 +141,15 @@ fn reserved_destinations_and_external_edits_are_not_overwritten() -> Result<()> 
 
 #[test]
 fn zzmi_switches_whole_folders_and_preserves_unmanaged_assets() -> Result<()> {
+    xxmi_folder_lifecycle(GameKind::Zzmi)
+}
+
+#[test]
+fn efmi_switches_whole_folders_and_preserves_unmanaged_assets() -> Result<()> {
+    xxmi_folder_lifecycle(GameKind::Efmi)
+}
+
+fn xxmi_folder_lifecycle(kind: GameKind) -> Result<()> {
     let f = Fixture::new()?;
     let input = f.input(
         "skin",
@@ -149,7 +158,7 @@ fn zzmi_switches_whole_folders_and_preserves_unmanaged_assets() -> Result<()> {
             ("wrapper/textures/body.dds", "asset"),
         ],
     )?;
-    let mut library = f.library(GameKind::Zzmi)?;
+    let mut library = f.library(kind)?;
     library.install(
         "game",
         "ellen",

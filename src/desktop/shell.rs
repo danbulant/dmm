@@ -196,8 +196,7 @@ fn game_select(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
                 .any(|i| i.kind == GameKind::Generic)
                 .then_some((GameKind::Generic, "Custom game")),
         ) {
-            let detected = s.detected.iter().any(|game| game.kind == kind)
-                || (kind == GameKind::Zzmi && !s.zzz_steam_roots.is_empty());
+            let detected = s.detected.iter().chain(&s.steam_games).any(|game| game.kind == kind);
             let item = MenuItem::new(title)
                 .lead(game_icon(s, kind, t))
                 .checked(s.public_game == kind)
@@ -215,7 +214,7 @@ fn game_icon(s: &State, kind: GameKind, t: Theme) -> El {
     let pixels = match kind {
         GameKind::Cyberpunk => s.cyberpunk_icon.as_ref(),
         GameKind::Zzmi => s.zzmi_icon.as_ref(),
-        GameKind::Generic => None,
+        GameKind::Efmi | GameKind::Generic => None,
     };
     let square = el()
         .size(24.0, 24.0)
@@ -225,7 +224,7 @@ fn game_icon(s: &State, kind: GameKind, t: Theme) -> El {
     if let Some(pixels) = pixels {
         square.pixels_fit(pixels, SurfaceFit::Fit)
     } else {
-        square.child(muted("G", t))
+        square.child(muted(if kind == GameKind::Efmi { "E" } else { "G" }, t))
     }
 }
 

@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 #[cfg(target_os = "linux")]
-use std::{sync::mpsc::Receiver, time::Duration};
+use std::{fs, path::Path, sync::mpsc::Receiver, time::Duration};
 
 use dmm::games::GameKind;
 #[cfg(target_os = "linux")]
-use dmm::games::zzz::steam_xxmi::{InstallStage, SteamXxmi};
-use dmm::games::zzz::validate_installation_root;
+use dmm::games::xxmi::steam_xxmi::{InstallStage, SteamXxmi};
+use dmm::games::xxmi::validate_installation_root;
 use dmm::library::LaunchSettings;
 use rune::tok::Theme;
 use rune::{El, FileDialogOptions, TextEdit, col, row};
@@ -17,7 +17,7 @@ use rune_kit::{Kit, RadioGroup, RadioItem};
 
 use super::components::{button, form_field, heading, muted, open_page, panel};
 use super::installations::{self, Installation};
-use super::{Snapshot, State, Update};
+use super::{Snapshot, State, Update, XxmiLaunch};
 
 #[derive(Default)]
 pub(super) struct SetupForm {
@@ -118,8 +118,8 @@ pub(super) fn view(s: &State, t: Theme, k: &Kit) -> El {
                     instance.name.clone()
                 }
             }
-            Installation::Detected(_) if kind == GameKind::Zzmi => {
-                "Detected ZZMI Mods folder".into()
+            Installation::Detected(_) if kind.is_xxmi() => {
+                format!("Detected {title} Mods folder")
             }
             Installation::Detected(_) => format!("Detected {title}"),
         };
@@ -147,7 +147,11 @@ pub(super) fn view(s: &State, t: Theme, k: &Kit) -> El {
     } else if ready {
         body = body.child(
             muted(
-                "No usable installations found. Add a folder manually or rescan.",
+                if s.steam_games.iter().any(|game| game.kind == kind) {
+                    "Steam game detected. Install its importer in XXMI, then rescan to find the Mods folder."
+                } else {
+                    "No usable installations found. Add a folder manually or rescan."
+                },
                 t,
             )
             .wrap(),
@@ -175,33 +179,48 @@ pub(super) fn view(s: &State, t: Theme, k: &Kit) -> El {
         GameKind::Cyberpunk => {
             body = body.child(muted("Launch game opens the Steam-registered copy. The selected folder determines where DMM deploys mods.", t).wrap());
         }
-        GameKind::Zzmi => {
-            for root in &s.zzz_steam_roots {
-                body = body.child(muted(format!("Steam game: {}", root.display()), t).wrap());
+        GameKind::Zzmi | GameKind::Efmi => {
+            for game in s.steam_games.iter().filter(|game| game.kind == kind) {
+                body = body.child(muted(format!("Steam game: {}", game.root.display()), t).wrap());
             }
             #[cfg(target_os = "linux")]
-            if !s.steam_xxmi.is_empty() {
-                body = body.child(steam_setup(s, t));
+            if s.steam_xxmi.iter().any(|target| target.kind() == kind) {
+                body = body.child(steam_setup(s, t, kind));
             }
             if !any {
                 body = body.child(button("setup:xxmi-guide", "Set up XXMI ↗", t, true, true,
                     |s, tx| open_page(s, tx, "https://github.com/SpectrumQT/XXMI-Launcher#installation")))
                     .child(muted(if cfg!(target_os = "windows") {
-                        "Run the official installer, install the Zenless Zone Zero importer in XXMI, then rescan."
+                        format!("Run the official installer, install the {title} importer in XXMI, then rescan.")
                     } else {
-                        "Use the official portable release with Wine 9.22+ and the Visual C++ runtime. Install the Zenless Zone Zero importer in XXMI, then rescan. Use the same Wine environment for launches."
+                        format!("Use the official portable release with Wine 9.22+ and the Visual C++ runtime. Install the {title} importer in XXMI, then rescan. Use the same Wine environment for launches.")
                     }, t).wrap());
             }
             if s.snapshot.selected.is_some() {
                 body = body.child(launch_settings(s, t, k));
                 body = body.child(button(
                     "setup:start-xxmi",
-                    "Start XXMI for this installation",
+                    s.xxmi_launch.label("Start XXMI for this installation"),
+                    t,
+                    false,
+                    ready && !s.xxmi_launch.active(),
+                    |s, _| s.open_xxmi(),
+                ));
+            }
+            if matches!(s.xxmi_launch, XxmiLaunch::Running(..))
+                && cfg!(any(target_os = "linux", target_os = "windows"))
+            {
+                body = body.child(button(
+                    "setup:close-xxmi",
+                    "Close XXMI",
                     t,
                     false,
                     ready,
-                    |s, _| s.open_xxmi(),
+                    |s, _| s.close_xxmi(),
                 ));
+            }
+            if let XxmiLaunch::Failed(error) = &s.xxmi_launch {
+                body = body.child(muted(error.clone(), t).wrap());
             }
         }
         GameKind::Generic => {
@@ -221,7 +240,7 @@ pub(super) fn view(s: &State, t: Theme, k: &Kit) -> El {
 }
 
 #[cfg(target_os = "linux")]
-fn steam_setup(s: &State, t: Theme) -> El {
+fn steam_setup(s: &State, t: Theme, kind: GameKind) -> El {
     let mut body = panel(t).child(heading("Steam Proton setup", t));
     if s.protontricks.is_none() {
         body = body.child(muted("Install Protontricks, then rescan. DMM uses it to select Steam’s Proton runtime rather than creating a Wine prefix.", t).wrap())
@@ -230,17 +249,34 @@ fn steam_setup(s: &State, t: Theme) -> El {
             }));
     }
     let available = s.busy.is_none() && s.protontricks.is_some();
-    for (index, target) in s.steam_xxmi.iter().enumerate() {
-        let mut game = col()
-            .gap(8.0)
-            .child(muted(format!("Steam game: {}", target.game.display()), t).wrap());
+    let title = kind.display_name();
+    let has_launcher = s.steam_xxmi.iter().any(|target| target.kind() == kind && target.installed);
+    if !has_launcher
+        && let Some(target) = s.steam_xxmi.iter().find(|target| target.kind() != kind && target.installed)
+    {
+        let existing = target.clone();
+        body = body.child(button(
+            "setup:steam-reuse", s.xxmi_launch.label("Start existing XXMI"), t, true,
+            available && !s.xxmi_launch.active(),
+            move |s, _| s.open_steam_xxmi(existing.clone()),
+        )).child(muted(format!("Install the {title} importer in XXMI, then rescan. Reusing this launcher runs the importer in the existing Proton prefix."), t).wrap());
+        for (index, game) in s.steam_xxmi.iter().enumerate().filter(|(_, game)| game.kind() == kind) {
+            body = body.child(xxmi_game_folder(index, game, &target, t));
+        }
+    }
+    for (index, target) in s.steam_xxmi.iter().enumerate().filter(|(_, target)| target.kind() == kind) {
+        let mut game = col().gap(8.0)
+            .child(muted(format!("Proton prefix: {}", target.compatdata.join("pfx").display()), t).wrap());
+        game = game.child(xxmi_game_folder(index, target, target, t));
         if target.installed {
             let target = target.clone();
-            game = game.child(button(format!("setup:steam-start:{index}"), "Start XXMI", t, true, available,
+            game = game.child(button(format!("setup:steam-start:{index}"),
+                s.xxmi_launch.label("Start XXMI"), t, true,
+                available && !s.xxmi_launch.active(),
                 move |s, _| s.open_steam_xxmi(target.clone())))
-                .child(muted("Install the ZZMI importer in XXMI, then return here and Rescan. Launch game uses the importer headlessly once its Mods folder is selected.", t).wrap());
+                .child(muted(format!("Install the {title} importer in XXMI, then rescan to find its Mods folder."), t).wrap());
         } else if !target.initialized {
-            game = game.child(muted("Launch Zenless Zone Zero once in Steam with Proton to create its prefix, then close it and rescan.", t).wrap());
+            game = game.child(muted(format!("Launch {title} once in Steam with Proton to create its prefix, then close it and rescan."), t).wrap());
         } else {
             let target = target.clone();
             game = game.child(button(
@@ -258,6 +294,76 @@ fn steam_setup(s: &State, t: Theme) -> El {
 }
 
 #[cfg(target_os = "linux")]
+fn xxmi_game_folder(index: usize, game: &SteamXxmi, launcher: &SteamXxmi, t: Theme) -> El {
+    let executables: &[&str] = match game.kind() {
+        GameKind::Efmi => &["Endfield.exe"],
+        GameKind::Zzmi => &[
+            "ZenlessZoneZero.exe",
+            "games/ZenlessZoneZero Game/ZenlessZoneZero.exe",
+        ],
+        GameKind::Cyberpunk | GameKind::Generic => return col(),
+    };
+    let Some(folder) = executables.iter().find_map(|exe| {
+        let path = game.game.join(exe);
+        path.parent().filter(|_| path.is_file()).map(Path::to_owned)
+    }) else {
+        return muted("XXMI game folder unavailable: the game executable was not found.", t).wrap();
+    };
+    let reused = launcher.kind() != game.kind();
+    let label = if reused {
+        "Game Folder (existing XXMI)"
+    } else {
+        "Game Folder (XXMI)"
+    };
+    let Some(path) = windows_game_folder(&launcher.compatdata.join("pfx"), &folder) else {
+        return muted(format!("{label}: no Proton drive maps to {}", folder.display()), t).wrap();
+    };
+    col().gap(4.0)
+        .child(muted(format!("{label}: {path}"), t).wrap().selectable(true))
+        .child(button(
+            format!("setup:steam-copy:{index}:{reused}"),
+            "Copy game folder",
+            t,
+            false,
+            true,
+            move |_: &mut State, tx| tx.copy(path.clone()),
+        ))
+}
+
+#[cfg(target_os = "linux")]
+fn windows_game_folder(prefix: &Path, folder: &Path) -> Option<String> {
+    let folder = folder.canonicalize().ok()?;
+    let mappings = fs::read_dir(prefix.join("dosdevices")).ok()?;
+    mappings
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            let [letter, b':'] = name.as_encoded_bytes() else {
+                return None;
+            };
+            if !letter.is_ascii_alphabetic() {
+                return None;
+            }
+            let root = entry.path().canonicalize().ok()?;
+            let relative = folder.strip_prefix(root).ok()?;
+            Some((relative, letter.to_ascii_uppercase()))
+        })
+        .min_by(|(a, drive_a), (b, drive_b)| {
+            a.as_os_str()
+                .len()
+                .cmp(&b.as_os_str().len())
+                .then(drive_a.cmp(drive_b))
+        })
+        .map(|(relative, drive)| {
+            format!(
+                "{}:\\{}",
+                char::from(drive),
+                relative.to_string_lossy().replace('/', "\\")
+            )
+        })
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn overlays(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) {
     super::nexus_handler::overlay(s, t, k, layer);
     let Some(dialog) = &s.setup.steam_dialog else {
@@ -267,7 +373,7 @@ pub(super) fn overlays(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) {
         SteamDialog::Confirm(target) => {
             let target = target.clone();
             ("Set up XXMI for Steam", col().gap(12.0)
-                .child(muted("Close Zenless Zone Zero and XXMI first. DMM will download the official portable launcher and install the x64 Visual C++ runtime in this Proton prefix:", t).wrap())
+                .child(muted(format!("Close {} and XXMI first. DMM will download the official portable launcher and install the x64 Visual C++ runtime in this Proton prefix:", target.kind().display_name()), t).wrap())
                 .child(muted(target.compatdata.join("pfx").display().to_string(), t).wrap())
                 .child(row().gap(8.0).flex_wrap().justify_end()
                     .child(button("xxmi-setup-cancel", "Cancel", t, false, true, close_steam_setup_tx))
@@ -323,10 +429,11 @@ pub(super) fn overlays(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) {
         SteamDialog::Complete(Ok(target)) => {
             let target = target.clone();
             ("XXMI installed", col().gap(12.0)
-                .child(muted("Start XXMI, install the ZZMI importer in its window, then rescan in Game setup.", t).wrap())
+                .child(muted(format!("Start XXMI, install the {} importer, then rescan in Game setup.", target.kind().display_name()), t).wrap())
                 .child(row().gap(8.0).justify_end()
                     .child(button("xxmi-setup-done", "Done", t, false, true, close_steam_setup_tx))
-                    .child(button("xxmi-setup-start", "Start XXMI", t, true, s.busy.is_none(),
+                    .child(button("xxmi-setup-start", s.xxmi_launch.label("Start XXMI"), t, true,
+                        s.busy.is_none() && !s.xxmi_launch.active() && s.protontricks.is_some(),
                         move |s, _| {
                             s.setup.steam_dialog = None;
                             s.open_steam_xxmi(target.clone());
@@ -364,10 +471,10 @@ fn close_steam_setup_tx(s: &mut State, _: &mut Tx) {
 
 fn manual_form(s: &State, t: Theme, k: &Kit) -> El {
     let kind = s.game_kind();
-    let place = if kind == GameKind::Zzmi {
-        "ZZMI Mods folder"
-    } else {
-        "Game installation folder"
+    let place = match kind {
+        GameKind::Zzmi => "ZZMI Mods folder",
+        GameKind::Efmi => "EFMI Mods folder",
+        GameKind::Cyberpunk | GameKind::Generic => "Game installation folder",
     };
     panel(t).child(heading("Add installation manually", t))
         .child(form_field("setup:name", "Installation label", &s.setup.name, k, t, |s| &mut s.setup.name))
@@ -457,16 +564,11 @@ fn register_game(s: &mut State, kind: GameKind) {
     };
     let name = s.setup.name.text.trim().to_owned();
     let descriptor = path(&s.setup.descriptor);
-    let steam_roots = if kind == GameKind::Zzmi {
-        s.zzz_steam_roots.clone()
-    } else {
-        Vec::new()
-    };
+    let steam_roots = s.steam_games.iter().filter(|game| game.kind == kind)
+        .map(|game| game.root.clone()).collect::<Vec<_>>();
     s.submit("Adding installation…", move |dir| {
         let root = root.canonicalize()?;
-        if kind == GameKind::Zzmi {
-            validate_installation_root(&root, &steam_roots)?;
-        }
+        validate_installation_root(kind, &root, &steam_roots)?;
         let library = super::open_library(&dir)?;
         library.register(&name, kind, &root, descriptor.as_deref())?;
         library.use_installation(&name)?;

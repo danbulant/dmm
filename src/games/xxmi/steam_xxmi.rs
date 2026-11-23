@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -15,8 +15,8 @@ use serde::Deserialize;
 use tempfile::Builder;
 use url::Url;
 
-use super::{LaunchCommand, STEAM_APP_ID as APP_ID};
-use crate::archive;
+use super::{LaunchCommand, STEAM_APPS, SteamApp};
+use crate::{archive, games::GameKind};
 
 const FLATPAK_ID: &str = "com.github.Matoking.protontricks";
 const RELEASE: &str = "https://api.github.com/repos/SpectrumQT/XXMI-Launcher/releases/latest";
@@ -28,6 +28,7 @@ const PORTABLE_EXE: &str = "Resources/Bin/XXMI Launcher.exe";
 
 #[derive(Clone)]
 pub struct SteamXxmi {
+    app: SteamApp,
     pub game: PathBuf,
     pub compatdata: PathBuf,
     pub initialized: bool,
@@ -78,12 +79,6 @@ fn executable(name: &str) -> Option<PathBuf> {
         .and_then(|path| path.canonicalize().ok())
 }
 
-pub(super) fn compatdata_dir(library: &Path) -> PathBuf {
-    library
-        .join("steamapps/compatdata")
-        .join(APP_ID.to_string())
-}
-
 pub fn discover() -> Result<Vec<SteamXxmi>> {
     let mut installs = Vec::new();
     if !cfg!(target_arch = "x86_64") {
@@ -96,27 +91,30 @@ pub fn discover() -> Result<Vec<SteamXxmi>> {
             .context("could not inspect Steam libraries")?
             .filter_map(Result::ok)
         {
-            let Some(Ok(app)) = library.app(APP_ID) else {
-                continue;
-            };
-            let Ok(game) = library.resolve_app_dir(&app).canonicalize() else {
-                continue;
-            };
-            if !game.is_dir() {
-                continue;
+            for app in STEAM_APPS {
+                let Some(Ok(manifest)) = library.app(app.id) else {
+                    continue;
+                };
+                let Ok(game) = library.resolve_app_dir(&manifest).canonicalize() else {
+                    continue;
+                };
+                if !game.is_dir() {
+                    continue;
+                }
+                let path = app.compatdata(library.path());
+                let compatdata = path.canonicalize().unwrap_or(path);
+                let initialized = compatdata.join("pfx/drive_c/windows").is_dir();
+                let installed =
+                    initialized && compatdata.join(PORTABLE_DIR).join(PORTABLE_EXE).is_file();
+                installs.push(SteamXxmi {
+                    app,
+                    game,
+                    compatdata,
+                    initialized,
+                    installed,
+                    steam: steam_root.clone(),
+                });
             }
-            let path = compatdata_dir(library.path());
-            let compatdata = path.canonicalize().unwrap_or(path);
-            let initialized = compatdata.join("pfx/drive_c/windows").is_dir();
-            let installed =
-                initialized && compatdata.join(PORTABLE_DIR).join(PORTABLE_EXE).is_file();
-            installs.push(SteamXxmi {
-                game,
-                compatdata,
-                initialized,
-                installed,
-                steam: steam_root.clone(),
-            });
         }
     }
     installs.sort_unstable_by(|a, b| (&a.game, &a.compatdata).cmp(&(&b.game, &b.compatdata)));
@@ -125,6 +123,10 @@ pub fn discover() -> Result<Vec<SteamXxmi>> {
 }
 
 impl SteamXxmi {
+    pub fn kind(&self) -> GameKind {
+        self.app.kind
+    }
+
     fn executable(&self) -> PathBuf {
         self.compatdata.join(PORTABLE_DIR).join(PORTABLE_EXE)
     }
@@ -171,17 +173,18 @@ impl SteamXxmi {
         }
         command.args.extend([
             "--appid".into(),
-            APP_ID.to_string().into(),
+            self.app.id.to_string().into(),
             exe.as_os_str().to_owned(),
         ]);
         command.args.extend(args);
         command
     }
 
-    pub fn start_launcher(&self, runner: &Protontricks) -> Result<()> {
+    pub fn start_launcher(&self, runner: &Protontricks) -> Result<(Child, PathBuf)> {
         let exe = self.executable();
         ensure!(exe.is_file(), "The Steam XXMI launcher is not installed");
-        self.command(runner, &exe, []).spawn()
+        let child = self.command(runner, &exe, []).spawn_process()?;
+        Ok((child, exe))
     }
 
     pub fn install(
@@ -192,7 +195,8 @@ impl SteamXxmi {
         progress(InstallStage::Preparing);
         ensure!(
             self.compatdata.join("pfx/drive_c/windows").is_dir(),
-            "Launch Zenless Zone Zero once in Steam with Proton, close it, then rescan"
+            "Launch {} once in Steam with Proton, close it, then rescan",
+            self.kind().display_name()
         );
         let _lock = install_lock(&self.compatdata)?;
         if self.executable().is_file() {
@@ -424,9 +428,12 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
 
+    use crate::games::xxmi::steam_app;
+
     #[test]
     fn steam_runner_uses_the_exact_game_prefix_and_passes_paths_as_arguments() {
         let target = SteamXxmi {
+            app: steam_app(GameKind::Zzmi),
             game: "/steam/common/Zenless Zone Zero".into(),
             compatdata: "/steam library/compatdata/4162040".into(),
             steam: "/steam".into(),
@@ -458,6 +465,30 @@ mod tests {
                 .any(|(key, value)| key == "STEAM_COMPAT_DATA_PATH"
                     && value == Some(target.compatdata.as_os_str()))
         );
+    }
+
+    #[test]
+    fn endfield_runner_uses_endfield_steam_app() {
+        let app = steam_app(GameKind::Efmi);
+        let target = SteamXxmi {
+            app,
+            game: "/steam/common/Arknights Endfield".into(),
+            compatdata: app.compatdata(Path::new("/steam")),
+            steam: "/steam".into(),
+            initialized: true,
+            installed: true,
+        };
+        let spec = target.command(
+            &Protontricks::Native("/bin/protontricks-launch".into()),
+            &target.executable(),
+            ["--nogui".into(), "--xxmi".into(), "EFMI".into()],
+        );
+        let process = spec.process();
+        assert!(process.get_args().take(2).eq(["--appid", "4732690"]));
+        assert!(process.get_envs().any(|(key, value)| {
+            key == "STEAM_COMPAT_DATA_PATH"
+                && value == Some(OsStr::new("/steam/steamapps/compatdata/4732690"))
+        }));
     }
 
     #[test]

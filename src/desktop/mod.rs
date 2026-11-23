@@ -21,18 +21,21 @@ pub(crate) fn forward_nexus_handler(state_dir: &std::path::Path, uri: &str) -> R
 #[cfg(test)]
 mod tests;
 
+mod launcher_window;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::process::Child;
 #[cfg(target_os = "linux")]
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use dmm::acquisition::pending_pages;
 use dmm::games::discovery::{DetectedGame, Discovery, discover};
-use dmm::games::zzz::launch_xxmi;
+use dmm::games::xxmi::launch_xxmi;
 #[cfg(target_os = "linux")]
-use dmm::games::zzz::steam_xxmi::{InstallStage, Protontricks, SteamXxmi};
+use dmm::games::xxmi::steam_xxmi::{InstallStage, Protontricks, SteamXxmi};
 use dmm::games::{GameKind, GameProfile, launch_profile, profile};
 use dmm::library::{Instance, LaunchSettings, Library, ManagedMod, SavedFavorite};
 use dmm::sources::{RemoteMod, Source};
@@ -167,6 +170,43 @@ fn public_origins(kind: GameKind) -> Vec<Origin> {
     profile(kind).map(|game| origins(&game)).unwrap_or_default()
 }
 
+enum XxmiLaunch {
+    Idle,
+    Starting,
+    Running(Child, PathBuf),
+    Failed(String),
+}
+
+impl XxmiLaunch {
+    fn active(&self) -> bool {
+        matches!(self, Self::Starting | Self::Running(..))
+    }
+
+    fn label<'a>(&self, idle: &'a str) -> &'a str {
+        match self {
+            Self::Starting => "Starting XXMI…",
+            Self::Running(..) => "XXMI is running",
+            Self::Idle | Self::Failed(_) => idle,
+        }
+    }
+
+    fn poll(&mut self, tx: &mut Tx) -> bool {
+        let Self::Running(child, _) = self else {
+            return false;
+        };
+        *self = match child.try_wait() {
+            Ok(None) => {
+                tx.wake_after(Duration::from_millis(250));
+                return false;
+            }
+            Ok(Some(status)) if status.success() => Self::Idle,
+            Ok(Some(status)) => Self::Failed(format!("XXMI exited with {status}.")),
+            Err(error) => Self::Failed(format!("Could not check the XXMI process: {error}")),
+        };
+        true
+    }
+}
+
 struct State {
     state_dir: PathBuf,
     worker: Option<Worker>,
@@ -176,6 +216,7 @@ struct State {
     detail_revision: u64,
     previews: Option<Previews>,
     busy: Option<&'static str>,
+    xxmi_launch: XxmiLaunch,
     queue: Queue,
     handoff_open: bool,
     preferences: Preferences,
@@ -187,7 +228,7 @@ struct State {
     window_size: [f32; 2],
     sidebar: PaneState,
     detected: Vec<DetectedGame>,
-    zzz_steam_roots: Vec<PathBuf>,
+    steam_games: Vec<DetectedGame>,
     #[cfg(target_os = "linux")]
     steam_xxmi: Vec<SteamXxmi>,
     #[cfg(target_os = "linux")]
@@ -218,6 +259,7 @@ impl State {
             detail_revision: 0,
             previews: None,
             busy: None,
+            xxmi_launch: XxmiLaunch::Idle,
             #[cfg(target_os = "linux")]
             nexus_listener: None,
             queue: Queue::default(),
@@ -231,7 +273,7 @@ impl State {
             window_size: [START_SIZE.0, START_SIZE.1],
             sidebar: PaneState::new(245.0).range(180.0, 340.0),
             detected: Vec::new(),
-            zzz_steam_roots: Vec::new(),
+            steam_games: Vec::new(),
             #[cfg(target_os = "linux")]
             steam_xxmi: Vec::new(),
             #[cfg(target_os = "linux")]
@@ -405,7 +447,7 @@ impl State {
 
     fn apply_discovery(&mut self, discovery: Discovery) {
         self.detected = discovery.games;
-        self.zzz_steam_roots = discovery.zzz_steam_roots;
+        self.steam_games = discovery.steam_games;
         self.discovery_notices = discovery.notices;
         #[cfg(target_os = "linux")]
         {
@@ -450,9 +492,36 @@ impl State {
             .as_ref()
             .map(|instance| instance.root.clone());
         let LaunchSettings { xxmi, wine_prefix } = self.snapshot.launch.clone();
+        self.start_xxmi(move || {
+            let (command, exe) = launch_xxmi(root.as_deref(), xxmi.as_deref(), wine_prefix.as_deref())?;
+            Ok((command.spawn_process()?, exe))
+        });
+    }
+
+    fn start_xxmi(&mut self, start: impl FnOnce() -> Result<(Child, PathBuf)> + Send + 'static) {
+        if self.busy.is_some() || self.xxmi_launch.active() {
+            return;
+        }
         self.submit("Starting XXMI…", move |_| {
-            launch_xxmi(root.as_deref(), xxmi.as_deref(), wine_prefix.as_deref())?.spawn()?;
-            Ok(Update::Message("XXMI launch requested".into()))
+            let (child, exe) = start()?;
+            Ok(Update::XxmiStarted(child, exe))
+        });
+        self.xxmi_launch = if self.busy.is_some() {
+            XxmiLaunch::Starting
+        } else {
+            XxmiLaunch::Failed(self.notice.clone())
+        };
+    }
+
+    fn close_xxmi(&mut self) {
+        let XxmiLaunch::Running(child, exe) = &self.xxmi_launch else {
+            return;
+        };
+        let pid = child.id();
+        let exe = exe.clone();
+        self.submit("Closing XXMI…", move |_| {
+            launcher_window::close(pid, &exe)?;
+            Ok(Update::Message("XXMI close requested".into()))
         });
     }
 
@@ -494,10 +563,7 @@ impl State {
         let Some(runner) = self.protontricks.clone() else {
             return;
         };
-        self.submit("Starting XXMI through Proton…", move |_| {
-            target.start_launcher(&runner)?;
-            Ok(Update::Message("XXMI launch requested".into()))
-        });
+        self.start_xxmi(move || target.start_launcher(&runner));
     }
 
     fn set_screen(&mut self, screen: Screen, tx: &mut Tx) {
@@ -767,6 +833,7 @@ impl State {
                 Ok(Update::Library(snapshot)) => self.apply_snapshot(snapshot, tx),
                 Ok(Update::LocalPlan(inspection)) => self.local.apply_preview(inspection),
                 Ok(Update::Message(message)) => self.notice = message,
+                Ok(Update::XxmiStarted(child, exe)) => self.xxmi_launch = XxmiLaunch::Running(child, exe),
                 Ok(Update::Search(revision, query, result))
                     if revision == self.browser.search_revision =>
                 {
@@ -823,10 +890,14 @@ impl State {
                     }
                 }
                 Ok(Update::Search(..) | Update::Filters(..) | Update::Details(..)) => {}
+                Err(error) if local && matches!(self.xxmi_launch, XxmiLaunch::Starting) => {
+                    self.xxmi_launch = XxmiLaunch::Failed(format!("Could not start XXMI: {error:#}"));
+                }
                 Err(error) => self.notice = format!("{error:#}"),
             }
             changed = true;
         }
+        changed |= self.xxmi_launch.poll(tx);
         changed |= self.poll_queue(tx);
         #[cfg(target_os = "linux")]
         {

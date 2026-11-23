@@ -13,17 +13,18 @@ pub struct DetectedGame {
 #[derive(Default)]
 pub struct Discovery {
     pub games: Vec<DetectedGame>,
-    pub zzz_steam_roots: Vec<PathBuf>,
+    pub steam_games: Vec<DetectedGame>,
     #[cfg(target_os = "linux")]
-    pub steam_xxmi: Vec<super::zzz::steam_xxmi::SteamXxmi>,
+    pub steam_xxmi: Vec<super::xxmi::steam_xxmi::SteamXxmi>,
     #[cfg(target_os = "linux")]
-    pub protontricks: Option<super::zzz::steam_xxmi::Protontricks>,
+    pub protontricks: Option<super::xxmi::steam_xxmi::Protontricks>,
     pub notices: Vec<(GameKind, String)>,
 }
 
-pub const SUPPORTED: [(GameKind, &str); 2] = [
+pub const SUPPORTED: [(GameKind, &str); 3] = [
     (GameKind::Cyberpunk, GameKind::Cyberpunk.display_name()),
     (GameKind::Zzmi, GameKind::Zzmi.display_name()),
+    (GameKind::Efmi, GameKind::Efmi.display_name()),
 ];
 
 pub fn discover() -> Discovery {
@@ -39,27 +40,26 @@ pub fn discover() -> Discovery {
             Err(error) => found.notices.push((kind, format!("{label}: {error:#}"))),
         }
     }
-    match super::zzz::detect_game() {
-        Ok(roots) => {
-            found.zzz_steam_roots = roots
-                .into_iter()
-                .map(|root| root.canonicalize().unwrap_or(root))
-                .collect()
+    for kind in [GameKind::Zzmi, GameKind::Efmi] {
+        match super::xxmi::detect_game(kind) {
+            Ok(roots) => found
+                .steam_games
+                .extend(roots.into_iter().map(|root| DetectedGame { kind, root })),
+            Err(error) => found.notices.push((kind, format!("Steam: {error:#}"))),
         }
-        Err(error) => found
-            .notices
-            .push((GameKind::Zzmi, format!("Steam: {error:#}"))),
     }
     #[cfg(target_os = "linux")]
-    if !found.zzz_steam_roots.is_empty() {
-        match super::zzz::steam_xxmi::discover() {
+    if !found.steam_games.is_empty() {
+        match super::xxmi::steam_xxmi::discover() {
             Ok(targets) => found.steam_xxmi = targets,
-            Err(error) => found
-                .notices
-                .push((GameKind::Zzmi, format!("Steam Proton: {error:#}"))),
+            Err(error) => {
+                for kind in [GameKind::Zzmi, GameKind::Efmi] {
+                    found.notices.push((kind, format!("Steam Proton: {error:#}")));
+                }
+            }
         }
         if !found.steam_xxmi.is_empty() {
-            found.protontricks = super::zzz::steam_xxmi::Protontricks::find();
+            found.protontricks = super::xxmi::steam_xxmi::Protontricks::find();
         }
     }
     found
