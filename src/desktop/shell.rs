@@ -4,6 +4,7 @@ use rune::{Cx, El, ScrollSpec, SurfaceFit, col, el, row, text};
 use rune_kit::shell::{Sidebar, SidebarRow, SplitView, Toolbar};
 use rune_kit::{Kit, Menu, MenuItem};
 
+use super::browse::DetailTarget;
 use super::components::{self, button, heading, muted};
 use super::{Screen, State, browse, download_queue, game_setup, workbench};
 
@@ -12,24 +13,27 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
     let t = tok::theme(dark);
     let k = components::kit(dark);
     let mut layer = Vec::new();
-    let detail = if s.screen == Screen::Setup {
-        None
-    } else {
-        s.browser.detail.as_ref()
-    };
-    let installed = s.local_detail.as_ref().and_then(|slug| {
-        let instance = s.snapshot.selected.as_ref()?;
-        let record = s.snapshot.mods.iter().find(|record| &record.slug == slug)?;
-        Some((instance, record))
+    let installed = s.detail.as_ref().and_then(|detail| {
+        let DetailTarget::Installed(slug) = &detail.target else {
+            return None;
+        };
+        Some((s.snapshot.selected.as_ref()?, s.snapshot.installed(slug)?))
+    });
+    let detail = s.detail.as_ref().and_then(|detail| {
+        let info = match &detail.target {
+            DetailTarget::Online(info) => info,
+            DetailTarget::Installed(_) => installed?.1.details()?,
+        };
+        Some((detail, info))
     });
     let content = if let Some((instance, record)) = installed {
         let mut page = col().w_full().gap(18.0);
-        if let Some(detail) = detail {
-            page = page.child(browse::details::body(s, detail, t));
+        if let Some((detail, info)) = detail {
+            page = page.child(browse::details::body(s, detail, info, t));
         }
         page.child(workbench::installed_actions(s, t, &instance.name, record))
-    } else if let Some(detail) = detail {
-        browse::details::body(s, detail, t)
+    } else if let Some((detail, info)) = detail {
+        browse::details::body(s, detail, info, t)
     } else {
         match s.screen {
             Screen::Explore => browse::explore(s, t, &k, &mut layer),
@@ -40,9 +44,9 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
     };
     let content = col().w_full().gap(16.0).padding(24.0).child(content);
     let mut main = col().grow(1.0).min_w(0.0).min_h(0.0).h_full();
-    if let Some(detail) = detail {
-        main = main.child(browse::details::header(s, detail, t, &k));
-        browse::details::overlays(s, detail, t, &k, &mut layer, cx.is_reduced_motion());
+    if let Some((detail, info)) = detail {
+        main = main.child(browse::details::header(s, info, installed.is_some(), t, &k));
+        browse::details::overlays(s, detail, info, t, &k, &mut layer, cx.is_reduced_motion());
     } else if let Some((_, record)) = installed {
         main = main.child(
             row()

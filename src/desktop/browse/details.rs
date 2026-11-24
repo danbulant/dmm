@@ -18,8 +18,13 @@ static ZOOM_PLUS: Icon = Icon {
     body: r#"<path d="M8 4V12M4 8H12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>"#,
 };
 
-pub(in crate::desktop) fn header(s: &State, detail: &Detail, t: Theme, k: &Kit) -> El {
-    let info = &detail.info;
+pub(in crate::desktop) fn header(
+    s: &State,
+    info: &ModDetails,
+    installed: bool,
+    t: Theme,
+    k: &Kit,
+) -> El {
     let mut meta = row()
         .gap(6.0)
         .items_center()
@@ -36,8 +41,6 @@ pub(in crate::desktop) fn header(s: &State, detail: &Detail, t: Theme, k: &Kit) 
     {
         meta = meta.child(muted(format!("·  {label}"), t).truncate());
     }
-    let available = s.matches_instance(&info.id);
-    let has_files = !info.files.is_empty();
     let mut header = row()
         .key("detail-header")
         .w_full()
@@ -81,58 +84,40 @@ pub(in crate::desktop) fn header(s: &State, detail: &Detail, t: Theme, k: &Kit) 
         t,
         k,
     ));
-    if s.local_detail.is_some() {
+    if installed {
         return header;
     }
-    let queued = s.queued_for_selected(&info.id);
+    let queued = s.pending_install(&info.id).is_some();
+    let blocker = s.install_blocker(&info.id);
     let install_id = info.id.clone();
     header = header.child(
         button(
             "details-install",
             if queued {
                 "In Downloads"
-            } else if s.installed_for(&info.id).is_some() {
+            } else if s.snapshot.installed_remote(&info.id).is_some() {
                 "Reinstall"
             } else {
                 "Install"
             },
             t,
             true,
-            queued || (has_files && available && s.queue.available()),
-            move |s, tx| {
-                if queued {
-                    s.open_downloads(tx);
-                } else {
-                    if let Some(info) = s
-                        .browser
-                        .detail
-                        .as_ref()
-                        .filter(|detail| detail.info.id == install_id)
-                        .map(|detail| detail.info.clone())
-                    {
-                        s.open_install_dialog(info);
-                    }
-                }
-            },
+            queued || blocker.is_none(),
+            move |s, tx| s.request_install(&install_id, tx),
         )
         .help(if queued {
             "View this mod in the download queue"
-        } else if !has_files {
-            "No downloadable files from this source"
-        } else if !available {
-            "Select a game installation before installing"
         } else {
-            "Choose files and install options"
+            blocker.unwrap_or("Choose files and install options")
         }),
     );
     header
 }
 
-pub(in crate::desktop) fn body(s: &State, detail: &Detail, t: Theme) -> El {
-    let info = &detail.info;
+pub(in crate::desktop) fn body(s: &State, detail: &Detail, info: &ModDetails, t: Theme) -> El {
     let mut view = col().w_full().gap(18.0);
     if !info.images.is_empty() {
-        view = view.child(gallery(s, detail, t));
+        view = view.child(gallery(s, detail, &info.images, t));
     }
     if !info.requirements.is_empty() {
         let mut requirements = section("Requirements", t);
@@ -200,7 +185,7 @@ pub(in crate::desktop) fn body(s: &State, detail: &Detail, t: Theme) -> El {
         )
         .child(actions);
     view.child(about)
-        .child(files(&detail.info, &detail.selected_files, t, None))
+        .child(files(info, t, None))
 }
 
 fn section(title: &str, t: Theme) -> El {
@@ -211,13 +196,10 @@ fn section(title: &str, t: Theme) -> El {
 }
 
 pub(in crate::desktop) fn install_overlay(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) {
-    let Some(dialog) = s.browser.install_dialog.as_ref() else {
+    let Some(dialog) = s.install_dialog.as_ref() else {
         return;
     };
-    if !dialog.belongs_to(s) {
-        return;
-    }
-    let content = if s.matches_instance(&dialog.info.id) {
+    let content = if s.install_target(&dialog.info.id).is_some() {
         install_options(s, dialog, t, k)
     } else {
         col()
@@ -233,7 +215,7 @@ pub(in crate::desktop) fn install_overlay(s: &State, t: Theme, k: &Kit, layer: &
                 |s, tx| s.set_screen(Screen::Setup, tx),
             ))
     };
-    let title = if s.installed_for(&dialog.info.id).is_some() {
+    let title = if s.snapshot.installed_remote(&dialog.info.id).is_some() {
         "Reinstall mod"
     } else {
         "Install mod"
@@ -243,20 +225,19 @@ pub(in crate::desktop) fn install_overlay(s: &State, t: Theme, k: &Kit, layer: &
         .open(true)
         .fit()
         .width(760.0)
-        .on_close(|s: &mut State| s.browser.install_dialog = None)
+        .on_close(|s: &mut State| s.install_dialog = None)
         .child(col().w_full().px(16.0).pb(16.0).child(content))
         .build(k, layer);
 }
 
 fn close_image(s: &mut State) {
-    if let Some(detail) = &mut s.browser.detail {
+    if let Some(detail) = &mut s.detail {
         detail.full_image_open = false;
     }
 }
 
 fn image_zoom(s: &mut State) -> &mut ImageZoom {
     &mut s
-        .browser
         .detail
         .as_mut()
         .expect("image detail is open")
@@ -266,13 +247,14 @@ fn image_zoom(s: &mut State) -> &mut ImageZoom {
 pub(in crate::desktop) fn overlays(
     s: &State,
     detail: &Detail,
+    info: &ModDetails,
     t: Theme,
     k: &Kit,
     layer: &mut Vec<El>,
     reduced_motion: bool,
 ) {
     if detail.full_image_open
-        && let Some(image) = detail.info.images.get(detail.image)
+        && let Some(image) = info.images.get(detail.image)
     {
         let decoded = s.previews.as_ref().and_then(|previews| {
             previews
@@ -283,8 +265,8 @@ pub(in crate::desktop) fn overlays(
             .w_full()
             .items_center()
             .gap(12.0)
-            .child(muted(&detail.info.name, t).grow(1.0).shrink().truncate())
-            .child(image_navigation(detail, t, "expanded-image"));
+            .child(muted(&info.name, t).grow(1.0).shrink().truncate())
+            .child(image_navigation(detail.image, info.images.len(), t, "expanded-image"));
         let mut overlay = col()
             .key("full-image")
             .role("dialog")
@@ -338,8 +320,7 @@ pub(in crate::desktop) fn overlays(
     }
 }
 
-fn gallery(s: &State, detail: &Detail, t: Theme) -> El {
-    let images = &detail.info.images;
+fn gallery(s: &State, detail: &Detail, images: &[ModImage], t: Theme) -> El {
     let Some(image) = images.get(detail.image) else {
         return col();
     };
@@ -350,7 +331,7 @@ fn gallery(s: &State, detail: &Detail, t: Theme) -> El {
         .help("Expand screenshot")
         .focusable(true)
         .on_press(|s: &mut State| {
-            if let Some(detail) = &mut s.browser.detail {
+            if let Some(detail) = &mut s.detail {
                 detail.zoom.reset();
                 detail.full_image_open = true;
             }
@@ -385,12 +366,10 @@ fn gallery(s: &State, detail: &Detail, t: Theme) -> El {
             }));
         gallery = gallery.child(row().w_full().h(68.0).scroll_x().child(strip));
     }
-    gallery.child(image_navigation(detail, t, "image"))
+    gallery.child(image_navigation(detail.image, images.len(), t, "image"))
 }
 
-fn image_navigation(detail: &Detail, t: Theme, key: &str) -> El {
-    let index = detail.image;
-    let count = detail.info.images.len();
+fn image_navigation(index: usize, count: usize, t: Theme, key: &str) -> El {
     row()
         .items_center()
         .justify_between()
@@ -423,13 +402,13 @@ fn thumbnail(image: &ModImage) -> &str {
 }
 
 pub(in crate::desktop) fn preview_requests(
-    detail: &Detail,
+    info: &ModDetails,
+    image: usize,
     saved: bool,
 ) -> impl Iterator<Item = (&str, Size)> {
-    let image = detail.info.images.get(detail.image);
+    let image = info.images.get(image);
     let gallery = image.map(|image| (image.url.as_str(), Size::Gallery));
-    let thumbnails = detail
-        .info
+    let thumbnails = info
         .images
         .iter()
         .map(|image| (thumbnail(image), Size::Thumbnail));
@@ -439,8 +418,7 @@ pub(in crate::desktop) fn preview_requests(
         .chain(thumbnails)
         .chain(gallery.filter(|_| saved))
         .chain(
-            detail
-                .info
+            info
                 .requirements
                 .iter()
                 .filter_map(|dep| dep.thumbnail.as_deref())
@@ -470,7 +448,7 @@ fn render(s: &State, url: Option<&str>, size: Size, frame: El, fit: SurfaceFit, 
     }
 }
 
-fn files(info: &ModDetails, selected_files: &BTreeSet<u64>, t: Theme, picker: Option<&Kit>) -> El {
+fn files(info: &ModDetails, t: Theme, picker: Option<(&BTreeSet<u64>, &Kit)>) -> El {
     let mut view = section(
         if picker.is_some() {
             "Choose files"
@@ -484,8 +462,8 @@ fn files(info: &ModDetails, selected_files: &BTreeSet<u64>, t: Theme, picker: Op
     }
     for file in &info.files {
         let id = file.id;
-        let chosen = selected_files.contains(&id);
-        let title = if let Some(k) = picker {
+        let chosen = picker.is_some_and(|(selected, _)| selected.contains(&id));
+        let title = if let Some((_, k)) = picker {
             Checkbox::new(chosen)
                 .label(&file.name)
                 .build(k)
@@ -512,7 +490,7 @@ fn files(info: &ModDetails, selected_files: &BTreeSet<u64>, t: Theme, picker: Op
         {
             entry = entry.child(muted(description, t).wrap());
         }
-        if let Some(k) = picker {
+        if let Some((_, k)) = picker {
             entry = entry
                 .key(format!("file-{id}"))
                 .role("checkbox")
@@ -521,7 +499,7 @@ fn files(info: &ModDetails, selected_files: &BTreeSet<u64>, t: Theme, picker: Op
                 .focusable(true)
                 .hover(t.control_track)
                 .on_press(move |s: &mut State| {
-                    if let Some(dialog) = &mut s.browser.install_dialog
+                    if let Some(dialog) = &mut s.install_dialog
                         && !dialog.selected_files.remove(&id)
                     {
                         dialog.selected_files.insert(id);
@@ -586,7 +564,7 @@ fn install_options(s: &State, detail: &InstallDialog, t: Theme, k: &Kit) -> El {
                 .scroll(ScrollSpec {
                     stick_bottom: false,
                 })
-                .child(files(&detail.info, &detail.selected_files, t, Some(k))),
+                .child(files(&detail.info, t, Some((&detail.selected_files, k)))),
         );
     if !s.game_kind().is_xxmi() {
         content = content.child(
@@ -597,10 +575,15 @@ fn install_options(s: &State, detail: &InstallDialog, t: Theme, k: &Kit) -> El {
                 .child(form_field(
                     "remote-into",
                     "Default: detected game folder layout",
-                    &s.browser.install_into,
+                    &detail.destination,
                     k,
                     t,
-                    |s| &mut s.browser.install_into,
+                    |s| {
+                        &mut s.install_dialog
+                            .as_mut()
+                            .expect("install dialog is open")
+                            .destination
+                    },
                 )),
         );
     }
@@ -609,7 +592,7 @@ fn install_options(s: &State, detail: &InstallDialog, t: Theme, k: &Kit) -> El {
         .items_center()
         .justify_between()
         .gap(8.0)
-        .children(s.installed_for(&detail.info.id).is_none().then(|| {
+        .children(s.snapshot.installed_remote(&detail.info.id).is_none().then(|| {
             Checkbox::new(s.preferences.enable_new_mods)
                 .label("Enable after installing")
                 .disabled(!enabled)

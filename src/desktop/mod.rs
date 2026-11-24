@@ -40,7 +40,7 @@ use rune_kit::shell::PaneState;
 use url::Url;
 
 use backend::{Backend, Update, Worker, open_library};
-use browse::Browser;
+use browse::{Browser, Detail, DetailTarget, InstallDialog};
 use components::icon;
 use download_queue::Queue;
 use game_setup::SetupForm;
@@ -131,6 +131,16 @@ impl Snapshot {
     fn is_saved(&self, id: &RemoteMod) -> bool {
         self.favorites.iter().any(|saved| &saved.item == id)
     }
+
+    fn installed(&self, slug: &str) -> Option<&ManagedMod> {
+        self.mods.iter().find(|record| record.slug == slug)
+    }
+
+    fn installed_remote(&self, id: &RemoteMod) -> Option<&ManagedMod> {
+        self.mods
+            .iter()
+            .find(|record| record.release().is_some_and(|release| release.id == *id))
+    }
 }
 
 fn public_origins(game: GameKind) -> Vec<Origin> {
@@ -184,7 +194,8 @@ struct State {
     public_sources: Vec<Origin>,
     browser: Browser,
     local: LocalForm,
-    local_detail: Option<String>,
+    detail: Option<Detail>,
+    install_dialog: Option<InstallDialog>,
     setup: SetupForm,
     #[cfg(target_os = "linux")]
     nexus_listener: Option<nexus_handler::Listener>,
@@ -233,7 +244,8 @@ impl State {
             public_sources: public_origins(GameKind::Cyberpunk),
             browser: Browser::default(),
             local: LocalForm::default(),
-            local_detail: None,
+            detail: None,
+            install_dialog: None,
             setup: SetupForm::default(),
         }
     }
@@ -298,6 +310,14 @@ impl State {
         self.submit_job(label, move |worker| job(worker.state_dir.clone()));
     }
 
+    fn can_toggle_mod(&self, instance: &str) -> bool {
+        self.busy.is_none()
+            && !self
+                .queue
+                .active()
+                .is_some_and(|(target, applying)| target == instance && applying)
+    }
+
     fn set_mod_enabled(
         &mut self,
         instance: String,
@@ -305,6 +325,9 @@ impl State {
         enabled: bool,
         download: Option<RemoteMod>,
     ) {
+        if !self.can_toggle_mod(&instance) {
+            return;
+        }
         let selected = self.snapshot.selected.as_ref().map(|game| game.name.clone());
         self.submit("Updating mod…", move |dir| {
             let mut library = open_library(&dir)?;
@@ -476,13 +499,10 @@ impl State {
     fn set_screen(&mut self, screen: Screen, tx: &mut Tx) {
         let previous = self.screen;
         self.screen = screen;
-        self.detail_revision = self.detail_revision.wrapping_add(1);
+        self.set_detail(None);
         self.game_menu = false;
         self.local.close_menus();
         self.browser.close_menus();
-        self.browser.detail = None;
-        self.browser.install_dialog = None;
-        self.local_detail = None;
         self.sync_previews();
         tx.scroll_to_instant("main-scroll", 0.0, 0.0);
         if screen == Screen::Explore {
@@ -521,21 +541,23 @@ impl State {
         }
     }
 
+    fn set_detail(&mut self, detail: Option<Detail>) {
+        self.detail_revision = self.detail_revision.wrapping_add(1);
+        self.detail = detail;
+        self.install_dialog = None;
+    }
+
     fn open_installed_details(&mut self, slug: &str, tx: &mut Tx) {
-        let Some(record) = self.snapshot.mods.iter().find(|record| record.slug == slug) else {
+        let Some(record) = self.snapshot.installed(slug) else {
             return;
         };
-        self.browser.detail = None;
-        if let Some(details) = record.details().cloned() {
-            self.browser.show_details(details);
-        }
-        self.local_detail = Some(slug.to_owned());
+        self.set_detail(Some(Detail::installed(record)));
         self.sync_previews();
         tx.scroll_to_instant("main-scroll", 0.0, 0.0);
     }
 
     fn change_origin(&mut self, tx: &mut Tx) {
-        self.detail_revision = self.detail_revision.wrapping_add(1);
+        self.set_detail(None);
         let preferred = self.game_kind().preferred_source();
         self.browser.source = self
             .available_sources()
@@ -576,16 +598,16 @@ impl State {
             .queue
             .preview_urls(self.screen == Screen::Downloads)
             .map(|url| (url, Size::Thumbnail));
-        if matches!(
-            self.screen,
-            Screen::Explore | Screen::Local | Screen::Downloads
-        ) && let Some(detail) = &self.browser.detail
-        {
-            if self.local_detail.is_some() {
-                previews
-                    .show_saved(downloads.chain(browse::details::preview_requests(detail, true)));
+        if let Some(detail) = &self.detail {
+            let saved = matches!(detail.target, DetailTarget::Installed(_));
+            let requests = detail
+                .info(&self.snapshot)
+                .into_iter()
+                .flat_map(|info| browse::details::preview_requests(info, detail.image, saved));
+            if saved {
+                previews.show_saved(downloads.chain(requests));
             } else {
-                previews.show(downloads.chain(browse::details::preview_requests(detail, false)));
+                previews.show(downloads.chain(requests));
             }
         } else if self.screen == Screen::Explore {
             let cards = self
@@ -616,38 +638,33 @@ impl State {
         let old = self.snapshot.selected.as_ref().map(|i| &i.name);
         let next = snapshot.selected.as_ref().map(|i| &i.name);
         let changed = self.public_game != kind || old != next;
-        if changed {
-            self.detail_revision = self.detail_revision.wrapping_add(1);
-            self.browser.install_dialog = None;
+        if !changed
+            && let Some(Detail {
+                target: DetailTarget::Installed(slug),
+                ..
+            }) = &self.detail
+        {
+            match snapshot.installed(slug) {
+                Some(record)
+                    if record.details()
+                        != self.snapshot.installed(slug).and_then(ManagedMod::details) =>
+                {
+                    self.detail = Some(Detail::installed(record));
+                }
+                Some(_) => {}
+                None => self.set_detail(None),
+            }
         }
         self.snapshot = snapshot;
         self.public_game = kind;
-        if let Some(slug) = &self.local_detail {
-            if let Some(record) = self
-                .snapshot
-                .mods
-                .iter()
-                .find(|record| !changed && &record.slug == slug)
-            {
-                let displayed = self.browser.detail.as_ref().map(|detail| &detail.info);
-                if record.details() != displayed {
-                    self.browser.detail = None;
-                    if let Some(details) = record.details().cloned() {
-                        self.browser.show_details(details);
-                    }
-                }
-            } else {
-                self.local_detail = None;
-                self.browser.detail = None;
-            }
-        }
         if changed {
             self.public_sources = public_origins(kind);
             self.local = LocalForm::default();
             self.setup = SetupForm::default();
             self.change_origin(tx);
+        } else {
+            self.sync_previews();
         }
-        self.sync_previews();
     }
 
     fn poll(&mut self, now: f64, tx: &mut Tx) -> bool {
@@ -670,7 +687,6 @@ impl State {
             tx.wake_after(std::time::Duration::from_millis(250));
         }
         changed |= self
-            .browser
             .detail
             .as_mut()
             .is_some_and(|detail| detail.poll_zoom(now, tx));
@@ -726,6 +742,10 @@ impl State {
                     self.save_preferences();
                 }
                 Ok(Update::Library(snapshot)) => self.apply_snapshot(snapshot, tx),
+                Ok(Update::Favorites(favorites)) => {
+                    self.snapshot.favorites = favorites;
+                    self.sync_previews();
+                }
                 Ok(Update::ModRenamed {
                     instance,
                     slug,
@@ -743,6 +763,7 @@ impl State {
                             .find(|record| record.slug == slug)
                     {
                         record.enabled = enabled;
+                        self.sync_previews();
                     }
                     if let Some(record) = self
                         .snapshot
@@ -785,40 +806,14 @@ impl State {
                         Err(error) => self.notice = format!("{error:#}"),
                     }
                 }
-                Ok(Update::Details(
-                    screen,
+                Ok(Update::Details {
                     revision,
-                    search_revision,
-                    local_detail,
-                    install,
+                    intent,
                     result,
-                )) if self.screen == screen
-                    && self.detail_revision == revision
-                    && (install
-                        || screen != Screen::Explore
-                        || self.browser.search_revision == search_revision)
-                    && self.local_detail == local_detail =>
-                {
-                    match result {
-                        Ok(details) => {
-                            self.local_detail = None;
-                            if install {
-                                if self.available_sources().iter().any(|origin| {
-                                    origin.source == details.id.source
-                                        && origin.game == details.id.game
-                                }) {
-                                    self.open_install_dialog(details);
-                                }
-                            } else {
-                                self.show_online_details(details);
-                                self.sync_previews();
-                                tx.scroll_to_instant("main-scroll", 0.0, 0.0);
-                            }
-                        }
-                        Err(error) => self.notice = format!("{error:#}"),
-                    }
+                }) => {
+                    self.apply_details(revision, intent, result, tx);
                 }
-                Ok(Update::Search(..) | Update::Filters(..) | Update::Details(..)) => {}
+                Ok(Update::Search(..) | Update::Filters(..)) => {}
                 Err(error) if local && matches!(self.xxmi_launch, XxmiLaunch::Starting) => {
                     self.xxmi_launch = XxmiLaunch::Failed(format!("Could not start XXMI: {error:#}"));
                 }

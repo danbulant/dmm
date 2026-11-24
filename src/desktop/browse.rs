@@ -7,8 +7,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use dmm::games::GameKind;
-use dmm::library::{Library, ManagedMod};
+use dmm::library::ManagedMod;
 use dmm::sources::{
     FilterCatalog, Maturity, ModDetails, ModFile, ProviderFilters, RemoteMod, SearchPage,
     SearchQuery, Sort, Source, TimeWindow,
@@ -49,9 +48,6 @@ pub(super) struct Browser {
     pub(super) search_revision: u64,
     pub(super) results: Option<Rc<SearchPage>>,
     pub(super) shown_query: Option<SearchQuery>,
-    pub(super) detail: Option<Detail>,
-    pub(super) install_dialog: Option<InstallDialog>,
-    install_into: TextEdit,
     pub(super) nxm: TextEdit,
     pub(super) preference_save_due: Option<Instant>,
 }
@@ -81,10 +77,7 @@ impl Default for Browser {
             search_revision: 0,
             results: None,
             shown_query: None,
-            detail: None,
-            install_dialog: None,
             nxm: TextEdit::default(),
-            install_into: TextEdit::default(),
             preference_save_due: None,
         }
     }
@@ -108,11 +101,7 @@ pub(super) struct InstallDialog {
     pub(super) info: ModDetails,
     pub(super) selected_files: BTreeSet<u64>,
     pub(super) missing_previous_files: bool,
-    screen: Screen,
-    game: GameKind,
-    instance: Option<String>,
-    origin: Option<Origin>,
-    local_detail: Option<String>,
+    destination: TextEdit,
 }
 
 impl InstallDialog {
@@ -122,32 +111,68 @@ impl InstallDialog {
             .iter()
             .filter(|file| self.selected_files.contains(&file.id))
     }
+}
 
-    pub(super) fn belongs_to(&self, state: &State) -> bool {
-        self.screen == state.screen
-            && self.game == state.game_kind()
-            && self.instance.as_deref()
-                == state
-                    .snapshot
-                    .selected
-                    .as_ref()
-                    .map(|instance| instance.name.as_str())
-            && self.origin.as_ref() == state.origin()
-            && self.local_detail.as_deref() == state.local_detail.as_deref()
-    }
+pub(super) enum DetailsIntent {
+    View { search_revision: Option<u64> },
+    Install,
+}
+
+pub(super) enum DetailTarget {
+    Online(ModDetails),
+    Installed(String),
 }
 
 pub(super) struct Detail {
-    pub(super) info: ModDetails,
+    pub(super) target: DetailTarget,
     pub(super) image: usize,
     description: String,
-    selected_files: BTreeSet<u64>,
-    missing_previous_files: bool,
     full_image_open: bool,
-    pub(super) zoom: ImageZoom,
+    zoom: ImageZoom,
 }
 
 impl Detail {
+    pub(super) fn online(info: ModDetails) -> Self {
+        let description = Self::description(Some(&info));
+        Self::new(DetailTarget::Online(info), description)
+    }
+
+    pub(super) fn installed(record: &ManagedMod) -> Self {
+        Self::new(
+            DetailTarget::Installed(record.slug.clone()),
+            Self::description(record.details()),
+        )
+    }
+
+    fn new(target: DetailTarget, description: String) -> Self {
+        Self {
+            target,
+            description,
+            image: 0,
+            full_image_open: false,
+            zoom: ImageZoom::new(),
+        }
+    }
+
+    pub(super) fn info<'a>(&'a self, snapshot: &'a Snapshot) -> Option<&'a ModDetails> {
+        match &self.target {
+            DetailTarget::Online(info) => Some(info),
+            DetailTarget::Installed(slug) => snapshot.installed(slug)?.details(),
+        }
+    }
+
+    fn description(info: Option<&ModDetails>) -> String {
+        let raw = info
+            .and_then(|info| info.description.as_deref().or(info.summary.as_deref()))
+            .unwrap_or_default();
+        let message: String = raw.chars().take(5000).collect();
+        if message.contains('<') {
+            std::mem::take(&mut TextEdit::from_html(&message).text)
+        } else {
+            message
+        }
+    }
+
     pub(super) fn poll_zoom(&mut self, now: f64, tx: &mut Tx) -> bool {
         self.full_image_open && self.zoom.poll(now, tx)
     }
@@ -175,8 +200,6 @@ impl Browser {
         self.shown_query = None;
         self.searching_since = None;
         self.show_search_progress = false;
-        self.detail = None;
-        self.install_dialog = None;
         self.show_filters = false;
     }
 
@@ -249,40 +272,6 @@ impl Browser {
                 })
                 .filter_map(|category| category.icon.as_deref())
         })
-    }
-
-    pub(super) fn show_details(&mut self, info: ModDetails) {
-        let raw = info
-            .description
-            .as_deref()
-            .or(info.summary.as_deref())
-            .unwrap_or_default();
-        let message: String = raw.chars().take(5000).collect();
-        let description = if message.contains('<') {
-            std::mem::take(&mut TextEdit::from_html(&message).text)
-        } else {
-            message
-        };
-        let mut main = info.files.iter().filter(|file| file.primary);
-        let primary = main.next().filter(|_| main.next().is_none());
-        let selected_files = if info.files.len() == 1 {
-            info.files.first()
-        } else {
-            primary
-        }
-        .map(|file| file.id)
-        .into_iter()
-        .collect();
-        self.install_into = TextEdit::default();
-        self.detail = Some(Detail {
-            selected_files,
-            missing_previous_files: false,
-            info,
-            image: 0,
-            description,
-            full_image_open: false,
-            zoom: ImageZoom::new(),
-        });
     }
 }
 
@@ -499,7 +488,7 @@ impl State {
     pub(super) fn drive_explore(&mut self) -> bool {
         if self.catalog_busy.is_some()
             || self.screen != Screen::Explore
-            || self.browser.detail.is_some()
+            || self.detail.is_some()
         {
             return false;
         }
@@ -573,6 +562,7 @@ impl State {
     fn change_source(&mut self, source: Source, tx: &mut Tx) {
         if self.browser.source != source {
             self.browser.source = source;
+            self.set_detail(None);
             self.browser.reset_origin();
             if let Some(origin) = self.origin().cloned() {
                 self.restore_browse_preferences(&origin);
@@ -629,18 +619,47 @@ impl State {
     }
 
     pub(super) fn details(&mut self, id: RemoteMod) {
-        self.load_details(id, false);
+        let search_revision =
+            (self.screen == Screen::Explore).then_some(self.browser.search_revision);
+        self.load_details(id, DetailsIntent::View { search_revision });
     }
 
-    pub(super) fn details_for_install(&mut self, id: RemoteMod) {
-        self.load_details(id, true);
+    fn loaded_install_details(&self, id: &RemoteMod) -> Option<&ModDetails> {
+        match &self.detail.as_ref()?.target {
+            DetailTarget::Online(info) if info.id == *id => Some(info),
+            _ => None,
+        }
     }
 
-    fn load_details(&mut self, id: RemoteMod, install: bool) {
-        let screen = self.screen;
+    pub(super) fn install_blocker(&self, id: &RemoteMod) -> Option<&'static str> {
+        let loaded = self.loaded_install_details(id);
+        if loaded.is_some_and(|info| info.files.is_empty()) {
+            Some("No downloadable files from this source")
+        } else if self.install_target(id).is_none() {
+            Some("Select a game installation before installing")
+        } else if !self.queue.available() {
+            Some("The download queue is unavailable")
+        } else if loaded.is_none() && self.details_busy.is_some() {
+            Some("Loading mod details…")
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn request_install(&mut self, id: &RemoteMod, tx: &mut Tx) {
+        if self.pending_install(id).is_some() {
+            self.open_downloads(tx);
+        } else if self.install_blocker(id).is_none() {
+            if let Some(info) = self.loaded_install_details(id).cloned() {
+                self.open_install_dialog(info);
+            } else {
+                self.load_details(id.clone(), DetailsIntent::Install);
+            }
+        }
+    }
+
+    fn load_details(&mut self, id: RemoteMod, intent: DetailsIntent) {
         let revision = self.detail_revision;
-        let search_revision = self.browser.search_revision;
-        let local_detail = self.local_detail.clone();
         let maturity = (self.screen == Screen::Explore && self.browser.source == Source::Nexus)
             .then_some(self.browser.maturity);
         let listed_rating = self.browser.results.as_ref().and_then(|page| {
@@ -666,19 +685,44 @@ impl State {
                     );
                     Ok(detail)
                 });
-            Ok(Update::Details(
-                screen,
-                revision,
-                search_revision,
-                local_detail,
-                install,
-                result,
-            ))
+            Ok(Update::Details { revision, intent, result })
         });
     }
 
-    pub(super) fn unsave(&mut self, id: RemoteMod) {
-        self.change_bookmark(move |library| library.unsave(&id));
+    pub(super) fn apply_details(
+        &mut self,
+        revision: u64,
+        intent: DetailsIntent,
+        result: anyhow::Result<ModDetails>,
+        tx: &mut Tx,
+    ) {
+        if revision != self.detail_revision
+            || matches!(intent, DetailsIntent::View { search_revision: Some(search) }
+                if search != self.browser.search_revision)
+        {
+            return;
+        }
+        let details = match result {
+            Ok(details) => details,
+            Err(error) => {
+                self.notice = format!("{error:#}");
+                return;
+            }
+        };
+        match intent {
+            DetailsIntent::View { .. } => {
+                self.detail = Some(Detail::online(details));
+                self.sync_previews();
+                tx.scroll_to_instant("main-scroll", 0.0, 0.0);
+            }
+            DetailsIntent::Install => {
+                if self.available_sources().iter().any(|origin| {
+                    origin.source == details.id.source && origin.game == details.id.game
+                }) {
+                    self.open_install_dialog(details);
+                }
+            }
+        }
     }
 
     pub(super) fn toggle_bookmark(
@@ -686,48 +730,29 @@ impl State {
         id: RemoteMod,
         name: String,
         image: Option<String>,
-        saved: bool,
     ) {
-        if saved {
-            self.unsave(id);
-        } else {
-            self.change_bookmark(move |library| {
-                library.save_favorite(&id, &name, image.as_deref())
-            });
-        }
-    }
-
-    fn change_bookmark(
-        &mut self,
-        change: impl FnOnce(&Library) -> anyhow::Result<()> + Send + 'static,
-    ) {
-        let target = self.snapshot.selected.as_ref().map(|i| i.name.clone());
+        let saved = self.snapshot.is_saved(&id);
         self.submit("Updating saved mods…", move |dir| {
             let library = super::open_library(&dir)?;
-            change(&library)?;
-            Ok(Update::Library(Snapshot::load(
-                &library,
-                target.as_deref(),
-            )?))
+            if saved {
+                library.unsave(&id)?;
+            } else {
+                library.save_favorite(&id, &name, image.as_deref())?;
+            }
+            Ok(Update::Favorites(library.saved_favorites()?))
         });
     }
 
-    pub(super) fn matches_instance(&self, id: &RemoteMod) -> bool {
+    pub(super) fn install_target(&self, id: &RemoteMod) -> Option<&str> {
         self.snapshot
             .selected
             .as_ref()
-            .is_some_and(|instance| instance.kind.source_game(id.source) == Some(id.game.as_str()))
-    }
-
-    pub(super) fn installed_for(&self, id: &RemoteMod) -> Option<&ManagedMod> {
-        self.snapshot
-            .mods
-            .iter()
-            .find(|record| record.release().is_some_and(|release| release.id == *id))
+            .filter(|instance| instance.kind.source_game(id.source) == Some(id.game.as_str()))
+            .map(|instance| instance.name.as_str())
     }
 
     fn installed_file_ids(&self, id: &RemoteMod) -> Option<BTreeSet<u64>> {
-        self.installed_for(id).map(|record| {
+        self.snapshot.installed_remote(id).map(|record| {
             if record.releases().is_empty() {
                 record
                     .release()
@@ -744,71 +769,37 @@ impl State {
         })
     }
 
-    pub(super) fn open_install_dialog(&mut self, info: ModDetails) {
-        let mut main = info.files.iter().filter(|file| file.primary);
-        let primary = main.next().filter(|_| main.next().is_none());
-        let selected_files = if info.files.len() == 1 {
-            info.files.first()
-        } else {
-            primary
-        }
-        .map(|file| file.id)
-        .into_iter()
-        .collect();
-        let installed_files = self.installed_file_ids(&info.id);
-        let mut dialog = InstallDialog {
+    fn open_install_dialog(&mut self, info: ModDetails) {
+        let (selected_files, missing_previous_files) =
+            if let Some(ids) = self.installed_file_ids(&info.id) {
+                if ids.iter().all(|id| info.files.iter().any(|file| file.id == *id)) {
+                    (ids, false)
+                } else {
+                    (BTreeSet::new(), true)
+                }
+            } else {
+                let default = match info.files.as_slice() {
+                    [only] => Some(only),
+                    files => {
+                        let mut primary = files.iter().filter(|file| file.primary);
+                        primary.next().filter(|_| primary.next().is_none())
+                    }
+                };
+                (default.map(|file| file.id).into_iter().collect(), false)
+            };
+        self.install_dialog = Some(InstallDialog {
             info,
             selected_files,
-            missing_previous_files: false,
-            screen: self.screen,
-            game: self.game_kind(),
-            instance: self
-                .snapshot
-                .selected
-                .as_ref()
-                .map(|instance| instance.name.clone()),
-            origin: self.origin().cloned(),
-            local_detail: self.local_detail.clone(),
-        };
-        if let Some(ids) = installed_files {
-            dialog.missing_previous_files = ids
-                .iter()
-                .any(|id| !dialog.info.files.iter().any(|file| file.id == *id));
-            dialog.selected_files = if dialog.missing_previous_files {
-                BTreeSet::new()
-            } else {
-                ids
-            };
-        }
-        self.browser.install_into = TextEdit::default();
-        self.browser.install_dialog = Some(dialog);
-    }
-
-    pub(super) fn show_online_details(&mut self, info: ModDetails) {
-        let installed_files = self.installed_file_ids(&info.id);
-        self.browser.show_details(info);
-        if let Some(ids) = installed_files
-            && let Some(detail) = &mut self.browser.detail
-        {
-            detail.missing_previous_files = ids
-                .iter()
-                .any(|id| !detail.info.files.iter().any(|file| file.id == *id));
-            detail.selected_files = if detail.missing_previous_files {
-                BTreeSet::new()
-            } else {
-                ids
-            };
-        }
+            missing_previous_files,
+            destination: TextEdit::default(),
+        });
     }
 
     fn install_selected(&mut self) {
-        let Some(dialog) = &self.browser.install_dialog else {
+        let Some(dialog) = &self.install_dialog else {
             return;
         };
-        if !dialog.belongs_to(self) || !self.matches_instance(&dialog.info.id) {
-            return;
-        }
-        let Some(target) = self.snapshot.selected.as_ref().map(|i| i.name.clone()) else {
+        let Some(target) = self.install_target(&dialog.info.id).map(str::to_owned) else {
             return;
         };
         let files: Vec<_> = dialog.picked_files().cloned().collect();
@@ -816,12 +807,13 @@ impl State {
             return;
         }
         let info = dialog.info.clone();
-        let into = nonempty(&self.browser.install_into.text).map(PathBuf::from);
+        let into = nonempty(&dialog.destination.text).map(PathBuf::from);
         let keep_disabled = self
-            .installed_for(&info.id)
+            .snapshot
+            .installed_remote(&info.id)
             .map_or(!self.preferences.enable_new_mods, |record| !record.enabled);
         if self.enqueue_install(target, info, files, into, keep_disabled) {
-            self.browser.install_dialog = None;
+            self.install_dialog = None;
         }
     }
 
@@ -836,8 +828,13 @@ impl State {
     }
 
     fn gallery_step(&mut self, index: usize) {
-        if let Some(detail) = &mut self.browser.detail
-            && index < detail.info.images.len()
+        let count = self
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.info(&self.snapshot))
+            .map_or(0, |info| info.images.len());
+        if let Some(detail) = &mut self.detail
+            && index < count
             && index != detail.image
         {
             detail.image = index;
@@ -854,13 +851,14 @@ fn nonempty(s: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use dmm::games::GameKind;
     use rune::{Env, Runtime};
 
     use super::super::preferences::Preferences;
     use super::*;
 
     #[test]
-    fn install_dialog_survives_search_and_detail_state_changes_but_not_context_changes() {
+    fn install_dialog_survives_search_and_detail_results_but_not_navigation() {
         let mut state = State::new(PathBuf::from("unused"));
         let info = ModDetails {
             id: RemoteMod {
@@ -895,26 +893,24 @@ mod tests {
             }],
         };
         state.open_install_dialog(info.clone());
-        assert!(state.browser.detail.is_none());
+        assert!(state.detail.is_none());
 
         state.browser.query = TextEdit::new("new search");
         state.search();
-        assert!(
-            state
-                .browser
-                .install_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.belongs_to(&state))
-        );
+        assert!(state.install_dialog.is_some());
 
-        state.browser.show_details(info.clone());
-        assert!(state.browser.install_dialog.is_some());
+        let revision = state.detail_revision;
+        let intent = DetailsIntent::View { search_revision: Some(state.browser.search_revision) };
+        state.apply_details(revision, intent, Ok(info.clone()), &mut Tx::default());
+        assert!(state.detail.is_some());
+        assert!(state.install_dialog.is_some());
         state.set_screen(Screen::Local, &mut Tx::default());
-        assert!(state.browser.install_dialog.is_none());
+        state.apply_details(revision, DetailsIntent::Install, Ok(info.clone()), &mut Tx::default());
+        assert!(state.install_dialog.is_none());
         state.set_screen(Screen::Explore, &mut Tx::default());
         state.open_install_dialog(info);
         state.apply_game(GameKind::Zzmi, Snapshot::default(), &mut Tx::default());
-        assert!(state.browser.install_dialog.is_none());
+        assert!(state.install_dialog.is_none());
     }
 
     #[test]

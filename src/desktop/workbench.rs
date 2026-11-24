@@ -16,7 +16,7 @@ use super::components::{
     button, bytes, field, heading, muted, open_page, panel, source_name, styled_field,
 };
 use super::download_queue::Queue;
-use super::mod_card::{Card, byline, remote_key};
+use super::mod_card::{Card, CardSource, byline, remote_key};
 use super::{Origin, Screen, Size, Snapshot, State, Update, open_library};
 
 const PAGE_SIZE: usize = 24;
@@ -251,11 +251,14 @@ pub(super) fn local_mods(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> E
             .child(record_filter_menu(s, k, layer, FilterMenu::Group))
             .child(filter_menu(s, k, layer, FilterMenu::Sort)),
     );
-    let entries = entries(&s.local, &s.snapshot, s.available_sources(), &s.queue);
-    let pages = entries.len().div_ceil(PAGE_SIZE);
-    let page = s.local.page.min(pages.saturating_sub(1));
+    let rows = LocalPage::new(&s.local, &s.snapshot, s.available_sources(), &s.queue);
+    let LocalPage {
+        index: page,
+        count: pages,
+        ..
+    } = rows;
     let mut grid = row().w_full().flex_wrap().gaps(12.0, 12.0);
-    for entry in entries.into_iter().skip(page * PAGE_SIZE).take(PAGE_SIZE) {
+    for entry in rows.visible() {
         grid = grid.child(match entry {
             Entry::Installed(instance, record) => installed_card(s, t, k, instance, record),
             Entry::Remote {
@@ -567,11 +570,7 @@ fn entries<'a>(
                     (form.status != Status::Saved || snapshot.is_saved(item.id))
                         && form.site_filter.is_none_or(|site| site == item.id.source)
                         && contains(item.name, &q)
-                        && !snapshot.mods.iter().any(|record| {
-                            record
-                                .release()
-                                .is_some_and(|release| release.id == *item.id)
-                        })
+                        && snapshot.installed_remote(item.id).is_none()
                 })
                 .map(|item| Entry::Remote {
                     id: item.id,
@@ -650,11 +649,7 @@ fn entries<'a>(
                             .selected
                             .as_ref()
                             .is_some_and(|instance| queue.contains(&instance.name, &favorite.item))
-                        && !snapshot.mods.iter().any(|record| {
-                            record
-                                .release()
-                                .is_some_and(|release| release.id == favorite.item)
-                        })
+                        && snapshot.installed_remote(&favorite.item).is_none()
                 })
                 .map(|item| Entry::Remote {
                     id: &item.item,
@@ -707,20 +702,40 @@ fn installed_image(record: &ManagedMod) -> Option<&str> {
     Some(image.thumbnail.as_deref().unwrap_or(&image.url))
 }
 
+struct LocalPage<'a> {
+    entries: Vec<Entry<'a>>,
+    index: usize,
+    count: usize,
+}
+
+impl<'a> LocalPage<'a> {
+    fn new(form: &LocalForm, snapshot: &'a Snapshot, origins: &[Origin], queue: &'a Queue) -> Self {
+        let entries = entries(form, snapshot, origins, queue);
+        let count = entries.len().div_ceil(PAGE_SIZE);
+        let index = form.page.min(count.saturating_sub(1));
+        Self {
+            entries,
+            index,
+            count,
+        }
+    }
+
+    fn visible(self) -> impl Iterator<Item = Entry<'a>> {
+        self.entries
+            .into_iter()
+            .skip(self.index * PAGE_SIZE)
+            .take(PAGE_SIZE)
+    }
+}
+
 pub(super) fn preview_requests<'a>(
     form: &LocalForm,
     snapshot: &'a Snapshot,
     origins: &[Origin],
     queue: &'a Queue,
 ) -> impl Iterator<Item = (&'a str, Size)> + use<'a> {
-    let entries = entries(form, snapshot, origins, queue);
-    let page = form
-        .page
-        .min(entries.len().div_ceil(PAGE_SIZE).saturating_sub(1));
-    entries
-        .into_iter()
-        .skip(page * PAGE_SIZE)
-        .take(PAGE_SIZE)
+    LocalPage::new(form, snapshot, origins, queue)
+        .visible()
         .filter_map(|entry| {
             let url = match entry {
                 Entry::Installed(_, record) => installed_image(record),
@@ -748,15 +763,13 @@ fn remote_card(
         image,
         byline: source_name(id.source).into(),
         metadata: String::new(),
-        remote: Some(id),
-        installed: None,
+        source: CardSource::Remote(id),
     }
     .view(s, t, k)
 }
 
 fn installed_card(s: &State, t: Theme, k: &Kit, instance: &str, managed: &ManagedMod) -> El {
     let details = managed.details();
-    let release = managed.release();
     let metadata: Vec<_> = managed
         .group
         .as_deref()
@@ -787,8 +800,10 @@ fn installed_card(s: &State, t: Theme, k: &Kit, instance: &str, managed: &Manage
                 }
             },
         ),
-        remote: release.map(|release| &release.id),
-        installed: Some(managed),
+        source: CardSource::Installed {
+            instance,
+            record: managed,
+        },
     }
     .view(s, t, k)
 }
@@ -827,13 +842,18 @@ pub(super) fn installed_actions(s: &State, t: Theme, instance: &str, managed: &M
     }
     if let Some(release) = managed.release() {
         let id = release.id.clone();
+        let queued = s.pending_install(&id).is_some();
         body = body.child(button(
             format!("installed:{instance}:{slug}:reinstall"),
-            "Choose files to reinstall…",
+            if queued {
+                "In Downloads"
+            } else {
+                "Choose files to reinstall…"
+            },
             t,
             false,
-            s.details_busy.is_none() && s.queue.available() && s.matches_instance(&id),
-            move |s, _| s.details_for_install(id.clone()),
+            queued || s.install_blocker(&id).is_none(),
+            move |s, tx| s.request_install(&id, tx),
         ));
     }
     if !managed.enabled

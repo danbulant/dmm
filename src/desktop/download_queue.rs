@@ -521,24 +521,12 @@ impl State {
     fn toggle_completed_download(&mut self, index: usize, enabled: bool) {
         let Some(item) = self.queue.items.get(index) else { return };
         let Some(record) = item.installed_state(&self.snapshot) else { return };
-        if self.queue.active().is_some_and(|(instance, applying)| {
-            applying && instance == item.instance
-        }) {
-            return;
-        }
         self.set_mod_enabled(
             record.instance.clone(),
             record.slug.clone(),
             enabled,
             Some(record.id.clone()),
         );
-    }
-
-    pub(super) fn queued_for_selected(&self, id: &RemoteMod) -> bool {
-        self.snapshot
-            .selected
-            .as_ref()
-            .is_some_and(|game| self.queue.contains(&game.name, id))
     }
 
     pub(super) fn pending_install(&self, id: &RemoteMod) -> Option<&'static str> {

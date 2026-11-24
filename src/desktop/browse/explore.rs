@@ -7,7 +7,7 @@ use super::{State, filters};
 use crate::desktop::components::{
     button, field, heading, muted, panel, source_icon, source_name, styled_field,
 };
-use crate::desktop::mod_card::{Card, byline, remote_key};
+use crate::desktop::mod_card::{Card, CardSource, byline, remote_key};
 
 pub(in crate::desktop) fn explore(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
     let game = s.game_kind().display_name().to_uppercase();
@@ -246,8 +246,7 @@ fn card(s: &State, item: &SearchResult, t: Theme, k: &Kit) -> El {
         image: item.image.as_deref(),
         byline: byline(item.author.as_deref(), item.category.as_deref(), "Mod"),
         metadata: meta.join(" · "),
-        remote: Some(&item.id),
-        installed: s.installed_for(&item.id),
+        source: CardSource::Remote(&item.id),
     }
     .view(s, t, k)
 }

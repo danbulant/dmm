@@ -10,6 +10,7 @@ use super::{Action, Entry, Phase, Transfer};
 use crate::desktop::components::{
     button, bytes, field, heading, muted, open_page, panel, source_icon, styled_field,
 };
+use crate::desktop::mod_card::enable_switch;
 use crate::desktop::shell::game_icon;
 use crate::desktop::{Screen, Size, State};
 
@@ -136,19 +137,19 @@ fn entry(s: &State, index: usize, item: &Entry, t: Theme, k: &Kit) -> El {
     );
     if let Some(mod_state) = installed {
         let enabled = mod_state.enabled;
-        let locked = s.busy.is_some()
-            || s.queue.active().is_some_and(|(instance, applying)| {
-                applying && instance == item.instance
-            });
-        line = line.child(
-            Switch::new(enabled)
-                .label(format!("Enable {}", item.name))
-                .disabled(locked)
-                .hide_label()
-                .on_toggle(move |s: &mut State| s.toggle_completed_download(index, !enabled))
-                .build(k)
+        line = line
+            .child(
+                enable_switch(
+                    s,
+                    &item.instance,
+                    &item.name,
+                    enabled,
+                    move |s| s.toggle_completed_download(index, !enabled),
+                    k,
+                )
                 .key(format!("queue-enabled-{index}")),
-        ).child(muted(if enabled { "Enabled" } else { "Disabled" }, t));
+            )
+            .child(muted(if enabled { "Enabled" } else { "Disabled" }, t));
     }
     if let Phase::Waiting(_) = item.phase {
         line = line.child(button(
@@ -203,15 +204,17 @@ fn entry(s: &State, index: usize, item: &Entry, t: Theme, k: &Kit) -> El {
     if let Phase::Failed(error) = &item.phase {
         card = card.child(muted(error, t).wrap());
     }
-    if matches!(item.phase, Phase::Failed(_) | Phase::Cancelled) && s.matches_instance(&item.id) {
+    if matches!(item.phase, Phase::Failed(_) | Phase::Cancelled)
+        && s.install_target(&item.id).is_some()
+    {
         let id = item.id.clone();
         card = card.child(button(
             format!("queue-reinstall-{index}"),
             "Choose files again",
             t,
             false,
-            true,
-            move |s, _| s.details_for_install(id.clone()),
+            s.pending_install(&id).is_some() || s.install_blocker(&id).is_none(),
+            move |s, tx| s.request_install(&id, tx),
         ));
     }
     card

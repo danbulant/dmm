@@ -10,14 +10,16 @@ use dmm::games::GameKind;
 use dmm::games::discovery::Discovery;
 #[cfg(target_os = "linux")]
 use dmm::games::xxmi::steam_xxmi::SteamXxmi;
-use dmm::library::{Inspection, Library};
+use dmm::library::{Inspection, Library, SavedFavorite};
 use dmm::sources::{FilterCatalog, ModDetails, SearchPage, SearchQuery, SourceClient};
 use rune::Waker;
 
-use super::{Origin, Screen, Snapshot};
+use super::browse::DetailsIntent;
+use super::{Origin, Snapshot};
 
 pub(super) enum Update {
     Library(Snapshot),
+    Favorites(Vec<SavedFavorite>),
     ModRenamed {
         instance: String,
         slug: String,
@@ -33,7 +35,11 @@ pub(super) enum Update {
     Message(String),
     Search(u64, SearchQuery, Result<SearchPage>),
     Filters(Origin, Result<FilterCatalog>),
-    Details(Screen, u64, u64, Option<String>, bool, Result<ModDetails>),
+    Details {
+        revision: u64,
+        intent: DetailsIntent,
+        result: Result<ModDetails>,
+    },
 }
 
 pub(super) type Job = Box<dyn FnOnce(&mut Backend) -> Result<Update> + Send>;

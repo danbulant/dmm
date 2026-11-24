@@ -219,13 +219,7 @@ fn paging_keeps_the_current_grid_and_restores_cached_pages_immediately() {
     );
 }
 
-fn details_fixture() -> State {
-    let mut state = State::new(PathBuf::from("unused"));
-    state.snapshot.selected = Some(Instance {
-        name: "cyberpunk".into(),
-        kind: GameKind::Cyberpunk,
-        root: PathBuf::from("unused-game"),
-    });
+fn remote_mod_fixture() -> ModDetails {
     let file = |id, name: &str| ModFile {
         id,
         name: name.to_owned(),
@@ -238,7 +232,7 @@ fn details_fixture() -> State {
         description: None,
         url: None,
     };
-    state.browser.show_details(ModDetails {
+    ModDetails {
         id: RemoteMod {
             source: Source::Nexus,
             game: "cyberpunk2077".into(),
@@ -272,7 +266,17 @@ fn details_fixture() -> State {
             thumbnail: None,
         }],
         files: vec![file(1, "wardrobe.zip"), file(2, "optional-patch.zip")],
+    }
+}
+
+fn details_fixture() -> State {
+    let mut state = State::new(PathBuf::from("unused"));
+    state.snapshot.selected = Some(Instance {
+        name: "cyberpunk".into(),
+        kind: GameKind::Cyberpunk,
+        root: PathBuf::from("unused-game"),
     });
+    state.set_detail(Some(Detail::online(remote_mod_fixture())));
     state
 }
 
@@ -324,7 +328,6 @@ fn details_keeps_install_header_and_opens_file_and_image_overlays() {
     runtime.frame(1.0 / 60.0);
     runtime.update(|state, _| {
         let selected: Vec<_> = state
-            .browser
             .install_dialog
             .as_ref()
             .unwrap()
@@ -401,7 +404,7 @@ fn expanding_a_cached_thumbnail_shows_a_zoomable_image_before_the_full_image_arr
 #[test]
 fn catalog_loading_does_not_block_setup_or_local_import_controls() {
     let mut state = details_fixture();
-    state.browser.detail = None;
+    state.set_detail(None);
     state.snapshot.instances = state.snapshot.selected.clone().into_iter().collect();
     state.catalog_busy = Some("Searching mods…");
     let mut runtime = Runtime::new(state, view, (960.0, 620.0), Env::new(true, 1.0));
@@ -665,7 +668,7 @@ fn local_grid_presents_bookmarks_and_requires_confirmation_before_removing_an_in
 
     responses.send(requests.try_recv()?(&mut backend))?;
     runtime.frame(1.0 / 60.0);
-    assert!(runtime.state.local_detail.is_none());
+    assert!(runtime.state.detail.is_none());
     assert!(runtime.state.snapshot.mods.is_empty());
     assert!(!game.join("archive/pc/mod/mod.archive").exists());
     assert!(
@@ -677,13 +680,57 @@ fn local_grid_presents_bookmarks_and_requires_confirmation_before_removing_an_in
 }
 
 #[test]
+fn reinstall_keeps_the_installed_mod_page_open() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state_dir = dir.path().join("state");
+    let game = dir.path().join("game");
+    let input = dir.path().join("input");
+    std::fs::create_dir(&game)?;
+    std::fs::create_dir(&input)?;
+    std::fs::write(input.join("mod.archive"), b"archive fixture")?;
+    let mut library = Library::open(&state_dir)?;
+    library.register("cp", GameKind::Cyberpunk, &game)?;
+    let info = remote_mod_fixture();
+    let file = &info.files[1];
+    let release = Release {
+        id: info.id.clone(),
+        source_url: info.url.clone(),
+        file_id: file.id,
+        filename: file.name.clone(),
+        version: None,
+        updated_at: None,
+    };
+    library.install("cp", "wardrobe", &input, Some(release), Default::default())?;
+    let mut state = State::new(state_dir);
+    state.screen = Screen::Local;
+    state.snapshot = Snapshot::load(&library, Some("cp"))?;
+    state.open_installed_details("wardrobe", &mut Tx::default());
+    state.apply_details(
+        state.detail_revision,
+        browse::DetailsIntent::Install,
+        Ok(info),
+        &mut Tx::default(),
+    );
+    let mut runtime = Runtime::new(state, view, (960.0, 620.0), Env::new(true, 1.0));
+    runtime.frame(0.0);
+    assert!(runtime.presented("mod-install-dialog").is_some());
+    assert!(runtime.presented("installed:cp:wardrobe:remove").is_some());
+    let dialog = runtime.state.install_dialog.as_ref().unwrap();
+    assert_eq!(
+        dialog.picked_files().map(|file| file.id).collect::<Vec<_>>(),
+        [2],
+    );
+    Ok(())
+}
+
+#[test]
 fn bookmark_and_queue_actions_work_across_explore_and_local_cards() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let data = dir.path().join("state");
     let game = dir.path().join("game");
     std::fs::create_dir(&game)?;
-    let mut state = details_fixture();
-    let info = state.browser.detail.take().unwrap().info;
+    let mut state = State::new(PathBuf::from("unused"));
+    let info = remote_mod_fixture();
     let id = info.id.clone();
     let image = info.images[0].thumbnail.clone();
     state.state_dir = data.clone();
@@ -738,7 +785,7 @@ fn bookmark_and_queue_actions_work_across_explore_and_local_cards() -> Result<()
     runtime.frame(1.0 / 60.0);
     assert!(runtime.state.snapshot.is_saved(&id));
     assert_eq!(runtime.state.snapshot.favorites[0].image, image);
-    assert!(runtime.state.browser.detail.is_none());
+    assert!(runtime.state.detail.is_none());
     click(&mut runtime, "nav-Local mods");
     assert!(
         runtime
