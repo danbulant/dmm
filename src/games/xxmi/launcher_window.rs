@@ -1,6 +1,6 @@
 use std::path::Path;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use anyhow::Context;
 use anyhow::Result;
 #[cfg(target_os = "linux")]
