@@ -1,13 +1,29 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, ensure};
 
-use super::GameKind;
-use super::xxmi::{SteamApp, is_importer_mods};
+#[cfg(feature = "rune-ui")]
+use super::GamePresentation;
+use super::xxmi::{SteamApp, XxmiAdapter, is_importer_mods};
+use super::{GameKind, GameProfile};
+use crate::sources::Source;
 
-pub(super) const NAME: &str = "Arknights: Endfield";
-pub(super) const GAMEBANANA_GAME: &str = "21842";
-pub(super) const INSTALLATION_LABEL: &str = "EFMI Mods folder";
+pub(super) const PROFILE: GameProfile = GameProfile {
+    id: "efmi",
+    aliases: &["endfield"],
+    adapter: &XxmiAdapter::new(STEAM_APP, validate_installation_root),
+    name: "Arknights: Endfield",
+    nexus: None,
+    gamebanana: Some("21842"),
+    preferred_source: Source::GameBanana,
+    installation_label: "EFMI Mods folder",
+    #[cfg(feature = "rune-ui")]
+    presentation: GamePresentation {
+        icon: include_bytes!("icon.jpg"),
+        setup_note: None,
+        destination_override: false,
+    },
+};
 pub(super) const EXE: &str = "Endfield.exe";
 
 pub(super) const STEAM_APP: SteamApp = SteamApp {
@@ -18,7 +34,7 @@ pub(super) const STEAM_APP: SteamApp = SteamApp {
     executables: &[EXE],
 };
 
-pub(super) fn validate_installation_root(root: &Path) -> Result<()> {
+fn validate_installation_root(root: &Path, _steam_roots: &[PathBuf]) -> Result<()> {
     ensure!(
         is_importer_mods(root, GameKind::Efmi),
         "Choose the EFMI Mods folder from an installed XXMI importer."

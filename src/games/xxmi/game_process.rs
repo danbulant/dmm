@@ -15,11 +15,7 @@ pub struct RunningGames {
 
 impl RunningGames {
     pub fn contains(&self, kind: GameKind) -> bool {
-        match kind {
-            GameKind::Zzmi => self.zzmi,
-            GameKind::Efmi => self.efmi,
-            GameKind::Cyberpunk => false,
-        }
+        (kind == GameKind::Zzmi && self.zzmi) || (kind == GameKind::Efmi && self.efmi)
     }
 }
 

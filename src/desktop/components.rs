@@ -151,9 +151,7 @@ pub(super) fn card_title(name: &str, t: Theme) -> El {
 }
 
 pub(super) fn icon(bytes: &[u8]) -> Option<Pixels> {
-    let rgba = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
-        .ok()?
-        .into_rgba8();
+    let rgba = image::load_from_memory(bytes).ok()?.into_rgba8();
     let pixels = Pixels::new();
     pixels.set(rgba.width(), rgba.height(), rgba.into_raw());
     Some(pixels)

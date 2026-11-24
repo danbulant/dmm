@@ -566,7 +566,7 @@ fn install_options(s: &State, detail: &InstallDialog, t: Theme, k: &Kit) -> El {
                 })
                 .child(files(&detail.info, t, Some((&detail.selected_files, k)))),
         );
-    if !s.game_kind().is_xxmi() {
+    if s.game_kind().presentation().destination_override {
         content = content.child(
             col()
                 .w_full()

@@ -12,8 +12,8 @@ use anyhow::{Context, Result, ensure};
 
 use super::discovery::detect_steam_app;
 use super::{
-    FileMapping, GameKind, InstallPlan, LaunchCommand, common_wrapper, endfield, normalized_paths,
-    strip_wrapper, validate_plan, zzz,
+    FileMapping, GameAdapter, GameKind, InstallPlan, LaunchCommand, LaunchContext, common_wrapper,
+    endfield, normalized_paths, strip_wrapper, validate_plan, zzz,
 };
 
 #[derive(Clone, Copy)]
@@ -41,29 +41,75 @@ fn validate_destination(destination: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn plan(
-    kind: GameKind,
-    files: &[PathBuf],
-    slug: &str,
-    destination: Option<&Path>,
-) -> Result<InstallPlan> {
-    validate_destination(destination)?;
-    require_ini(kind, files.iter())?;
-    plan_mod_folder(files, slug)
+pub(super) struct XxmiAdapter {
+    app: SteamApp,
+    validate_setup: fn(&Path, &[PathBuf]) -> Result<()>,
 }
 
-pub(super) fn plan_bundle(
-    kind: GameKind,
-    packages: &[&[PathBuf]],
-    slug: &str,
-    destination: Option<&Path>,
-) -> Result<Vec<InstallPlan>> {
-    validate_destination(destination)?;
-    require_ini(kind, packages.iter().flat_map(|package| package.iter()))?;
-    packages
-        .iter()
-        .map(|files| plan_mod_folder(files, slug))
-        .collect()
+impl XxmiAdapter {
+    pub(super) const fn new(
+        app: SteamApp,
+        validate_setup: fn(&Path, &[PathBuf]) -> Result<()>,
+    ) -> Self {
+        Self { app, validate_setup }
+    }
+}
+
+impl GameAdapter for XxmiAdapter {
+    fn is_xxmi(&self) -> bool {
+        true
+    }
+
+    fn detect(&self) -> Result<Vec<PathBuf>> {
+        let app = self.app;
+        let steam_roots = detect_steam_app(app.id).unwrap_or_default();
+        let mut candidates = standard_xxmi_roots()
+            .into_iter()
+            .flat_map(|base| [base.join(app.importer).join("Mods"), base.join("Mods")])
+            .chain(steam_roots.into_iter().map(|root| root.join(app.importer).join("Mods")))
+            .filter(|path| is_importer_mods(path, app.kind))
+            .filter_map(|path| path.canonicalize().ok())
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.dedup();
+        Ok(candidates)
+    }
+
+    fn launch(&self, context: LaunchContext<'_>) -> Result<LaunchCommand> {
+        let args = ["--nogui", "--xxmi", self.app.importer].map(OsString::from).into();
+        xxmi_command(
+            Some(context.root),
+            context.xxmi,
+            context.wine,
+            context.wine_prefix,
+            args,
+        )
+        .map(|(command, _)| command)
+    }
+
+    fn validate_setup_root(&self, root: &Path, steam_game_roots: &[PathBuf]) -> Result<()> {
+        (self.validate_setup)(root, steam_game_roots)
+    }
+
+    fn plan(&self, files: &[PathBuf], slug: &str, destination: Option<&Path>) -> Result<InstallPlan> {
+        validate_destination(destination)?;
+        require_ini(self.app.kind, files.iter())?;
+        plan_mod_folder(files, slug)
+    }
+
+    fn plan_bundle(
+        &self,
+        packages: &[&[PathBuf]],
+        slug: &str,
+        destination: Option<&Path>,
+    ) -> Result<Vec<InstallPlan>> {
+        validate_destination(destination)?;
+        require_ini(self.app.kind, packages.iter().flat_map(|package| package.iter()))?;
+        packages
+            .iter()
+            .map(|files| plan_mod_folder(files, slug))
+            .collect()
+    }
 }
 
 fn require_ini<'a>(kind: GameKind, mut files: impl Iterator<Item = &'a PathBuf>) -> Result<()> {
@@ -106,34 +152,6 @@ pub fn deployed_path(path: &str, enabled: bool) -> String {
 
 pub fn reserved_slug(slug: &str) -> bool {
     slug.starts_with("disabled")
-}
-
-pub(super) fn detect(kind: GameKind) -> Result<Vec<PathBuf>> {
-    let app = steam_app(kind);
-    let steam_roots = detect_game(kind).unwrap_or_default();
-    let mut candidates = standard_xxmi_roots()
-        .into_iter()
-        .flat_map(|base| [base.join(app.importer).join("Mods"), base.join("Mods")])
-        .chain(steam_roots.into_iter().map(|root| root.join(app.importer).join("Mods")))
-        .filter(|path| is_importer_mods(path, kind))
-        .filter_map(|path| path.canonicalize().ok())
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
-    Ok(candidates)
-}
-
-pub(super) fn launch(
-    kind: GameKind,
-    root: &Path,
-    xxmi: Option<&Path>,
-    wine: Option<&Path>,
-    wine_prefix: Option<&Path>,
-) -> Result<LaunchCommand> {
-    let args = ["--nogui", "--xxmi", steam_app(kind).importer]
-        .map(OsString::from)
-        .into();
-    xxmi_command(Some(root), xxmi, wine, wine_prefix, args).map(|(command, _)| command)
 }
 
 fn steam_app(kind: GameKind) -> SteamApp {

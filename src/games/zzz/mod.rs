@@ -2,13 +2,28 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, ensure};
 
-use super::GameKind;
-use super::xxmi::{SteamApp, is_importer_mods};
+#[cfg(feature = "rune-ui")]
+use super::GamePresentation;
+use super::xxmi::{SteamApp, XxmiAdapter, is_importer_mods};
+use super::{GameKind, GameProfile};
+use crate::sources::Source;
 
-pub(super) const NAME: &str = "Zenless Zone Zero";
-pub(super) const NEXUS_GAME: &str = "zenlesszonezero";
-pub(super) const GAMEBANANA_GAME: &str = "19567";
-pub(super) const INSTALLATION_LABEL: &str = "ZZMI Mods folder";
+pub(super) const PROFILE: GameProfile = GameProfile {
+    id: "zzmi",
+    aliases: &[],
+    adapter: &XxmiAdapter::new(STEAM_APP, validate_installation_root),
+    name: "Zenless Zone Zero",
+    nexus: Some("zenlesszonezero"),
+    gamebanana: Some("19567"),
+    preferred_source: Source::GameBanana,
+    installation_label: "ZZMI Mods folder",
+    #[cfg(feature = "rune-ui")]
+    presentation: GamePresentation {
+        icon: include_bytes!("icon.png"),
+        setup_note: None,
+        destination_override: false,
+    },
+};
 #[cfg(all(feature = "rune-ui", target_os = "linux"))]
 pub(super) const PROCESS_NAME: &str = "ZenlessZoneZero";
 #[cfg(all(feature = "rune-ui", target_os = "linux"))]
@@ -25,7 +40,7 @@ pub(super) const STEAM_APP: SteamApp = SteamApp {
     ],
 };
 
-pub(super) fn validate_installation_root(root: &Path, steam_roots: &[PathBuf]) -> Result<()> {
+fn validate_installation_root(root: &Path, steam_roots: &[PathBuf]) -> Result<()> {
     if steam_roots.iter().any(|game| root.starts_with(game)) {
         ensure!(
             is_importer_mods(root, GameKind::Zzmi),

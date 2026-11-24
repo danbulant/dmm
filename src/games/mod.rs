@@ -8,85 +8,114 @@ use std::str::FromStr;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::archive::portable_path;
+use crate::archive::{ArchiveTree, portable_path, unpack};
 use crate::sources::Source;
 
 pub mod cp;
 pub mod discovery;
 mod endfield;
+mod ff7;
 pub mod xxmi;
 mod zzz;
 
-pub const SUPPORTED: [GameKind; 3] = [GameKind::Cyberpunk, GameKind::Zzmi, GameKind::Efmi];
+pub const SUPPORTED: [GameKind; 4] = [
+    GameKind::Cyberpunk,
+    GameKind::Zzmi,
+    GameKind::Efmi,
+    GameKind::Ff7Remake,
+];
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GameKind {
+    #[default]
     Cyberpunk,
     Zzmi,
     Efmi,
+    Ff7Remake,
 }
 
 impl FromStr for GameKind {
     type Err = String;
 
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().as_str() {
-            "cyberpunk" | "cyberpunk2077" => Ok(Self::Cyberpunk),
-            "zzmi" => Ok(Self::Zzmi),
-            "efmi" | "endfield" => Ok(Self::Efmi),
-            _ => Err(format!("unknown game kind: {value}")),
-        }
+        SUPPORTED
+            .into_iter()
+            .find(|kind| {
+                let profile = kind.profile();
+                value.eq_ignore_ascii_case(profile.id)
+                    || profile
+                        .aliases
+                        .iter()
+                        .any(|alias| value.eq_ignore_ascii_case(alias))
+            })
+            .ok_or_else(|| format!("unknown game kind: {value}"))
     }
 }
 
 impl fmt::Display for GameKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Cyberpunk => "cyberpunk",
-            Self::Zzmi => "zzmi",
-            Self::Efmi => "efmi",
-        })
+        f.write_str(self.profile().id)
     }
 }
 
+struct GameProfile {
+    id: &'static str,
+    aliases: &'static [&'static str],
+    adapter: &'static dyn GameAdapter,
+    name: &'static str,
+    nexus: Option<&'static str>,
+    gamebanana: Option<&'static str>,
+    preferred_source: Source,
+    installation_label: &'static str,
+    #[cfg(feature = "rune-ui")]
+    presentation: GamePresentation,
+}
+
+#[cfg(feature = "rune-ui")]
+pub struct GamePresentation {
+    pub icon: &'static [u8],
+    pub setup_note: Option<&'static str>,
+    pub destination_override: bool,
+}
+
 impl GameKind {
-    pub const fn display_name(self) -> &'static str {
+    const fn profile(self) -> &'static GameProfile {
         match self {
-            Self::Cyberpunk => cp::NAME,
-            Self::Zzmi => zzz::NAME,
-            Self::Efmi => endfield::NAME,
+            Self::Cyberpunk => &cp::PROFILE,
+            Self::Zzmi => &zzz::PROFILE,
+            Self::Efmi => &endfield::PROFILE,
+            Self::Ff7Remake => &ff7::PROFILE,
         }
     }
 
-    pub const fn is_xxmi(self) -> bool {
-        matches!(self, Self::Zzmi | Self::Efmi)
+    pub const fn display_name(self) -> &'static str {
+        self.profile().name
+    }
+
+    #[cfg(feature = "rune-ui")]
+    pub const fn presentation(self) -> &'static GamePresentation {
+        &self.profile().presentation
+    }
+
+    pub fn is_xxmi(self) -> bool {
+        self.profile().adapter.is_xxmi()
     }
 
     pub fn preferred_source(self) -> Source {
-        match self {
-            Self::Zzmi | Self::Efmi => Source::GameBanana,
-            Self::Cyberpunk => Source::Nexus,
-        }
+        self.profile().preferred_source
     }
 
     pub const fn source_game(self, source: Source) -> Option<&'static str> {
-        match (self, source) {
-            (Self::Cyberpunk, Source::Nexus) => Some(cp::NEXUS_GAME),
-            (Self::Cyberpunk, Source::GameBanana) => Some(cp::GAMEBANANA_GAME),
-            (Self::Zzmi, Source::Nexus) => Some(zzz::NEXUS_GAME),
-            (Self::Zzmi, Source::GameBanana) => Some(zzz::GAMEBANANA_GAME),
-            (Self::Efmi, Source::Nexus) | (_, Source::Local) => None,
-            (Self::Efmi, Source::GameBanana) => Some(endfield::GAMEBANANA_GAME),
+        match source {
+            Source::Nexus => self.profile().nexus,
+            Source::GameBanana => self.profile().gamebanana,
+            Source::Local => None,
         }
     }
 
     pub const fn installation_label(self) -> &'static str {
-        match self {
-            Self::Cyberpunk => cp::INSTALLATION_LABEL,
-            Self::Zzmi => zzz::INSTALLATION_LABEL,
-            Self::Efmi => endfield::INSTALLATION_LABEL,
-        }
+        self.profile().installation_label
     }
 }
 
@@ -112,6 +141,57 @@ pub struct InstallPlan {
     pub warnings: Vec<String>,
 }
 
+trait GameAdapter: Sync {
+    fn detect(&self) -> Result<Vec<PathBuf>>;
+
+    fn launch(&self, context: LaunchContext<'_>) -> Result<LaunchCommand>;
+
+    fn plan(&self, files: &[PathBuf], slug: &str, destination: Option<&Path>) -> Result<InstallPlan>;
+
+    fn plan_bundle(
+        &self,
+        packages: &[&[PathBuf]],
+        slug: &str,
+        destination: Option<&Path>,
+    ) -> Result<Vec<InstallPlan>> {
+        packages
+            .iter()
+            .map(|files| {
+                ensure!(!files.is_empty(), "cannot plan an installation with no files");
+                self.plan(files, slug, destination)
+            })
+            .collect()
+    }
+
+    fn is_xxmi(&self) -> bool {
+        false
+    }
+
+    fn validate_registration_root(&self, _root: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    fn validate_setup_root(&self, root: &Path, _steam_game_roots: &[PathBuf]) -> Result<()> {
+        self.validate_registration_root(root)
+    }
+
+    fn unpack_mod(
+        &self,
+        input: &Path,
+        scratch: &Path,
+        _filename: Option<&str>,
+    ) -> Result<ArchiveTree> {
+        unpack(input, scratch)
+    }
+}
+
+struct LaunchContext<'a> {
+    root: &'a Path,
+    xxmi: Option<&'a Path>,
+    wine: Option<&'a Path>,
+    wine_prefix: Option<&'a Path>,
+}
+
 pub fn plan(
     kind: GameKind,
     files: &[PathBuf],
@@ -122,10 +202,7 @@ pub fn plan(
     if files.is_empty() {
         bail!("cannot plan an installation with no files");
     }
-    match kind {
-        GameKind::Cyberpunk => cp::plan(files, slug, destination),
-        GameKind::Zzmi | GameKind::Efmi => xxmi::plan(kind, files, slug, destination),
-    }
+    kind.profile().adapter.plan(files, slug, destination)
 }
 pub fn plan_bundle(
     kind: GameKind,
@@ -133,13 +210,7 @@ pub fn plan_bundle(
     slug: &str,
     destination: Option<&Path>,
 ) -> Result<Vec<InstallPlan>> {
-    if kind.is_xxmi() {
-        return xxmi::plan_bundle(kind, packages, safe_slug(slug)?, destination);
-    }
-    packages
-        .iter()
-        .map(|files| plan(kind, files, slug, destination))
-        .collect()
+    kind.profile().adapter.plan_bundle(packages, safe_slug(slug)?, destination)
 }
 
 fn validate_plan(plan: InstallPlan) -> Result<InstallPlan> {
@@ -206,10 +277,7 @@ fn safe_slug(slug: &str) -> Result<&str> {
 }
 
 pub fn detect(kind: GameKind) -> Result<Vec<PathBuf>> {
-    match kind {
-        GameKind::Cyberpunk => cp::detect(),
-        GameKind::Zzmi | GameKind::Efmi => xxmi::detect(kind),
-    }
+    kind.profile().adapter.detect()
 }
 
 pub fn validate_installation_root(
@@ -217,11 +285,20 @@ pub fn validate_installation_root(
     root: &Path,
     steam_game_roots: &[PathBuf],
 ) -> Result<()> {
-    match kind {
-        GameKind::Cyberpunk => Ok(()),
-        GameKind::Zzmi => zzz::validate_installation_root(root, steam_game_roots),
-        GameKind::Efmi => endfield::validate_installation_root(root),
-    }
+    kind.profile().adapter.validate_setup_root(root, steam_game_roots)
+}
+
+pub(crate) fn validate_registration_root(kind: GameKind, root: &Path) -> Result<()> {
+    kind.profile().adapter.validate_registration_root(root)
+}
+
+pub(crate) fn unpack_mod(
+    kind: GameKind,
+    input: &Path,
+    scratch: &Path,
+    filename: Option<&str>,
+) -> Result<ArchiveTree> {
+    kind.profile().adapter.unpack_mod(input, scratch, filename)
 }
 
 #[derive(Debug)]
@@ -234,6 +311,16 @@ pub struct LaunchCommand {
 }
 
 impl LaunchCommand {
+    fn steam(app_id: u32) -> Self {
+        Self {
+            program: OsString::from(format!("steam://rungameid/{app_id}")),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            url: true,
+        }
+    }
+
     pub fn spawn(&self) -> Result<()> {
         if self.url {
             let value = self
@@ -287,10 +374,12 @@ pub fn launch(
             url: false,
         });
     }
-    match kind {
-        GameKind::Cyberpunk => Ok(cp::launch()),
-        GameKind::Zzmi | GameKind::Efmi => xxmi::launch(kind, root, xxmi, wine, wine_prefix),
-    }
+    kind.profile().adapter.launch(LaunchContext {
+        root,
+        xxmi,
+        wine,
+        wine_prefix,
+    })
 }
 
 #[cfg(test)]

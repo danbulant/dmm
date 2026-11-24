@@ -2,6 +2,7 @@ mod portable;
 mod rar;
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -101,6 +102,52 @@ pub fn unpack(input: &Path, scratch: &Path) -> anyhow::Result<ArchiveTree> {
     unpack_with_limits(input, scratch, MAX_FILES, MAX_ENTRIES, MAX_UNPACKED_BYTES)
 }
 
+pub(crate) fn copy_standalone(
+    input: &Path,
+    scratch: &Path,
+    filename: &OsStr,
+) -> anyhow::Result<ArchiveTree> {
+    let name = portable_path(Path::new(filename))?;
+    ensure!(
+        Path::new(&name).as_os_str() == filename && !name.contains('/'),
+        "standalone file name must be a single path component"
+    );
+    ensure!(
+        input_metadata(input)?.is_file(),
+        "input must be a regular file"
+    );
+    let temp_dir = import_dir(scratch)?;
+    let mut state = ExtractState::new(temp_dir.path(), MAX_FILES, MAX_ENTRIES, MAX_UNPACKED_BYTES);
+    state.write_file(&name, &mut File::open(input)?, None)?;
+    let files = state.files;
+    Ok(ArchiveTree {
+        _temp_dir: temp_dir,
+        files,
+    })
+}
+
+fn input_metadata(input: &Path) -> anyhow::Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(input)
+        .with_context(|| format!("cannot inspect input {}", input.display()))?;
+    ensure!(
+        !is_reparse_or_symlink(&metadata),
+        "input cannot be a symlink or reparse point"
+    );
+    Ok(metadata)
+}
+
+fn import_dir(scratch: &Path) -> anyhow::Result<TempDir> {
+    Builder::new()
+        .prefix("dmm-import-")
+        .tempdir_in(scratch)
+        .with_context(|| {
+            format!(
+                "cannot create private import directory in {}",
+                scratch.display()
+            )
+        })
+}
+
 fn unpack_with_limits(
     input: &Path,
     scratch: &Path,
@@ -108,12 +155,7 @@ fn unpack_with_limits(
     max_entries: usize,
     max_bytes: u64,
 ) -> anyhow::Result<ArchiveTree> {
-    let metadata = fs::symlink_metadata(input)
-        .with_context(|| format!("cannot inspect input {}", input.display()))?;
-    ensure!(
-        !is_reparse_or_symlink(&metadata),
-        "input cannot be a symlink or reparse point"
-    );
+    let metadata = input_metadata(input)?;
     if metadata.is_dir() {
         ensure!(
             !scratch.canonicalize()?.starts_with(input.canonicalize()?),
@@ -121,18 +163,7 @@ fn unpack_with_limits(
         );
     }
 
-    let temp = || {
-        Builder::new()
-            .prefix("dmm-import-")
-            .tempdir_in(scratch)
-            .with_context(|| {
-                format!(
-                    "cannot create private import directory in {}",
-                    scratch.display()
-                )
-            })
-    };
-    let temp_dir = temp()?;
+    let temp_dir = import_dir(scratch)?;
     let mut files = if metadata.is_dir() {
         let mut state = ExtractState::new(temp_dir.path(), max_files, max_entries, max_bytes);
         copy_directory(input, Path::new(""), &mut state)?;

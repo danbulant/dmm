@@ -215,12 +215,7 @@ fn game_select(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
     menu.build(k, layer)
 }
 pub(super) fn game_icon(s: &State, kind: Option<GameKind>, t: Theme) -> El {
-    let pixels = match kind {
-        Some(GameKind::Cyberpunk) => s.cyberpunk_icon.as_ref(),
-        Some(GameKind::Zzmi) => s.zzmi_icon.as_ref(),
-        Some(GameKind::Efmi) => s.efmi_icon.as_ref(),
-        None => None,
-    };
+    let pixels = kind.and_then(|kind| s.game_icons.get(&kind));
     let square = el()
         .size(24.0, 24.0)
         .clip_rounded(5.0)

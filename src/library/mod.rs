@@ -16,13 +16,14 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tempfile::{Builder, TempDir};
 
-use crate::archive::{ArchiveTree, portable_path, unpack};
+use crate::archive::{ArchiveTree, portable_path};
 use crate::deploy::{
     Deployment, FileChange, FileState, checked_root, clear_empty_folder, fingerprint, metadata,
     store_blob, target, verify_folder, verify_folder_layout,
 };
-use crate::games::xxmi;
-use crate::games::{GameKind, InstallPlan, plan, plan_bundle};
+use crate::games::{
+    GameKind, InstallPlan, plan, plan_bundle, unpack_mod, validate_registration_root, xxmi,
+};
 
 use crate::sources::{ModDetails, RemoteMod, SearchQuery, Source};
 
@@ -256,6 +257,7 @@ impl Library {
             .canonicalize()
             .with_context(|| format!("locating {}", root.display()))?;
         checked_root(&root)?;
+        validate_registration_root(kind, &root)?;
         ensure!(
             !trees_overlap(&self.state, &root),
             "library and game root must be separate directories"
@@ -419,7 +421,7 @@ impl Library {
         let instance = self.instance(instance)?;
         checked_root(&instance.root)?;
         let scratch = self.scratch()?;
-        let tree = unpack(input, scratch.path())?;
+        let tree = unpack_mod(instance.kind, input, scratch.path(), None)?;
         let plan = plan(instance.kind, &tree.files, slug, destination)?;
         let mods = self.mods(&instance.name)?;
         let existing = mods.iter().find(|record| record.slug == slug);
@@ -499,7 +501,12 @@ impl Library {
             );
         }
         let scratch = self.scratch()?;
-        let tree = unpack(input, scratch.path())?;
+        let tree = unpack_mod(
+            instance.kind,
+            input,
+            scratch.path(),
+            release.as_ref().map(|release| release.filename.as_str()),
+        )?;
         let destination = options.destination.or_else(|| {
             old.as_ref()
                 .and_then(|m| m.versions[m.current].destination.as_deref())
@@ -610,7 +617,9 @@ impl Library {
         let inputs = volumes::packages(archives, scratch.path())?;
         let trees = inputs
             .iter()
-            .map(|(input, _)| unpack(input, scratch.path()))
+            .map(|(input, release)| {
+                unpack_mod(instance.kind, input, scratch.path(), Some(&release.filename))
+            })
             .collect::<Result<Vec<_>>>()?;
         let packages = trees
             .iter()

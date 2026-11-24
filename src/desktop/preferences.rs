@@ -27,7 +27,7 @@ pub(super) struct BrowsePreferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
-            game: GameKind::Cyberpunk,
+            game: GameKind::default(),
             enable_new_mods: false,
             notify_downloads_complete: false,
             browse: Vec::new(),

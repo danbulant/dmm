@@ -430,6 +430,30 @@ fn catalog_loading_does_not_block_setup_or_local_import_controls() {
     assert!(runtime.find("local:path").is_some());
 }
 
+#[test]
+fn ff7_local_install_offers_a_file_picker_without_a_destination_override() {
+    let mut state = State::new(PathBuf::from("unused"));
+    state.public_game = GameKind::Ff7Remake;
+    assert!(
+        state.game_icons.contains_key(&state.game_kind()),
+        "FF7 icon did not load"
+    );
+    state.snapshot.selected = Some(Instance {
+        name: "ff7".into(),
+        kind: GameKind::Ff7Remake,
+        root: PathBuf::from("unused-game"),
+    });
+    state.screen = Screen::Local;
+    let mut runtime = Runtime::new(state, view, (960.0, 620.0), Env::new(true, 1.0));
+    runtime.frame(0.0);
+    let (x, y) = runtime.find("local:add").expect("local import action");
+    runtime.pointer_down(x, y);
+    runtime.pointer_up(x, y);
+    runtime.frame(1.0 / 60.0);
+    assert!(runtime.find("local:pick-file").is_some());
+    assert!(runtime.find("local:destination").is_none());
+}
+
 #[cfg(unix)]
 #[test]
 fn xxmi_launch_rejects_repeats_until_child_exits() {

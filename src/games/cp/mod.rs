@@ -1,36 +1,155 @@
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 
+#[cfg(feature = "rune-ui")]
+use super::GamePresentation;
 use super::discovery::detect_steam_app;
 use super::{
-    FileMapping, InstallPlan, LaunchCommand, Placement, common_wrapper, normalized_paths,
-    strip_wrapper, validate_plan,
+    FileMapping, GameAdapter, GameProfile, InstallPlan, LaunchCommand, LaunchContext, Placement,
+    common_wrapper, normalized_paths, strip_wrapper, validate_plan,
 };
 use crate::archive::portable_path;
+use crate::sources::Source;
 
-pub(super) const NAME: &str = "Cyberpunk 2077";
-pub(super) const NEXUS_GAME: &str = "cyberpunk2077";
-pub(super) const GAMEBANANA_GAME: &str = "8722";
-pub(super) const INSTALLATION_LABEL: &str = "Game installation folder";
-pub const SETUP_LAUNCH_NOTE: &str =
-    "Launch game opens the Steam-registered copy. The selected folder determines where DMM deploys mods.";
+pub(super) const PROFILE: GameProfile = GameProfile {
+    id: "cyberpunk",
+    aliases: &["cyberpunk2077"],
+    adapter: &Cyberpunk,
+    name: "Cyberpunk 2077",
+    nexus: Some("cyberpunk2077"),
+    gamebanana: Some("8722"),
+    preferred_source: Source::Nexus,
+    installation_label: "Game installation folder",
+    #[cfg(feature = "rune-ui")]
+    presentation: GamePresentation {
+        icon: include_bytes!("icon.png"),
+        setup_note: Some(
+            "Launch game opens the Steam-registered copy. The selected folder determines where DMM deploys mods.",
+        ),
+        destination_override: true,
+    },
+};
 
 const STEAM_APP_ID: u32 = 1_091_500;
 const RECOGNIZED_ROOTS: [&str; 6] = ["archive", "r6", "bin", "red4ext", "mods", "engine"];
 
-pub(super) fn detect() -> Result<Vec<PathBuf>> {
-    detect_steam_app(STEAM_APP_ID)
-}
+struct Cyberpunk;
 
-pub(super) fn launch() -> LaunchCommand {
-    LaunchCommand {
-        program: OsString::from(format!("steam://rungameid/{STEAM_APP_ID}")),
-        args: Vec::new(),
-        cwd: None,
-        env: Vec::new(),
-        url: true,
+impl GameAdapter for Cyberpunk {
+    fn detect(&self) -> Result<Vec<PathBuf>> {
+        detect_steam_app(STEAM_APP_ID)
+    }
+
+    fn launch(&self, _context: LaunchContext<'_>) -> Result<LaunchCommand> {
+        Ok(LaunchCommand::steam(STEAM_APP_ID))
+    }
+
+    fn plan(
+        &self,
+        files: &[PathBuf],
+        slug: &str,
+        override_dir: Option<&Path>,
+    ) -> Result<InstallPlan> {
+        let mut paths = normalized_paths(files)?;
+        let wrapper = common_wrapper(
+            paths
+                .iter()
+                .filter(|(_, path)| !documentation(path))
+                .map(|(_, path)| path.as_str()),
+        )
+        .filter(|wrapper| {
+            !RECOGNIZED_ROOTS
+                .iter()
+                .any(|root| root.eq_ignore_ascii_case(wrapper))
+        });
+        for (_, path) in &mut paths {
+            let relative = strip_wrapper(path, wrapper.as_deref());
+            if relative.len() != path.len() {
+                path.drain(..path.len() - relative.len());
+            }
+        }
+
+        let standalone_redmod = paths
+            .iter()
+            .any(|(_, path)| path.eq_ignore_ascii_case("info.json"))
+            && paths.iter().any(|(_, path)| {
+                path.split_once('/')
+                    .is_some_and(|(head, _)| head.eq_ignore_ascii_case("archive"))
+                    && extension(path).as_deref() == Some("archive")
+            });
+        let has_game_layout = !standalone_redmod
+            && paths.iter().any(|(_, path)| {
+                path.split_once('/').is_some_and(|(head, _)| {
+                    RECOGNIZED_ROOTS
+                        .iter()
+                        .any(|root| head.eq_ignore_ascii_case(root))
+                })
+            });
+        let (cet_root, redmod_root) = if has_game_layout {
+            (None, None)
+        } else {
+            let cet = package_root(&paths, "init.lua");
+            let redmod = package_root(&paths, "info.json");
+            ensure!(
+                cet.is_none() || redmod.is_none(),
+                "archive contains both CET and REDmod markers; select one package"
+            );
+            (cet.map(str::to_owned), redmod.map(str::to_owned))
+        };
+        let override_dir = override_dir
+            .map(portable_path)
+            .transpose()?
+            .map(PathBuf::from);
+        let mut plan = InstallPlan::default();
+        if !has_game_layout && cet_root.is_none() && redmod_root.is_none() {
+            plan.placement = Placement::Inferred;
+        }
+        for (source, path) in paths {
+            let rooted = if has_game_layout {
+                path.split_once('/').and_then(|(head, rest)| {
+                    RECOGNIZED_ROOTS
+                        .into_iter()
+                        .find(|root| head.eq_ignore_ascii_case(root))
+                        .map(|root| (root, rest))
+                })
+            } else {
+                None
+            };
+            if rooted.is_none() && cet_root.is_none() && redmod_root.is_none() && documentation(&path)
+            {
+                plan.warnings.push(format!(
+                    "Skipped documentation outside the game layout: {path}"
+                ));
+                continue;
+            }
+            let target = if let Some((root, rest)) = rooted {
+                PathBuf::from(root).join(rest)
+            } else if has_game_layout {
+                explicit_placement(&path, override_dir.as_deref(), &mut plan)?
+            } else if let Some(root) = &cet_root {
+                if let Some(inner) = strip_prefix_ci(&path, root) {
+                    PathBuf::from("bin/x64/plugins/cyber_engine_tweaks/mods")
+                        .join(slug)
+                        .join(inner)
+                } else {
+                    standalone_target(&path, slug, override_dir.as_deref(), &mut plan)?
+                }
+            } else if let Some(root) = &redmod_root {
+                if let Some(inner) = strip_prefix_ci(&path, root) {
+                    PathBuf::from("mods").join(slug).join(inner)
+                } else {
+                    standalone_target(&path, slug, override_dir.as_deref(), &mut plan)?
+                }
+            } else {
+                standalone_target(&path, slug, override_dir.as_deref(), &mut plan)?
+            };
+            plan.files.push(FileMapping {
+                source,
+                destination: target,
+            });
+        }
+        validate_plan(plan)
     }
 }
 
@@ -161,111 +280,6 @@ mod tests {
         );
         assert_eq!(strip_prefix_ci("éclair/file.lua", "x"), None);
     }
-}
-
-pub(super) fn plan(
-    files: &[PathBuf],
-    slug: &str,
-    override_dir: Option<&Path>,
-) -> Result<InstallPlan> {
-    let mut paths = normalized_paths(files)?;
-    let wrapper = common_wrapper(
-        paths
-            .iter()
-            .filter(|(_, path)| !documentation(path))
-            .map(|(_, path)| path.as_str()),
-    )
-    .filter(|wrapper| {
-        !RECOGNIZED_ROOTS
-            .iter()
-            .any(|root| root.eq_ignore_ascii_case(wrapper))
-    });
-    for (_, path) in &mut paths {
-        let relative = strip_wrapper(path, wrapper.as_deref());
-        if relative.len() != path.len() {
-            path.drain(..path.len() - relative.len());
-        }
-    }
-
-    let standalone_redmod = paths
-        .iter()
-        .any(|(_, path)| path.eq_ignore_ascii_case("info.json"))
-        && paths.iter().any(|(_, path)| {
-            path.split_once('/')
-                .is_some_and(|(head, _)| head.eq_ignore_ascii_case("archive"))
-                && extension(path).as_deref() == Some("archive")
-        });
-    let has_game_layout = !standalone_redmod
-        && paths.iter().any(|(_, path)| {
-            path.split_once('/').is_some_and(|(head, _)| {
-                RECOGNIZED_ROOTS
-                    .iter()
-                    .any(|root| head.eq_ignore_ascii_case(root))
-            })
-        });
-    let (cet_root, redmod_root) = if has_game_layout {
-        (None, None)
-    } else {
-        let cet = package_root(&paths, "init.lua");
-        let redmod = package_root(&paths, "info.json");
-        ensure!(
-            cet.is_none() || redmod.is_none(),
-            "archive contains both CET and REDmod markers; select one package"
-        );
-        (cet.map(str::to_owned), redmod.map(str::to_owned))
-    };
-    let override_dir = override_dir
-        .map(portable_path)
-        .transpose()?
-        .map(PathBuf::from);
-    let mut plan = InstallPlan::default();
-    if !has_game_layout && cet_root.is_none() && redmod_root.is_none() {
-        plan.placement = Placement::Inferred;
-    }
-    for (source, path) in paths {
-        let rooted = if has_game_layout {
-            path.split_once('/').and_then(|(head, rest)| {
-                RECOGNIZED_ROOTS
-                    .into_iter()
-                    .find(|root| head.eq_ignore_ascii_case(root))
-                    .map(|root| (root, rest))
-            })
-        } else {
-            None
-        };
-        if rooted.is_none() && cet_root.is_none() && redmod_root.is_none() && documentation(&path) {
-            plan.warnings.push(format!(
-                "Skipped documentation outside the game layout: {path}"
-            ));
-            continue;
-        }
-        let target = if let Some((root, rest)) = rooted {
-            PathBuf::from(root).join(rest)
-        } else if has_game_layout {
-            explicit_placement(&path, override_dir.as_deref(), &mut plan)?
-        } else if let Some(root) = &cet_root {
-            if let Some(inner) = strip_prefix_ci(&path, root) {
-                PathBuf::from("bin/x64/plugins/cyber_engine_tweaks/mods")
-                    .join(slug)
-                    .join(inner)
-            } else {
-                standalone_target(&path, slug, override_dir.as_deref(), &mut plan)?
-            }
-        } else if let Some(root) = &redmod_root {
-            if let Some(inner) = strip_prefix_ci(&path, root) {
-                PathBuf::from("mods").join(slug).join(inner)
-            } else {
-                standalone_target(&path, slug, override_dir.as_deref(), &mut plan)?
-            }
-        } else {
-            standalone_target(&path, slug, override_dir.as_deref(), &mut plan)?
-        };
-        plan.files.push(FileMapping {
-            source,
-            destination: target,
-        });
-    }
-    validate_plan(plan)
 }
 
 fn standalone_target(

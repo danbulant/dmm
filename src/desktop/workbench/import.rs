@@ -13,7 +13,7 @@ pub(super) fn local_import(s: &State, t: Theme, k: &Kit, instance: &str) -> El {
     let mut body = col().gap(8.0).child(heading("Install from local files", t));
     body = body.child(form_field(
         "local:path",
-        "Archive or folder path",
+        "Mod file or folder path",
         &s.local.input,
         k,
         t,
@@ -27,27 +27,29 @@ pub(super) fn local_import(s: &State, t: Theme, k: &Kit, instance: &str) -> El {
         t,
         |s| &mut s.local.slug,
     ));
-    body = body.child(form_field(
-        "local:destination",
-        "Optional destination override",
-        &s.local.destination,
-        k,
-        t,
-        |s| &mut s.local.destination,
-    ));
+    if s.game_kind().presentation().destination_override {
+        body = body.child(form_field(
+            "local:destination",
+            "Optional destination override",
+            &s.local.destination,
+            k,
+            t,
+            |s| &mut s.local.destination,
+        ));
+    }
     body = body.child(
         row()
             .gap(8.0)
             .child(button(
                 "local:pick-file",
-                "Choose archive",
+                "Choose mod file",
                 t,
                 false,
                 true,
                 |_, tx: &mut Tx| {
                     tx.open_file(
                         FileDialogOptions {
-                            title: "Choose mod archive".into(),
+                            title: "Choose mod file".into(),
                             ..Default::default()
                         },
                         |s: &mut State, result, _| match result {
@@ -126,7 +128,7 @@ pub(super) fn local_import(s: &State, t: Theme, k: &Kit, instance: &str) -> El {
             let slug = state.local.slug.text.trim().to_owned();
             let destination = nonempty_path(&state.local.destination.text);
             if input.as_os_str().is_empty() || slug.is_empty() {
-                state.notice = "Choose a local archive or folder and enter a mod name.".into();
+                state.notice = "Choose a mod file or folder and enter a mod name.".into();
                 return;
             }
             state.local.begin_preview(instance.clone());

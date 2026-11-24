@@ -5,7 +5,7 @@ use std::{sync::mpsc::Receiver, time::Duration};
 #[path = "../games/xxmi/setup_view.rs"]
 mod xxmi_setup;
 
-use dmm::games::{GameKind, cp, validate_installation_root};
+use dmm::games::{GameKind, validate_installation_root};
 #[cfg(target_os = "linux")]
 use dmm::games::xxmi::steam_xxmi::{InstallStage, SteamXxmi};
 use rune::tok::Theme;
@@ -163,13 +163,11 @@ pub(super) fn view(s: &State, t: Theme, k: &Kit) -> El {
     {
         body = body.child(muted("Automatic nxm:// link registration is not available on this platform. Use Downloads to paste the link manually.", t).wrap());
     }
-    match kind {
-        GameKind::Cyberpunk => {
-            body = body.child(muted(cp::SETUP_LAUNCH_NOTE, t).wrap());
-        }
-        GameKind::Zzmi | GameKind::Efmi => {
-            body = xxmi_setup::view(body, s, t, k, any);
-        }
+    if let Some(note) = kind.presentation().setup_note {
+        body = body.child(muted(note, t).wrap());
+    }
+    if kind.is_xxmi() {
+        body = xxmi_setup::view(body, s, t, k, any);
     }
     if s.setup.manual {
         body = body.child(manual_form(s, t, k));
@@ -219,7 +217,9 @@ fn register_game(s: &mut State, kind: GameKind) {
         .map(|game| game.root.clone()).collect::<Vec<_>>();
     s.submit("Adding installation…", move |dir| {
         let root = root.canonicalize()?;
-        validate_installation_root(kind, &root, &steam_roots)?;
+        if kind.is_xxmi() {
+            validate_installation_root(kind, &root, &steam_roots)?;
+        }
         let library = super::open_library(&dir)?;
         library.register(&name, kind, &root)?;
         library.use_installation(&name)?;

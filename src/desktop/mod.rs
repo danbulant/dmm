@@ -23,6 +23,7 @@ pub(crate) fn forward_nexus_handler(state_dir: &std::path::Path, uri: &str) -> R
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -32,7 +33,7 @@ use dmm::games::discovery::{DetectedGame, Discovery, discover};
 use dmm::games::xxmi::game_process::{RunningGames, running_games};
 #[cfg(target_os = "linux")]
 use dmm::games::xxmi::steam_xxmi::{Protontricks, SteamXxmi};
-use dmm::games::{GameKind, launch};
+use dmm::games::{GameKind, SUPPORTED, launch};
 use dmm::library::{Instance, LaunchSettings, Library, ManagedMod, RemoteModState, SavedFavorite};
 use dmm::sources::{RemoteMod, Source};
 use rune::{App, AppSpec, Pixels, Tx, Waker};
@@ -185,9 +186,7 @@ struct State {
     #[cfg(target_os = "linux")]
     protontricks: Option<Protontricks>,
     discovery_notices: Vec<(GameKind, String)>,
-    cyberpunk_icon: Option<Pixels>,
-    zzmi_icon: Option<Pixels>,
-    efmi_icon: Option<Pixels>,
+    game_icons: HashMap<GameKind, Pixels>,
     gamebanana_icon: Option<Pixels>,
     nexus_icon: Option<Pixels>,
     public_game: GameKind,
@@ -203,6 +202,8 @@ struct State {
 
 impl State {
     fn new(state_dir: PathBuf) -> Self {
+        let preferences = Preferences::default();
+        let public_game = preferences.game;
         Self {
             state_dir,
             worker: None,
@@ -220,7 +221,7 @@ impl State {
             nexus_listener: None,
             queue: Queue::default(),
             handoff_open: false,
-            preferences: Preferences::default(),
+            preferences,
             catalog_busy: None,
             notice: String::new(),
             screen: Screen::Explore,
@@ -235,13 +236,14 @@ impl State {
             #[cfg(target_os = "linux")]
             protontricks: None,
             discovery_notices: Vec::new(),
-            cyberpunk_icon: icon(include_bytes!("icons/cyberpunk.png")),
-            zzmi_icon: icon(include_bytes!("icons/zzmi.png")),
-            efmi_icon: icon(include_bytes!("icons/efmi.jpg")),
+            game_icons: SUPPORTED
+                .into_iter()
+                .filter_map(|kind| Some((kind, icon(kind.presentation().icon)?)))
+                .collect(),
             gamebanana_icon: icon(include_bytes!("icons/gamebanana.png")),
             nexus_icon: icon(include_bytes!("icons/nexus.png")),
-            public_game: GameKind::Cyberpunk,
-            public_sources: public_origins(GameKind::Cyberpunk),
+            public_game,
+            public_sources: public_origins(public_game),
             browser: Browser::default(),
             local: LocalForm::default(),
             detail: None,

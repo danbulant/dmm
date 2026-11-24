@@ -1,11 +1,14 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use dmm::games::GameKind;
-use dmm::library::{InstallOptions, Library, SavedSearch};
-use dmm::sources::{RemoteMod, SearchQuery, Sort, Source};
+use dmm::games::{GameKind, Placement};
+use dmm::library::{InstallOptions, Library, Release, SavedSearch};
+use dmm::sources::{ModDetails, RemoteMod, SearchQuery, Sort, Source};
 use tempfile::TempDir;
+use zip::ZipWriter;
+use zip::write::SimpleFileOptions;
 
 struct Fixture {
     dir: TempDir,
@@ -43,6 +46,126 @@ fn put(root: &Path, relative: &str, content: &str) -> Result<()> {
     let path = root.join(relative);
     fs::create_dir_all(path.parent().unwrap())?;
     fs::write(path, content)?;
+    Ok(())
+}
+
+#[test]
+fn ff7_pak_archive_installs_and_toggles_without_touching_stock_paks() -> Result<()> {
+    let f = Fixture::new()?;
+    let stock = "End/Content/Paks/pakchunk0-WindowsNoEditor.pak";
+    let deployed = f.root.join("End/Content/Paks/~mods/Cloud_P.PAK");
+    let invalid = f.root.join("End");
+    fs::create_dir(&invalid)?;
+    let library = Library::open(&f.state)?;
+    assert!(library.register("invalid", GameKind::Ff7Remake, &invalid).is_err());
+    drop(library);
+    put(&f.root, stock, "stock")?;
+    let mut library = f.library(GameKind::Ff7Remake)?;
+    let archive = f.dir.path().join("cloud.zip");
+    let mut zip = ZipWriter::new(fs::File::create(&archive)?);
+    for (name, contents) in [
+        ("Release/end/content/paks/~Mods/Cloud_P.PAK", "cloud"),
+        ("Release/end/content/paks/~Mods/Textures.pak", "textures"),
+        ("Release/readme.txt", "instructions"),
+    ] {
+        zip.start_file(name, SimpleFileOptions::default())?;
+        zip.write_all(contents.as_bytes())?;
+    }
+    zip.finish()?;
+    let preview = library.inspect("game", "cloud", &archive, None)?;
+    assert_eq!(preview.plan.placement, Placement::Layout);
+    assert_eq!(preview.plan.files.len(), 2);
+    assert_eq!(preview.plan.warnings.len(), 1);
+    library.install("game", "cloud", &archive, None, InstallOptions::default())?;
+    assert_eq!(fs::read_to_string(&deployed)?, "cloud");
+    assert_eq!(
+        fs::read_to_string(deployed.with_file_name("Textures.pak"))?,
+        "textures"
+    );
+    assert!(!deployed.with_file_name("readme.txt").exists());
+    library.toggle("game", "cloud", false, false, false)?;
+    assert!(!deployed.exists());
+    library.toggle("game", "cloud", true, false, false)?;
+    assert_eq!(fs::read_to_string(&deployed)?, "cloud");
+    library.remove("game", "cloud")?;
+    assert!(!deployed.exists());
+    assert_eq!(fs::read_to_string(f.root.join(stock))?, "stock");
+    Ok(())
+}
+
+#[test]
+fn ff7_pak_import_rejects_ambiguous_layouts_and_unsupported_payloads() -> Result<()> {
+    let f = Fixture::new()?;
+    fs::create_dir_all(f.root.join("End/Content/Paks"))?;
+    let mut library = f.library(GameKind::Ff7Remake)?;
+    let variants = f.input("variants", &[("A/Cloud.pak", "a"), ("B/CloudAlt.pak", "b")])?;
+    let hook = f.input(
+        "hook",
+        &[
+            ("Cloud.pak", "pak"),
+            ("End/Binaries/Win64/xinput1_3.dll", "dll"),
+        ],
+    )?;
+    let companion = f.input("companion", &[("Cloud.pak", "pak"), ("Cloud.utoc", "toc")])?;
+    for (input, reason) in [
+        (variants, "multiple folders"),
+        (hook, "xinput1_3.dll"),
+        (companion, "Cloud.utoc"),
+    ] {
+        let err = library
+            .install("game", "cloud", &input, None, InstallOptions::default())
+            .unwrap_err();
+        assert!(err.to_string().contains(reason), "{err:#}");
+    }
+    assert!(library.mods("game")?.is_empty());
+    assert!(!f.root.join("End/Content/Paks/~mods").exists());
+    Ok(())
+}
+
+#[test]
+fn ff7_loose_paks_use_local_and_provider_filenames() -> Result<()> {
+    let f = Fixture::new()?;
+    let mods = f.root.join("End/Content/Paks/~mods");
+    fs::create_dir_all(mods.parent().unwrap())?;
+    let mut library = f.library(GameKind::Ff7Remake)?;
+    let input = f.dir.path().join("Local_P.pak");
+    fs::write(&input, "local")?;
+    library.install("game", "local", &input, None, InstallOptions::default())?;
+    assert_eq!(fs::read_to_string(mods.join("Local_P.pak"))?, "local");
+
+    let details: ModDetails = serde_json::from_str(
+        r#"{"id":{"source":"nexus","game":"finalfantasy7remake","id":1},"name":"Cloud","images":[],"requirements":[],"files":[]}"#,
+    )?;
+    let download = f.dir.path().join("download");
+    fs::write(&download, "remote")?;
+    let mut release = Release {
+        id: details.id.clone(),
+        source_url: None,
+        file_id: 2,
+        filename: "../Remote_P.pak".into(),
+        version: None,
+        updated_at: None,
+    };
+    assert!(
+        library
+            .install_remote_bundle(
+                "game",
+                "remote",
+                &[(download.clone(), release.clone())],
+                &details,
+                InstallOptions::default(),
+            )
+            .is_err()
+    );
+    release.filename = "Remote_P.pak".into();
+    library.install_remote_bundle(
+        "game",
+        "remote",
+        &[(download, release)],
+        &details,
+        InstallOptions::default(),
+    )?;
+    assert_eq!(fs::read_to_string(mods.join("Remote_P.pak"))?, "remote");
     Ok(())
 }
 
