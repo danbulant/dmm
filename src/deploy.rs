@@ -332,7 +332,7 @@ pub(crate) fn clear_empty_folder(root: &Path) -> Result<()> {
             let path = entry?.path();
             ensure!(
                 metadata(&path)?.is_some_and(|meta| meta.is_dir()),
-                "unmanaged file in XXMI destination: {}",
+                "unmanaged file in destination folder: {}",
                 path.display()
             );
             dirs.push(path);

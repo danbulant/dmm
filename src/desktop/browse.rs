@@ -713,12 +713,10 @@ impl State {
     }
 
     pub(super) fn matches_instance(&self, id: &RemoteMod) -> bool {
-        self.snapshot.selected.is_some()
-            && self
-                .snapshot
-                .sources
-                .iter()
-                .any(|o| o.source == id.source && o.game == id.game)
+        self.snapshot
+            .selected
+            .as_ref()
+            .is_some_and(|instance| instance.kind.source_game(id.source) == Some(id.game.as_str()))
     }
 
     pub(super) fn installed_for(&self, id: &RemoteMod) -> Option<&ManagedMod> {

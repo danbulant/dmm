@@ -3,7 +3,6 @@ mod browse;
 mod components;
 mod download_queue;
 mod download_recovery;
-mod game_process;
 mod game_setup;
 mod installations;
 mod mod_card;
@@ -13,6 +12,8 @@ mod preferences;
 mod previews;
 mod shell;
 mod workbench;
+#[path = "../games/xxmi/launch_state.rs"]
+mod launch_state;
 
 #[cfg(target_os = "linux")]
 pub(crate) fn forward_nexus_handler(state_dir: &std::path::Path, uri: &str) -> Result<()> {
@@ -22,22 +23,16 @@ pub(crate) fn forward_nexus_handler(state_dir: &std::path::Path, uri: &str) -> R
 #[cfg(test)]
 mod tests;
 
-mod launcher_window;
-
-use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::process::Child;
-#[cfg(target_os = "linux")]
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::{Result, ensure};
 use dmm::acquisition::pending_pages;
 use dmm::games::discovery::{DetectedGame, Discovery, discover};
-use dmm::games::xxmi::launch_xxmi;
+use dmm::games::xxmi::game_process::{RunningGames, running_games};
 #[cfg(target_os = "linux")]
-use dmm::games::xxmi::steam_xxmi::{InstallStage, Protontricks, SteamXxmi};
-use dmm::games::{GameKind, GameProfile, launch_profile, profile};
+use dmm::games::xxmi::steam_xxmi::{Protontricks, SteamXxmi};
+use dmm::games::{GameKind, launch};
 use dmm::library::{Instance, LaunchSettings, Library, ManagedMod, RemoteModState, SavedFavorite};
 use dmm::sources::{RemoteMod, Source};
 use rune::{App, AppSpec, Pixels, Tx, Waker};
@@ -47,11 +42,11 @@ use url::Url;
 use backend::{Backend, Update, Worker, open_library};
 use browse::Browser;
 use components::icon;
-use game_process::{RunningGames, running_games};
 use download_queue::Queue;
 use game_setup::SetupForm;
 #[cfg(target_os = "linux")]
 use game_setup::SteamDialog;
+use launch_state::{XxmiGameStart, XxmiLaunch};
 use preferences::Preferences;
 use previews::{Previews, Size};
 use shell::view;
@@ -94,13 +89,10 @@ struct Origin {
 struct Snapshot {
     instances: Vec<Instance>,
     selected: Option<Instance>,
-    profiles: BTreeMap<String, Result<GameProfile, String>>,
     mods: Vec<ManagedMod>,
     remote_mods: Vec<RemoteModState>,
     favorites: Vec<SavedFavorite>,
     nexus_pages: Vec<Url>,
-    sources: Vec<Origin>,
-    profile_issue: Option<String>,
     launch: LaunchSettings,
 }
 
@@ -115,15 +107,6 @@ impl Snapshot {
             .map(|i| library.mods_with_sizes(&i.name))
             .transpose()?
             .unwrap_or_default();
-        let profiles: BTreeMap<_, _> = instances
-            .iter()
-            .map(|instance| {
-                (
-                    instance.name.clone(),
-                    instance.profile().map_err(|error| format!("{error:#}")),
-                )
-            })
-            .collect();
         let launch = selected
             .as_ref()
             .map(|i| library.launch_settings(&i.name))
@@ -134,21 +117,13 @@ impl Snapshot {
         } else {
             Vec::new()
         };
-        let (sources, profile_issue) = match selected.as_ref().and_then(|i| profiles.get(&i.name)) {
-            Some(Ok(game)) => (origins(game), None),
-            Some(Err(error)) => (Vec::new(), Some(format!("Game profile: {error}"))),
-            None => (Vec::new(), None),
-        };
         Ok(Self {
             instances,
             selected,
-            profiles,
             mods,
             remote_mods: library.remote_mod_states()?,
             favorites: library.saved_favorites()?,
             nexus_pages,
-            sources,
-            profile_issue,
             launch,
         })
     }
@@ -158,7 +133,7 @@ impl Snapshot {
     }
 }
 
-fn origins(game: &GameProfile) -> Vec<Origin> {
+fn public_origins(game: GameKind) -> Vec<Origin> {
     [Source::GameBanana, Source::Nexus]
         .into_iter()
         .filter_map(|source| {
@@ -168,86 +143,6 @@ fn origins(game: &GameProfile) -> Vec<Origin> {
             })
         })
         .collect()
-}
-
-fn public_origins(kind: GameKind) -> Vec<Origin> {
-    profile(kind).map(|game| origins(&game)).unwrap_or_default()
-}
-
-enum XxmiLaunch {
-    Idle,
-    Starting,
-    Running(Child, PathBuf),
-    Failed(String),
-}
-
-impl XxmiLaunch {
-    fn active(&self) -> bool {
-        matches!(self, Self::Starting | Self::Running(..))
-    }
-
-    fn label<'a>(&self, idle: &'a str) -> &'a str {
-        match self {
-            Self::Starting => "Starting XXMI…",
-            Self::Running(..) => "XXMI is running",
-            Self::Idle | Self::Failed(_) => idle,
-        }
-    }
-
-    fn poll(&mut self, tx: &mut Tx) -> bool {
-        let Self::Running(child, _) = self else {
-            return false;
-        };
-        *self = match child.try_wait() {
-            Ok(None) => {
-                tx.wake_after(Duration::from_millis(250));
-                return false;
-            }
-            Ok(Some(status)) if status.success() => Self::Idle,
-            Ok(Some(status)) => Self::Failed(format!("XXMI exited with {status}.")),
-            Err(error) => Self::Failed(format!("Could not check the XXMI process: {error}")),
-        };
-        true
-    }
-}
-
-struct XxmiGameStart {
-    kind: GameKind,
-    launcher: Option<Child>,
-    exited_at: Option<Instant>,
-    seen: Option<Instant>,
-}
-
-impl XxmiGameStart {
-    fn poll(&mut self, running: bool, now: Instant) -> Option<Option<String>> {
-        if running {
-            self.seen.get_or_insert(now);
-        }
-        if let Some(child) = &mut self.launcher {
-            match child.try_wait() {
-                Ok(None) => return None,
-                Ok(Some(status)) => {
-                    self.launcher = None;
-                    self.exited_at = Some(now);
-                    if !status.success() && self.seen.is_none() {
-                        return Some(Some(format!("XXMI exited with {status}. Check XXMI Launcher Log.txt.")));
-                    }
-                }
-                Err(error) => return Some(Some(format!("Could not check the XXMI process: {error}"))),
-            }
-        }
-        if let Some(seen) = self.seen {
-            if now.duration_since(seen) >= Duration::from_secs(15) {
-                return Some(None);
-            }
-            if !running {
-                return Some(Some(format!("{} exited shortly after starting. Check the game log.", self.kind.display_name())));
-            }
-        } else if self.exited_at.is_some_and(|exit| now.duration_since(exit) >= Duration::from_secs(5)) {
-            return Some(Some(format!("{} did not stay running after launch. Check the game and XXMI logs.", self.kind.display_name())));
-        }
-        None
-    }
 }
 
 struct State {
@@ -550,40 +445,6 @@ impl State {
         });
     }
 
-    fn game_is_starting(&self) -> bool {
-        self.xxmi_game_start.as_ref().is_some_and(|start| {
-            start.kind == self.game_kind() && start.seen.is_none()
-        })
-    }
-
-    fn poll_games(&mut self, tx: &mut Tx) -> bool {
-        if !cfg!(target_os = "linux") || (!self.game_kind().is_xxmi() && self.xxmi_game_start.is_none()) {
-            self.next_game_check = None;
-            return false;
-        }
-        let now = Instant::now();
-        if let Some(next) = self.next_game_check.filter(|next| *next > now) {
-            tx.wake_after(next.duration_since(now));
-            return false;
-        }
-        let running = running_games();
-        let mut changed = self.running_games != running;
-        self.running_games = running;
-        if let Some(start) = &mut self.xxmi_game_start
-            && let Some(notice) = start.poll(self.running_games.contains(start.kind), now)
-        {
-            self.xxmi_game_start = None;
-            if let Some(notice) = notice {
-                self.notice = notice;
-            }
-            changed = true;
-        }
-        let interval = Duration::from_secs(1);
-        self.next_game_check = Some(now + interval);
-        tx.wake_after(interval);
-        changed
-    }
-
     fn launch_game(&mut self) {
         let Some(instance) = self.snapshot.selected.clone() else {
             return;
@@ -596,96 +457,20 @@ impl State {
         }
         let LaunchSettings { xxmi, wine_prefix } = self.snapshot.launch.clone();
         self.submit("Launching game…", move |_| {
-            let command = instance.profile().and_then(|profile| {
-                launch_profile(&profile, &instance.root, xxmi.as_deref(), None, wine_prefix.as_deref(), &[])
-            });
+            let command = launch(
+                instance.kind,
+                &instance.root,
+                xxmi.as_deref(),
+                None,
+                wine_prefix.as_deref(),
+                &[],
+            );
             if instance.kind.is_xxmi() && cfg!(target_os = "linux") {
                 return Ok(Update::XxmiGameStarted(instance.kind, command.and_then(|command| command.spawn_process())));
             }
             command?.spawn()?;
             Ok(Update::Message("Game launch requested".into()))
         });
-    }
-
-    fn open_xxmi(&mut self) {
-        let root = self
-            .snapshot
-            .selected
-            .as_ref()
-            .map(|instance| instance.root.clone());
-        let LaunchSettings { xxmi, wine_prefix } = self.snapshot.launch.clone();
-        self.start_xxmi(move || {
-            let (command, exe) = launch_xxmi(root.as_deref(), xxmi.as_deref(), wine_prefix.as_deref())?;
-            Ok((command.spawn_process()?, exe))
-        });
-    }
-
-    fn start_xxmi(&mut self, start: impl FnOnce() -> Result<(Child, PathBuf)> + Send + 'static) {
-        if self.busy.is_some() || self.xxmi_launch.active() {
-            return;
-        }
-        self.submit("Starting XXMI…", move |_| {
-            let (child, exe) = start()?;
-            Ok(Update::XxmiStarted(child, exe))
-        });
-        self.xxmi_launch = if self.busy.is_some() {
-            XxmiLaunch::Starting
-        } else {
-            XxmiLaunch::Failed(self.notice.clone())
-        };
-    }
-
-    fn close_xxmi(&mut self) {
-        let XxmiLaunch::Running(child, exe) = &self.xxmi_launch else {
-            return;
-        };
-        let pid = child.id();
-        let exe = exe.clone();
-        self.submit("Closing XXMI…", move |_| {
-            launcher_window::close(pid, &exe)?;
-            Ok(Update::Message("XXMI close requested".into()))
-        });
-    }
-
-    #[cfg(target_os = "linux")]
-    fn install_steam_xxmi(&mut self, mut target: SteamXxmi) {
-        let Some(runner) = self.protontricks.clone() else {
-            return;
-        };
-        if self.busy.is_some() {
-            return;
-        }
-        let (updates, progress) = mpsc::channel();
-        self.submit(
-            "Setting up XXMI and Visual C++ in Steam Proton…",
-            move |_| {
-                let result = target
-                    .install(&runner, |stage| {
-                        let _ = updates.send(stage);
-                    })
-                    .map(|()| {
-                        target.installed = true;
-                        target
-                    });
-                Ok(Update::SteamXxmiInstalled(result))
-            },
-        );
-        self.setup.steam_dialog = Some(if self.busy.is_some() {
-            SteamDialog::Running {
-                stage: InstallStage::Preparing,
-                progress,
-            }
-        } else {
-            SteamDialog::Complete(Err(self.notice.clone()))
-        });
-    }
-
-    #[cfg(target_os = "linux")]
-    fn open_steam_xxmi(&mut self, target: SteamXxmi) {
-        let Some(runner) = self.protontricks.clone() else {
-            return;
-        };
-        self.start_xxmi(move || target.start_launcher(&runner));
     }
 
     fn set_screen(&mut self, screen: Screen, tx: &mut Tx) {
@@ -774,11 +559,7 @@ impl State {
     }
 
     fn available_sources(&self) -> &[Origin] {
-        if self.snapshot.selected.is_some() {
-            &self.snapshot.sources
-        } else {
-            &self.public_sources
-        }
+        &self.public_sources
     }
 
     fn origin(&self) -> Option<&Origin> {
@@ -817,15 +598,10 @@ impl State {
             let icons = self.browser.category_icons().map(|url| (url, Size::Icon));
             previews.show(downloads.chain(cards).chain(icons));
         } else if self.screen == Screen::Local {
-            let sources = if self.snapshot.selected.is_some() {
-                &self.snapshot.sources
-            } else {
-                &self.public_sources
-            };
             previews.show_saved(downloads.chain(workbench::preview_requests(
                 &self.local,
                 &self.snapshot,
-                sources,
+                &self.public_sources,
                 &self.queue,
             )));
         } else {
@@ -840,7 +616,6 @@ impl State {
         let old = self.snapshot.selected.as_ref().map(|i| &i.name);
         let next = snapshot.selected.as_ref().map(|i| &i.name);
         let changed = self.public_game != kind || old != next;
-        let sources_changed = self.snapshot.sources != snapshot.sources;
         if changed {
             self.detail_revision = self.detail_revision.wrapping_add(1);
             self.browser.install_dialog = None;
@@ -870,8 +645,6 @@ impl State {
             self.public_sources = public_origins(kind);
             self.local = LocalForm::default();
             self.setup = SetupForm::default();
-            self.change_origin(tx);
-        } else if sources_changed {
             self.change_origin(tx);
         }
         self.sync_previews();
@@ -985,12 +758,7 @@ impl State {
                 Ok(Update::XxmiStarted(child, exe)) => self.xxmi_launch = XxmiLaunch::Running(child, exe),
                 Ok(Update::XxmiGameStarted(kind, result)) => match result {
                     Ok(launcher) => {
-                        self.xxmi_game_start = Some(XxmiGameStart {
-                            kind,
-                            launcher: Some(launcher),
-                            exited_at: None,
-                            seen: None,
-                        });
+                        self.xxmi_game_start = Some(XxmiGameStart::new(kind, launcher));
                         self.next_game_check = None;
                     }
                     Err(error) => self.notice = format!("Could not launch {}: {error:#}", kind.display_name()),

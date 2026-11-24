@@ -1,5 +1,9 @@
 #[cfg(target_os = "linux")]
 pub mod steam_xxmi;
+#[cfg(feature = "rune-ui")]
+pub mod game_process;
+#[cfg(feature = "rune-ui")]
+pub mod launcher_window;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -7,13 +11,18 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 
 use super::discovery::detect_steam_app;
-use super::{GameKind, GameProfile, InstallPlan, LaunchCommand, plan_mod_folder};
+use super::{
+    FileMapping, GameKind, InstallPlan, LaunchCommand, common_wrapper, endfield, normalized_paths,
+    strip_wrapper, validate_plan, zzz,
+};
 
 #[derive(Clone, Copy)]
-struct SteamApp {
-    kind: GameKind,
-    id: u32,
-    importer: &'static str,
+pub(super) struct SteamApp {
+    pub(super) kind: GameKind,
+    pub(super) id: u32,
+    pub(super) importer: &'static str,
+    #[cfg(target_os = "linux")]
+    pub(super) executables: &'static [&'static str],
 }
 
 impl SteamApp {
@@ -22,18 +31,7 @@ impl SteamApp {
     }
 }
 
-const STEAM_APPS: [SteamApp; 2] = [
-    SteamApp {
-        kind: GameKind::Zzmi,
-        id: 4_162_040,
-        importer: "ZZMI",
-    },
-    SteamApp {
-        kind: GameKind::Efmi,
-        id: 4_732_690,
-        importer: "EFMI",
-    },
-];
+const STEAM_APPS: [SteamApp; 2] = [zzz::STEAM_APP, endfield::STEAM_APP];
 
 fn validate_destination(destination: Option<&Path>) -> Result<()> {
     ensure!(
@@ -44,45 +42,54 @@ fn validate_destination(destination: Option<&Path>) -> Result<()> {
 }
 
 pub(super) fn plan(
-    profile: &GameProfile,
+    kind: GameKind,
     files: &[PathBuf],
     slug: &str,
     destination: Option<&Path>,
 ) -> Result<InstallPlan> {
     validate_destination(destination)?;
-    plan_mod_folder(profile, files, slug, None, true)
+    require_ini(kind, files.iter())?;
+    plan_mod_folder(files, slug)
 }
 
 pub(super) fn plan_bundle(
-    profile: &GameProfile,
+    kind: GameKind,
     packages: &[&[PathBuf]],
     slug: &str,
     destination: Option<&Path>,
 ) -> Result<Vec<InstallPlan>> {
     validate_destination(destination)?;
-    if let Some(required_file) = profile
-        .required_file
-        .as_deref()
-        .filter(|file| !file.is_empty())
-    {
-        let suffix = format!(".{}", required_file.trim_start_matches('.')).to_ascii_lowercase();
-        ensure!(
-            packages
-                .iter()
-                .flat_map(|package| package.iter())
-                .any(|path| {
-                    path.to_string_lossy()
-                        .to_ascii_lowercase()
-                        .ends_with(&suffix)
-                }),
-            "{} mods must contain at least one {suffix} file",
-            profile.name
-        );
-    }
+    require_ini(kind, packages.iter().flat_map(|package| package.iter()))?;
     packages
         .iter()
-        .map(|files| plan_mod_folder(profile, files, slug, None, false))
+        .map(|files| plan_mod_folder(files, slug))
         .collect()
+}
+
+fn require_ini<'a>(kind: GameKind, mut files: impl Iterator<Item = &'a PathBuf>) -> Result<()> {
+    ensure!(
+        files.any(|path| path.to_str().is_some_and(|path| {
+            path.rsplit_once('.').is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("ini"))
+        })),
+        "{} mods must contain at least one .ini file",
+        kind.display_name()
+    );
+    Ok(())
+}
+
+fn plan_mod_folder(files: &[PathBuf], slug: &str) -> Result<InstallPlan> {
+    let paths = normalized_paths(files)?;
+    let wrapper = common_wrapper(paths.iter().map(|(_, path)| path.as_str()));
+    validate_plan(InstallPlan {
+        files: paths
+            .into_iter()
+            .map(|(source, path)| FileMapping {
+                source,
+                destination: Path::new(slug).join(strip_wrapper(&path, wrapper.as_deref())),
+            })
+            .collect(),
+        ..InstallPlan::default()
+    })
 }
 
 pub fn mod_folder(slug: &str, enabled: bool) -> String {
@@ -116,39 +123,16 @@ pub(super) fn detect(kind: GameKind) -> Result<Vec<PathBuf>> {
     Ok(candidates)
 }
 
-pub fn validate_installation_root(
-    kind: GameKind,
-    root: &Path,
-    steam_game_roots: &[PathBuf],
-) -> Result<()> {
-    match kind {
-        GameKind::Efmi => ensure!(
-            is_importer_mods(root, kind),
-            "Choose the EFMI Mods folder from an installed XXMI importer."
-        ),
-        GameKind::Zzmi if steam_game_roots.iter().any(|game| root.starts_with(game)) => ensure!(
-            is_importer_mods(root, kind),
-            "Choose the ZZMI Mods folder, not the Steam game installation."
-        ),
-        GameKind::Cyberpunk | GameKind::Generic | GameKind::Zzmi => {}
-    }
-    Ok(())
-}
-
 pub(super) fn launch(
-    profile: &GameProfile,
+    kind: GameKind,
     root: &Path,
     xxmi: Option<&Path>,
     wine: Option<&Path>,
     wine_prefix: Option<&Path>,
 ) -> Result<LaunchCommand> {
-    let args = profile
-        .settings
-        .launch
-        .arguments
-        .iter()
+    let args = ["--nogui", "--xxmi", steam_app(kind).importer]
         .map(OsString::from)
-        .collect();
+        .into();
     xxmi_command(Some(root), xxmi, wine, wine_prefix, args).map(|(command, _)| command)
 }
 
@@ -163,7 +147,7 @@ pub(super) fn detect_game(kind: GameKind) -> Result<Vec<PathBuf>> {
     detect_steam_app(steam_app(kind).id)
 }
 
-fn is_importer_mods(path: &Path, kind: GameKind) -> bool {
+pub(super) fn is_importer_mods(path: &Path, kind: GameKind) -> bool {
     let Some(package) = path.parent() else {
         return false;
     };
@@ -182,7 +166,7 @@ fn is_importer_mods(path: &Path, kind: GameKind) -> bool {
             includes_mods |= key.eq_ignore_ascii_case("include_recursive")
                 && value.eq_ignore_ascii_case("Mods");
             targets_endfield |= key.eq_ignore_ascii_case("target")
-                && value.eq_ignore_ascii_case("Endfield.exe");
+                && value.eq_ignore_ascii_case(endfield::EXE);
         }
     }
     includes_mods && (targets_endfield == (kind == GameKind::Efmi))
@@ -326,17 +310,16 @@ fn xxmi_command(
 mod tests {
     #[cfg(target_os = "linux")]
     use super::wine_prefix_for_launcher;
-    use super::{Path, PathBuf, validate_installation_root};
-    use crate::games::{GameKind, plan, profile};
+    use super::{Path, PathBuf};
+    use crate::games::{GameKind, plan, validate_installation_root};
 
     #[test]
     fn preserves_mod_assets_and_requires_ini() {
-        let profile = profile(GameKind::Zzmi).unwrap();
         let files = [
             PathBuf::from("wrapper/mod.ini"),
             PathBuf::from("wrapper/textures/body.dds"),
         ];
-        let folder = plan(&profile, &files, "skin", None).unwrap();
+        let folder = plan(GameKind::Zzmi, &files, "skin", None).unwrap();
         let paths: Vec<_> = folder
             .files
             .iter()
@@ -349,7 +332,7 @@ mod tests {
                 Path::new("skin/textures/body.dds")
             ]
         );
-        assert!(plan(&profile, &[PathBuf::from("texture.dds")], "skin", None).is_err());
+        assert!(plan(GameKind::Zzmi, &[PathBuf::from("texture.dds")], "skin", None).is_err());
     }
 
     #[test]

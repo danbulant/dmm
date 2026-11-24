@@ -5,34 +5,33 @@ use anyhow::{Context, Result, ensure};
 
 use super::discovery::detect_steam_app;
 use super::{
-    FileMapping, GameKind, GameProfile, InstallPlan, LaunchCommand, Placement, common_wrapper,
-    normalized_paths, profile, strip_wrapper, validate_plan,
+    FileMapping, InstallPlan, LaunchCommand, Placement, common_wrapper, normalized_paths,
+    strip_wrapper, validate_plan,
 };
 use crate::archive::portable_path;
 
-pub(super) const PROFILE: &str = include_str!("profile.toml");
+pub(super) const NAME: &str = "Cyberpunk 2077";
+pub(super) const NEXUS_GAME: &str = "cyberpunk2077";
+pub(super) const GAMEBANANA_GAME: &str = "8722";
+pub(super) const INSTALLATION_LABEL: &str = "Game installation folder";
+pub const SETUP_LAUNCH_NOTE: &str =
+    "Launch game opens the Steam-registered copy. The selected folder determines where DMM deploys mods.";
+
+const STEAM_APP_ID: u32 = 1_091_500;
+const RECOGNIZED_ROOTS: [&str; 6] = ["archive", "r6", "bin", "red4ext", "mods", "engine"];
 
 pub(super) fn detect() -> Result<Vec<PathBuf>> {
-    let app_id = profile(GameKind::Cyberpunk)?
-        .settings
-        .steam_app_id
-        .context("Cyberpunk profile has no Steam AppID")?;
-    detect_steam_app(app_id)
+    detect_steam_app(STEAM_APP_ID)
 }
 
-pub(super) fn launch(profile: &GameProfile) -> Result<LaunchCommand> {
-    let url = profile
-        .settings
-        .steam_url
-        .as_deref()
-        .context("Cyberpunk profile has no Steam URL")?;
-    Ok(LaunchCommand {
-        program: OsString::from(url),
+pub(super) fn launch() -> LaunchCommand {
+    LaunchCommand {
+        program: OsString::from(format!("steam://rungameid/{STEAM_APP_ID}")),
         args: Vec::new(),
         cwd: None,
         env: Vec::new(),
         url: true,
-    })
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -62,17 +61,16 @@ pub fn proton_diagnostics(root: &Path) -> Option<ProtonDiagnostics> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GameKind, Path, PathBuf, profile, strip_prefix_ci};
-    use crate::games::plan;
+    use super::{Path, PathBuf, strip_prefix_ci};
+    use crate::games::{GameKind, plan};
 
     #[test]
     fn cyberpunk_preserves_game_root_and_strips_wrapper_once() {
-        let profile = profile(GameKind::Cyberpunk).unwrap();
         let files = [
             PathBuf::from("Release/archive/pc/mod/body.archive"),
             PathBuf::from("Release/r6/tweaks/body.yaml"),
         ];
-        let plan = plan(&profile, &files, "body", None).unwrap();
+        let plan = plan(GameKind::Cyberpunk, &files, "body", None).unwrap();
         assert_eq!(
             plan.files
                 .iter()
@@ -84,7 +82,6 @@ mod tests {
 
     #[test]
     fn cyberpunk_places_standalone_formats_and_rejects_ambiguity() {
-        let profile = profile(GameKind::Cyberpunk).unwrap();
         let files = [
             "pack.archive",
             "pack.xl",
@@ -93,7 +90,7 @@ mod tests {
             "settings.tweak",
         ]
         .map(PathBuf::from);
-        let inferred = plan(&profile, &files, "mod", None).unwrap();
+        let inferred = plan(GameKind::Cyberpunk, &files, "mod", None).unwrap();
         assert_eq!(
             inferred
                 .files
@@ -108,10 +105,10 @@ mod tests {
                 "r6/tweaks/settings.tweak"
             ]
         );
-        assert!(plan(&profile, &[PathBuf::from("plugin.dll")], "mod", None).is_err());
+        assert!(plan(GameKind::Cyberpunk, &[PathBuf::from("plugin.dll")], "mod", None).is_err());
         assert!(
             plan(
-                &profile,
+                GameKind::Cyberpunk,
                 &[PathBuf::from("plugin.dll")],
                 "mod",
                 Some(Path::new("bin/x64/plugins"))
@@ -122,12 +119,11 @@ mod tests {
 
     #[test]
     fn cyberpunk_detects_cet_and_redmod_package_layouts() {
-        let profile = profile(GameKind::Cyberpunk).unwrap();
         let cet = [
             PathBuf::from("Ellen/init.lua"),
             PathBuf::from("Ellen/scripts/main.lua"),
         ];
-        let cet_plan = plan(&profile, &cet, "ellen", None).unwrap();
+        let cet_plan = plan(GameKind::Cyberpunk, &cet, "ellen", None).unwrap();
         assert_eq!(
             cet_plan
                 .files
@@ -144,7 +140,7 @@ mod tests {
             PathBuf::from("Package/info.json"),
             PathBuf::from("Package/archive/base.archive"),
         ];
-        let plan = plan(&profile, &redmod, "package", None).unwrap();
+        let plan = plan(GameKind::Cyberpunk, &redmod, "package", None).unwrap();
         assert_eq!(
             plan.files
                 .iter()
@@ -168,13 +164,11 @@ mod tests {
 }
 
 pub(super) fn plan(
-    profile: &GameProfile,
     files: &[PathBuf],
     slug: &str,
     override_dir: Option<&Path>,
 ) -> Result<InstallPlan> {
     let mut paths = normalized_paths(files)?;
-    let recognized = &profile.settings.installation.recognized_roots;
     let wrapper = common_wrapper(
         paths
             .iter()
@@ -182,12 +176,15 @@ pub(super) fn plan(
             .map(|(_, path)| path.as_str()),
     )
     .filter(|wrapper| {
-        !recognized
+        !RECOGNIZED_ROOTS
             .iter()
             .any(|root| root.eq_ignore_ascii_case(wrapper))
     });
     for (_, path) in &mut paths {
-        *path = strip_wrapper(path, wrapper.as_deref());
+        let relative = strip_wrapper(path, wrapper.as_deref());
+        if relative.len() != path.len() {
+            path.drain(..path.len() - relative.len());
+        }
     }
 
     let standalone_redmod = paths
@@ -201,7 +198,7 @@ pub(super) fn plan(
     let has_game_layout = !standalone_redmod
         && paths.iter().any(|(_, path)| {
             path.split_once('/').is_some_and(|(head, _)| {
-                recognized
+                RECOGNIZED_ROOTS
                     .iter()
                     .any(|root| head.eq_ignore_ascii_case(root))
             })
@@ -228,8 +225,8 @@ pub(super) fn plan(
     for (source, path) in paths {
         let rooted = if has_game_layout {
             path.split_once('/').and_then(|(head, rest)| {
-                recognized
-                    .iter()
+                RECOGNIZED_ROOTS
+                    .into_iter()
                     .find(|root| head.eq_ignore_ascii_case(root))
                     .map(|root| (root, rest))
             })

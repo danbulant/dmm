@@ -2,6 +2,34 @@ use super::*;
 use crate::acquisition::pending_pages;
 
 #[test]
+fn legacy_descriptors_do_not_block_builtin_installations() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let state = dir.path().join("state");
+    let root = dir.path().join("cyberpunk");
+    let custom = dir.path().join("custom");
+    fs::create_dir(&root)?;
+    fs::create_dir(&custom)?;
+    let library = Library::open(&state)?;
+    for (name, kind, root) in [("cp", "cyberpunk", &root), ("custom", "generic", &custom)] {
+        library.db.execute(
+            "INSERT INTO instances VALUES (?1, ?2)",
+            params![name, serde_json::json!({
+                "name": name,
+                "kind": kind,
+                "root": root,
+                "profile": dir.path().join("missing.toml"),
+            }).to_string()],
+        )?;
+    }
+
+    assert_eq!(library.instances()?.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(), ["cp"]);
+    library.use_installation("cp")?;
+    assert_eq!(library.active_installation(GameKind::Cyberpunk)?.as_deref(), Some("cp"));
+    assert!(library.register("other", GameKind::Cyberpunk, &custom).is_err());
+    Ok(())
+}
+
+#[test]
 fn bookmark_migration_drops_only_unnamed_legacy_rows() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let db = Connection::open(dir.path().join("library.sqlite3"))?;
@@ -77,7 +105,7 @@ fn reopening_rolls_back_a_partially_applied_deployment() -> Result<()> {
     let state = dir.path().join("state");
     fs::create_dir(&root)?;
     let lib = Library::open(&state)?;
-    let instance = lib.register("game", GameKind::Generic, &root, None)?;
+    let instance = lib.register("game", GameKind::Cyberpunk, &root)?;
     let path = instance.root.join("first");
     let payload = dir.path().join("payload");
     fs::write(&path, b"unmanaged original")?;
@@ -123,7 +151,7 @@ fn reopening_rolls_back_an_xxmi_rename_without_reverting_edits() -> Result<()> {
     fs::create_dir(&input)?;
     fs::write(input.join("skin.ini"), "original")?;
     let mut lib = Library::open(&state)?;
-    let instance = lib.register("game", GameKind::Zzmi, &root, None)?;
+    let instance = lib.register("game", GameKind::Zzmi, &root)?;
     lib.install("game", "skin", &input, None, Default::default())?;
     let before = root.join("skin");
     let after = root.join("DISABLED_skin");
@@ -162,7 +190,7 @@ fn remote_bundle_plans_each_archive_and_records_offline_metadata() -> Result<()>
     tar_fixture(&patch, "different-wrapper/patch.yaml", b"patch")?;
 
     let mut library = Library::open(&state)?;
-    library.register("game", GameKind::Cyberpunk, &root, None)?;
+    library.register("game", GameKind::Cyberpunk, &root)?;
     let id = RemoteMod {
         source: Source::Nexus,
         game: "cyberpunk2077".to_owned(),
@@ -250,13 +278,12 @@ fn remote_bundle_plans_each_archive_and_records_offline_metadata() -> Result<()>
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([10, 11])
     );
-    let zzmi = profile(GameKind::Zzmi)?;
     let packages = [
         vec![PathBuf::from("main/base.ini")],
         vec![PathBuf::from("patch/textures.dds")],
     ];
     let packages = packages.iter().map(Vec::as_slice).collect::<Vec<_>>();
-    assert!(plan_bundle(&zzmi, &packages, "bundle", None).is_ok());
+    assert!(plan_bundle(GameKind::Zzmi, &packages, "bundle", None).is_ok());
     Ok(())
 }
 
@@ -269,8 +296,8 @@ fn nexus_bundle_retains_received_parts_across_restart_and_can_be_replaced() -> R
     fs::create_dir(&game)?;
     fs::create_dir(&other)?;
     let library = Library::open(&state)?;
-    library.register("cp", GameKind::Cyberpunk, &game, None)?;
-    library.register("other", GameKind::Cyberpunk, &other, None)?;
+    library.register("cp", GameKind::Cyberpunk, &game)?;
+    library.register("other", GameKind::Cyberpunk, &other)?;
     let details: ModDetails = serde_json::from_str(
         r#"{"id":{"source":"nexus","game":"cyberpunk2077","id":9},"name":"Bundle","images":[],"requirements":[],"files":[]}"#,
     )?;

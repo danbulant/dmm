@@ -115,10 +115,10 @@ pub fn run_remote(
     control.check()?;
     let (slug, releases) = {
         let library = Library::open_wait(state_dir, Duration::from_secs(5))?;
-        let profile = library.instance(instance)?.profile()?;
-        let game = profile
+        let kind = library.instance(instance)?.kind;
+        let game = kind
             .source_game(details.id.source)
-            .with_context(|| format!("this profile has no {} game ID", details.id.source))?;
+            .with_context(|| format!("{} has no {} game ID", kind.display_name(), details.id.source))?;
         ensure!(
             game == details.id.game.as_str(),
             "selected mod is for {}, but instance {instance} uses {}",
@@ -460,10 +460,10 @@ pub fn install_remote(
         files.iter().all(|file| selected_ids.insert(file.id)),
         "a provider file was selected more than once"
     );
-    let profile = library.instance(instance)?.profile()?;
-    let game = profile
+    let kind = library.instance(instance)?.kind;
+    let game = kind
         .source_game(details.id.source)
-        .with_context(|| format!("this profile has no {} game ID", details.id.source))?;
+        .with_context(|| format!("{} has no {} game ID", kind.display_name(), details.id.source))?;
     ensure!(
         game == details.id.game.as_str(),
         "selected mod is for {}, but instance {instance} uses {}",

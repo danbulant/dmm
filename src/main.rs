@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use dmm::games::{GameKind, cp, detect, launch_profile};
+use dmm::games::{GameKind, cp, detect, launch};
 use dmm::library::{InstallOptions, Library};
 use dmm::sources::{RemoteMod, Source};
 use serde::Serialize;
@@ -45,8 +45,6 @@ enum Command {
         name: String,
         kind: GameKind,
         root: PathBuf,
-        #[arg(long)]
-        profile: Option<PathBuf>,
     },
     Games,
     /// Preview mappings and collisions without deploying anything.
@@ -227,12 +225,7 @@ fn absolute_env_path(name: &str) -> Option<PathBuf> {
 fn with_library(state: &Path, command: Command) -> Result<()> {
     let mut library = Library::open(state)?;
     match command {
-        Command::AddGame {
-            name,
-            kind,
-            root,
-            profile,
-        } => print(&library.register(&name, kind, &root, profile.as_deref())?),
+        Command::AddGame { name, kind, root } => print(&library.register(&name, kind, &root)?),
         Command::Games => print(&library.instances()?),
         Command::Inspect {
             instance,
@@ -266,19 +259,19 @@ fn with_library(state: &Path, command: Command) -> Result<()> {
             xxmi,
             wine,
             wine_prefix,
-            plan,
+            plan: preview,
             custom,
         } => {
             let instance = library.instance(&instance)?;
-            let command = launch_profile(
-                &instance.profile()?,
+            let command = launch(
+                instance.kind,
                 &instance.root,
                 xxmi.as_deref(),
                 wine.as_deref(),
                 wine_prefix.as_deref(),
                 &custom,
             )?;
-            if plan {
+            if preview {
                 println!("{command:?}");
                 Ok(())
             } else {

@@ -36,7 +36,7 @@ impl Installation<'_> {
                 } else {
                     base
                 };
-                library.register(&name, kind, root, None)?.name
+                library.register(&name, kind, root)?.name
             }
         };
         library.use_installation(&name)?;
@@ -104,7 +104,7 @@ pub(super) fn select(library: &Library, kind: GameKind, root: &Path) -> Result<S
 }
 
 fn valid(instance: &Instance) -> bool {
-    instance.root.is_dir() && instance.profile().is_ok()
+    instance.root.is_dir()
 }
 
 #[cfg(test)]

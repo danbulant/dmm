@@ -1,13 +1,13 @@
 # DMM
 
-A simple graphical mod manager for Zenless Zone Zero and Cyberpunk 2077, on Windows and Linux. Supports Game Banana and Nexus Mods.
+A simple graphical mod manager for Zenless Zone Zero, Arknights: Endfield and Cyberpunk 2077, on Windows and Linux. Supports Game Banana and Nexus Mods.
 
 ![](./screenshots/zzz.png)
 
 Features:
 
 - Online mod download from Game Banana and Nexus Mods (requires opening the browser)
-- Setup ZZMI/XXMI (ZZZ mod loader)
+- Setup ZZMI/EFMI/XXMI (ZZZ/Endfield mod loader)
 - Linux support (currently only tested on NixOS and Steam versions)
 
 Check releases for downloads.

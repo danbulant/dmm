@@ -16,7 +16,7 @@ use tempfile::Builder;
 use url::Url;
 
 use super::{LaunchCommand, STEAM_APPS, SteamApp};
-use crate::{archive, games::GameKind};
+use crate::{archive, games::{GameKind, zzz}};
 
 const FLATPAK_ID: &str = "com.github.Matoking.protontricks";
 const RELEASE: &str = "https://api.github.com/repos/SpectrumQT/XXMI-Launcher/releases/latest";
@@ -34,6 +34,11 @@ pub struct SteamXxmi {
     pub initialized: bool,
     pub installed: bool,
     steam: PathBuf,
+}
+
+pub struct SteamPlayOption {
+    pub command: String,
+    pub instructions: [&'static str; 2],
 }
 
 #[derive(Clone, Copy)]
@@ -131,12 +136,23 @@ impl SteamXxmi {
         self.compatdata.join(PORTABLE_DIR).join(PORTABLE_EXE)
     }
 
-    pub fn steam_play_option(&self) -> Option<String> {
+    pub fn steam_play_option(&self) -> Option<SteamPlayOption> {
         if !self.installed || self.kind() != GameKind::Zzmi {
             return None;
         }
-        let executable = self.executable();
-        Some(zzz_steam_play_option(executable.to_str()?))
+        Some(SteamPlayOption {
+            command: zzz::steam_play_option(self.executable().to_str()?),
+            instructions: zzz::STEAM_PLAY_INSTRUCTIONS,
+        })
+    }
+
+    pub fn windows_game_folder(&self, launcher: &Self) -> Result<String> {
+        let folder = self.app.executables.iter().find_map(|exe| {
+            let path = self.game.join(exe);
+            path.parent().filter(|_| path.is_file()).map(Path::to_owned)
+        }).context("the game executable was not found")?;
+        windows_game_folder(&launcher.compatdata.join("pfx"), &folder)
+            .with_context(|| format!("no Proton drive maps to {}", folder.display()))
     }
 
     fn command(
@@ -259,11 +275,38 @@ impl SteamXxmi {
     }
 }
 
-fn zzz_steam_play_option(executable: &str) -> String {
-    let quoted = executable.replace('\'', "'\\''");
-    format!(
-        r#"bash -c 'launcher=$1; shift; args=("$@"); for i in "${{!args[@]}}"; do if [[ ${{args[i]}} == */HYP.exe ]]; then args[i]=$launcher; exec "${{args[@]}}"; fi; done; echo "HYP.exe not found in Steam launch command" >&2; exit 1' _ '{quoted}' %command%"#
-    )
+
+#[cfg(target_os = "linux")]
+fn windows_game_folder(prefix: &Path, folder: &Path) -> Option<String> {
+    let folder = folder.canonicalize().ok()?;
+    let mappings = fs::read_dir(prefix.join("dosdevices")).ok()?;
+    mappings
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            let [letter, b':'] = name.as_encoded_bytes() else {
+                return None;
+            };
+            if !letter.is_ascii_alphabetic() {
+                return None;
+            }
+            let root = entry.path().canonicalize().ok()?;
+            let relative = folder.strip_prefix(root).ok()?;
+            Some((relative, letter.to_ascii_uppercase()))
+        })
+        .min_by(|(a, drive_a), (b, drive_b)| {
+            a.as_os_str()
+                .len()
+                .cmp(&b.as_os_str().len())
+                .then(drive_a.cmp(drive_b))
+        })
+        .map(|(relative, drive)| {
+            format!(
+                "{}:\\{}",
+                char::from(drive),
+                relative.to_string_lossy().replace('/', "\\")
+            )
+        })
 }
 
 fn install_lock(compatdata: &Path) -> Result<File> {
@@ -448,7 +491,7 @@ mod tests {
     #[test]
     fn steam_play_option_replaces_only_hoyoplay() -> Result<()> {
         let executable = "/games/Dan's Library/XXMI Launcher.exe";
-        let option = zzz_steam_play_option(executable);
+        let option = zzz::steam_play_option(executable);
         let run = |original| {
             Command::new("bash")
                 .arg("-c")
@@ -526,6 +569,33 @@ mod tests {
             key == "STEAM_COMPAT_DATA_PATH"
                 && value == Some(OsStr::new("/steam/steamapps/compatdata/4732690"))
         }));
+    }
+
+    #[test]
+    fn endfield_game_folder_uses_reused_launchers_proton_drive_mapping() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let game = temp.path().join("Arknights Endfield");
+        fs::create_dir(&game)?;
+        fs::write(game.join("Endfield.exe"), [])?;
+        let target = SteamXxmi {
+            app: steam_app(GameKind::Efmi),
+            game,
+            compatdata: temp.path().join("endfield-prefix"),
+            steam: temp.path().to_owned(),
+            initialized: false,
+            installed: false,
+        };
+        let launcher = SteamXxmi {
+            app: steam_app(GameKind::Zzmi),
+            compatdata: temp.path().join("zzz-prefix"),
+            installed: true,
+            ..target.clone()
+        };
+        let drives = launcher.compatdata.join("pfx/dosdevices");
+        fs::create_dir_all(&drives)?;
+        std::os::unix::fs::symlink(temp.path(), drives.join("d:"))?;
+        assert_eq!(target.windows_game_folder(&launcher)?, "D:\\Arknights Endfield");
+        Ok(())
     }
 
     #[test]

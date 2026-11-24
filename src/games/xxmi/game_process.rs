@@ -1,4 +1,6 @@
-use dmm::games::GameKind;
+use crate::games::GameKind;
+#[cfg(target_os = "linux")]
+use crate::games::{endfield, zzz};
 
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -6,28 +8,28 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Default, PartialEq, Eq)]
-pub(super) struct RunningGames {
+pub struct RunningGames {
     zzmi: bool,
     efmi: bool,
 }
 
 impl RunningGames {
-    pub(super) fn contains(&self, kind: GameKind) -> bool {
+    pub fn contains(&self, kind: GameKind) -> bool {
         match kind {
             GameKind::Zzmi => self.zzmi,
             GameKind::Efmi => self.efmi,
-            GameKind::Cyberpunk | GameKind::Generic => false,
+            GameKind::Cyberpunk => false,
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn running_games() -> RunningGames {
+pub fn running_games() -> RunningGames {
     scan(Path::new("/proc"))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(super) fn running_games() -> RunningGames {
+pub fn running_games() -> RunningGames {
     RunningGames::default()
 }
 
@@ -45,14 +47,15 @@ fn scan(proc: &Path) -> RunningGames {
         path.push("comm");
         if let Ok(comm) = fs::read_to_string(&path) {
             match comm.trim_end() {
-                "Endfield.exe" => running.efmi = true,
-                "ZenlessZoneZero" if !running.zzmi => {
+                endfield::EXE => running.efmi = true,
+                zzz::PROCESS_NAME if !running.zzmi => {
                     // Linux truncates Wine's executable name to 15 bytes in comm.
                     path.set_file_name("maps");
                     running.zzmi = fs::read_to_string(&path).is_ok_and(|maps| {
                         maps.lines().any(|line| {
-                            line.ends_with("/ZenlessZoneZero.exe")
-                                || line.ends_with("/ZenlessZoneZeroBeta.exe")
+                            zzz::PROCESS_IMAGES.iter().any(|exe| {
+                                line.strip_suffix(*exe).is_some_and(|path| path.ends_with('/'))
+                            })
                         })
                     });
                 }

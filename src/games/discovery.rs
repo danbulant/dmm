@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use super::GameKind;
+use super::{GameKind, SUPPORTED, xxmi};
 
 #[derive(Clone, Debug)]
 pub struct DetectedGame {
@@ -21,15 +21,9 @@ pub struct Discovery {
     pub notices: Vec<(GameKind, String)>,
 }
 
-pub const SUPPORTED: [(GameKind, &str); 3] = [
-    (GameKind::Cyberpunk, GameKind::Cyberpunk.display_name()),
-    (GameKind::Zzmi, GameKind::Zzmi.display_name()),
-    (GameKind::Efmi, GameKind::Efmi.display_name()),
-];
-
 pub fn discover() -> Discovery {
     let mut found = Discovery::default();
-    for (kind, label) in SUPPORTED {
+    for kind in SUPPORTED {
         match super::detect(kind) {
             Ok(roots) => found
                 .games
@@ -37,11 +31,11 @@ pub fn discover() -> Discovery {
                     kind,
                     root: root.canonicalize().unwrap_or(root),
                 })),
-            Err(error) => found.notices.push((kind, format!("{label}: {error:#}"))),
+            Err(error) => found.notices.push((kind, format!("{}: {error:#}", kind.display_name()))),
         }
     }
-    for kind in [GameKind::Zzmi, GameKind::Efmi] {
-        match super::xxmi::detect_game(kind) {
+    for kind in SUPPORTED.into_iter().filter(|kind| kind.is_xxmi()) {
+        match xxmi::detect_game(kind) {
             Ok(roots) => found
                 .steam_games
                 .extend(roots.into_iter().map(|root| DetectedGame { kind, root })),
@@ -50,16 +44,16 @@ pub fn discover() -> Discovery {
     }
     #[cfg(target_os = "linux")]
     if !found.steam_games.is_empty() {
-        match super::xxmi::steam_xxmi::discover() {
+        match xxmi::steam_xxmi::discover() {
             Ok(targets) => found.steam_xxmi = targets,
             Err(error) => {
-                for kind in [GameKind::Zzmi, GameKind::Efmi] {
+                for kind in SUPPORTED.into_iter().filter(|kind| kind.is_xxmi()) {
                     found.notices.push((kind, format!("Steam Proton: {error:#}")));
                 }
             }
         }
         if !found.steam_xxmi.is_empty() {
-            found.protontricks = super::xxmi::steam_xxmi::Protontricks::find();
+            found.protontricks = xxmi::steam_xxmi::Protontricks::find();
         }
     }
     found

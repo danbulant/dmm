@@ -22,7 +22,7 @@ use crate::deploy::{
     store_blob, target, verify_folder, verify_folder_layout,
 };
 use crate::games::xxmi;
-use crate::games::{GameKind, GameProfile, InstallPlan, parse_profile, plan, plan_bundle, profile};
+use crate::games::{GameKind, InstallPlan, plan, plan_bundle};
 
 use crate::sources::{ModDetails, RemoteMod, SearchQuery, Source};
 
@@ -38,17 +38,6 @@ pub struct Instance {
     pub name: String,
     pub kind: GameKind,
     pub root: PathBuf,
-    pub profile: Option<PathBuf>,
-}
-
-impl Instance {
-    pub fn profile(&self) -> Result<GameProfile> {
-        if let Some(path) = &self.profile {
-            parse_profile(self.kind, &fs::read_to_string(path)?)
-        } else {
-            profile(self.kind)
-        }
-    }
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -261,7 +250,6 @@ impl Library {
         name: &str,
         kind: GameKind,
         root: &Path,
-        descriptor: Option<&Path>,
     ) -> Result<Instance> {
         validate_slug(name)?;
         let root = root
@@ -272,20 +260,20 @@ impl Library {
             !trees_overlap(&self.state, &root),
             "library and game root must be separate directories"
         );
-        for instance in self.instances()? {
+        let mut roots = self.db.prepare("SELECT name, json_extract(data, '$.root') FROM instances")?;
+        let roots = roots.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        for entry in roots {
+            let (name, existing_root) = entry?;
             ensure!(
-                !trees_overlap(&instance.root, &root),
-                "game root overlaps instance {}",
-                instance.name
+                !trees_overlap(Path::new(&existing_root), &root),
+                "game root overlaps instance {name}"
             );
         }
         let instance = Instance {
             name: name.to_owned(),
             kind,
             root,
-            profile: descriptor.map(Path::canonicalize).transpose()?,
         };
-        instance.profile()?;
         self.db.execute(
             "INSERT INTO instances VALUES (?1, ?2)",
             params![name, serde_json::to_string(&instance)?],
@@ -294,7 +282,10 @@ impl Library {
     }
 
     pub fn instances(&self) -> Result<Vec<Instance>> {
-        self.json_rows("SELECT data FROM instances ORDER BY name", [])
+        self.json_rows(
+            "SELECT data FROM instances WHERE json_extract(data, '$.kind') IS NOT 'generic' ORDER BY name",
+            [],
+        )
     }
 
     pub fn active_installation(&self, kind: GameKind) -> Result<Option<String>> {
@@ -310,7 +301,6 @@ impl Library {
 
     pub fn use_installation(&self, name: &str) -> Result<()> {
         let instance = self.instance(name)?;
-        instance.profile()?;
         checked_root(&instance.root)?;
         self.db.execute(
             "INSERT INTO active_installations VALUES (?1, ?2)
@@ -346,9 +336,11 @@ impl Library {
 
     pub fn instance(&self, name: &str) -> Result<Instance> {
         self.db
-            .query_row("SELECT data FROM instances WHERE name = ?1", [name], |r| {
-                r.get::<_, String>(0)
-            })
+            .query_row(
+                "SELECT data FROM instances WHERE name = ?1 AND json_extract(data, '$.kind') IS NOT 'generic'",
+                [name],
+                |r| r.get::<_, String>(0),
+            )
             .optional()?
             .map(|row| serde_json::from_str(&row))
             .transpose()?
@@ -384,9 +376,10 @@ impl Library {
         let mut statement = self.db.prepare(
             "SELECT instance, slug, id, enabled FROM (
                  SELECT instance, slug,
-                        json_extract(data, '$.versions[' || json_extract(data, '$.current') || '].release.id') AS id,
-                        json_extract(data, '$.enabled') AS enabled
-                 FROM mods
+                        json_extract(mods.data, '$.versions[' || json_extract(mods.data, '$.current') || '].release.id') AS id,
+                        json_extract(mods.data, '$.enabled') AS enabled
+                 FROM mods JOIN instances ON instances.name = mods.instance
+                 WHERE json_extract(instances.data, '$.kind') IS NOT 'generic'
              ) WHERE id IS NOT NULL ORDER BY instance, slug",
         )?;
         let mut rows = statement.query([])?;
@@ -427,7 +420,7 @@ impl Library {
         checked_root(&instance.root)?;
         let scratch = self.scratch()?;
         let tree = unpack(input, scratch.path())?;
-        let plan = plan(&instance.profile()?, &tree.files, slug, destination)?;
+        let plan = plan(instance.kind, &tree.files, slug, destination)?;
         let mods = self.mods(&instance.name)?;
         let existing = mods.iter().find(|record| record.slug == slug);
         let claims = Claims::from_mods(&mods, slug);
@@ -511,7 +504,7 @@ impl Library {
             old.as_ref()
                 .and_then(|m| m.versions[m.current].destination.as_deref())
         });
-        let plan = plan(&instance.profile()?, &tree.files, slug, destination)?;
+        let plan = plan(instance.kind, &tree.files, slug, destination)?;
         let mut next = old.clone().unwrap_or_else(|| ManagedMod {
             slug: slug.to_owned(),
             enabled: !options.keep_disabled,
@@ -623,8 +616,7 @@ impl Library {
             .iter()
             .map(|tree| tree.files.as_slice())
             .collect::<Vec<_>>();
-        let profile = instance.profile()?;
-        let plans = plan_bundle(&profile, &packages, slug, destination)?;
+        let plans = plan_bundle(instance.kind, &packages, slug, destination)?;
         let mut files = BTreeMap::new();
         let mut provenance = BTreeMap::new();
         let mut claims = Claims::default();

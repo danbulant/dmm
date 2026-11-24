@@ -117,7 +117,7 @@ fn completed_download_switch_changes_only_the_downloads_installation() -> Result
     };
     let mut library = Library::open(&state_dir)?;
     for (name, root) in [("selected", &selected), ("target", &target)] {
-        library.register(name, GameKind::Zzmi, root, None)?;
+        library.register(name, GameKind::Zzmi, root)?;
         library.install(name, "skin", &input, Some(release.clone()), Default::default())?;
     }
     let mut state = State::new(state_dir.clone());

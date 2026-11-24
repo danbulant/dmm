@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use dmm::games::GameKind;
 use rune::tok::{Theme, type_};
 use rune::{El, ScrollSpec, SurfaceFit, TextStyle, col, el, row, text};
 use rune_kit::shell::SidebarRow;
@@ -125,7 +124,7 @@ fn entry(s: &State, index: usize, item: &Entry, t: Theme, k: &Kit) -> El {
                         .help(&item.name),
                 )
                 .child(row().gap(6.0).items_center()
-                    .child(game_icon(s, kind.unwrap_or(GameKind::Generic), t))
+                    .child(game_icon(s, kind, t))
                     .child(muted(format!("{game}  ·  {}", file_summary(item)), t).wrap())),
         );
     line = line.child(

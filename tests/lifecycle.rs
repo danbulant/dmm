@@ -34,7 +34,7 @@ impl Fixture {
 
     fn library(&self, kind: GameKind) -> Result<Library> {
         let library = Library::open(&self.state)?;
-        library.register("game", kind, &self.root, None)?;
+        library.register("game", kind, &self.root)?;
         Ok(library)
     }
 }
@@ -234,7 +234,7 @@ fn never_deploys_through_game_symlink() -> Result<()> {
 #[test]
 fn local_bookmarks_survive_reopening() -> Result<()> {
     let f = Fixture::new()?;
-    let library = f.library(GameKind::Generic)?;
+    let library = Library::open(&f.state)?;
     let id = RemoteMod {
         source: Source::GameBanana,
         game: "1".into(),

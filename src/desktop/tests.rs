@@ -3,6 +3,9 @@ use std::rc::Rc;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
+#[cfg(target_os = "linux")]
+use dmm::games::xxmi::steam_xxmi::InstallStage;
+
 use dmm::sources::{
     ModDetails, ModFile, ModImage, Requirement, SearchPage, SearchQuery, SearchResult,
 };
@@ -222,9 +225,7 @@ fn details_fixture() -> State {
         name: "cyberpunk".into(),
         kind: GameKind::Cyberpunk,
         root: PathBuf::from("unused-game"),
-        profile: None,
     });
-    state.snapshot.sources = public_origins(GameKind::Cyberpunk);
     let file = |id, name: &str| ModFile {
         id,
         name: name.to_owned(),
@@ -418,6 +419,7 @@ fn catalog_loading_does_not_block_setup_or_local_import_controls() {
     assert!(runtime.find("setup:root").is_none());
     press(&mut runtime, "setup:add");
     assert!(runtime.find("setup:root").is_some());
+    assert!(runtime.find("setup:descriptor").is_none());
     press(&mut runtime, "nav-Local mods");
     assert!(matches!(runtime.state.screen, Screen::Local));
     assert!(runtime.find("local:path").is_none());
@@ -511,7 +513,7 @@ fn local_sort_reorders_cards_with_unknown_sizes_and_dates_last() -> Result<()> {
     let game = dir.path().join("game");
     std::fs::create_dir(&game)?;
     let mut library = Library::open(&state_dir)?;
-    library.register("cp", GameKind::Cyberpunk, &game, None)?;
+    library.register("cp", GameKind::Cyberpunk, &game)?;
     let id = RemoteMod {
         source: Source::Nexus,
         game: "cyberpunk2077".into(),
@@ -600,7 +602,7 @@ fn local_grid_presents_bookmarks_and_requires_confirmation_before_removing_an_in
     std::fs::create_dir(&input)?;
     std::fs::write(input.join("mod.archive"), b"archive fixture")?;
     let mut library = Library::open(&state_dir)?;
-    library.register("cp", GameKind::Cyberpunk, &game, None)?;
+    library.register("cp", GameKind::Cyberpunk, &game)?;
     library.install("cp", "night-city", &input, None, Default::default())?;
     let bookmark = RemoteMod {
         source: Source::Nexus,
@@ -686,7 +688,7 @@ fn bookmark_and_queue_actions_work_across_explore_and_local_cards() -> Result<()
     let image = info.images[0].thumbnail.clone();
     state.state_dir = data.clone();
     let library = Library::open(&data)?;
-    library.register("cyberpunk", GameKind::Cyberpunk, &game, None)?;
+    library.register("cyberpunk", GameKind::Cyberpunk, &game)?;
     state.snapshot = Snapshot::load(&library, Some("cyberpunk"))?;
     drop(library);
     state.browser.results = Some(Rc::new(SearchPage {

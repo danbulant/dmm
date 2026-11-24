@@ -33,9 +33,6 @@ pub(in crate::desktop) fn explore(s: &State, t: Theme, k: &Kit, layer: &mut Vec<
             )
             .child(sources),
     );
-    if let Some(issue) = &s.snapshot.profile_issue {
-        return view.child(panel(t).child(muted(issue, t).wrap()));
-    }
     if s.available_sources().is_empty() {
         return view.child(
             panel(t).child(

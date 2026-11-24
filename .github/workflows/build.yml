@@ -81,7 +81,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           ./target/release/dmm --help
-          tar -czf dmm-linux-x64.tar.gz -C target/release dmm
+          tar -czf dmm-linux-x64.tar.gz -C packaging licenses -C ../target/release dmm
           bash packaging/appimage/build.sh target/release/dmm dmm-linux-x64.AppImage
           APPIMAGE_EXTRACT_AND_RUN=1 ./dmm-linux-x64.AppImage --help
 
@@ -91,6 +91,7 @@ jobs:
         run: |
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item target/release/dmm.exe, "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\*.dll" -Destination dist
+          Copy-Item packaging/licenses -Destination dist -Recurse
           & .\dist\dmm.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Compress-Archive -Path dist/* -DestinationPath dmm-windows-x64.zip

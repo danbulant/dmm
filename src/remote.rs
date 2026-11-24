@@ -113,10 +113,10 @@ pub(crate) fn search(library: &Library, search: SavedSearch, instance: Option<&s
 }
 
 pub(crate) fn install(library: &mut Library, input: RemoteInstall) -> Result<()> {
-    let game = library.instance(&input.instance)?.profile()?;
-    let game = game
+    let kind = library.instance(&input.instance)?.kind;
+    let game = kind
         .source_game(input.source)
-        .with_context(|| format!("this profile has no {} game ID", input.source))?;
+        .with_context(|| format!("{} has no {} game ID", kind.display_name(), input.source))?;
     let id = RemoteMod {
         source: input.source,
         game: game.to_owned(),

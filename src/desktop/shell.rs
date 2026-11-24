@@ -1,5 +1,4 @@
-use dmm::games::GameKind;
-use dmm::games::discovery::SUPPORTED;
+use dmm::games::{GameKind, SUPPORTED};
 use rune::tok::{self, Theme, type_};
 use rune::{Cx, El, ScrollSpec, SurfaceFit, col, el, row, text};
 use rune_kit::shell::{Sidebar, SidebarRow, SplitView, Toolbar};
@@ -130,7 +129,6 @@ fn sidebar(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
         t,
         true,
         s.snapshot.selected.is_some()
-            && s.game_kind() != GameKind::Generic
             && !deploying
             && !s.running_games.contains(s.game_kind())
             && (!s.game_kind().is_xxmi() || s.xxmi_game_start.is_none())
@@ -174,7 +172,7 @@ fn game_select(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
         .radius(8.0)
         .fill(k.c.layer_01)
         .border(1.0, k.c.border_base)
-        .child(game_icon(s, s.game_kind(), t))
+        .child(game_icon(s, Some(s.game_kind()), t))
         .child(
             text(name)
                 .font(type_::LABEL)
@@ -197,16 +195,10 @@ fn game_select(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
         .min_width(288.0)
         .on_close(|s: &mut State| s.game_menu = false);
     if s.game_menu {
-        for (kind, title) in SUPPORTED.into_iter().chain(
-            s.snapshot
-                .instances
-                .iter()
-                .any(|i| i.kind == GameKind::Generic)
-                .then_some((GameKind::Generic, "Custom game")),
-        ) {
+        for kind in SUPPORTED {
             let detected = s.detected.iter().chain(&s.steam_games).any(|game| game.kind == kind);
-            let item = MenuItem::new(title)
-                .lead(game_icon(s, kind, t))
+            let item = MenuItem::new(kind.display_name())
+                .lead(game_icon(s, Some(kind), t))
                 .checked(s.public_game == kind)
                 .on_select(move |s: &mut State| s.select_game(kind));
             menu = menu.item(if detected {
@@ -218,12 +210,12 @@ fn game_select(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
     }
     menu.build(k, layer)
 }
-pub(super) fn game_icon(s: &State, kind: GameKind, t: Theme) -> El {
+pub(super) fn game_icon(s: &State, kind: Option<GameKind>, t: Theme) -> El {
     let pixels = match kind {
-        GameKind::Cyberpunk => s.cyberpunk_icon.as_ref(),
-        GameKind::Zzmi => s.zzmi_icon.as_ref(),
-        GameKind::Efmi => s.efmi_icon.as_ref(),
-        GameKind::Generic => None,
+        Some(GameKind::Cyberpunk) => s.cyberpunk_icon.as_ref(),
+        Some(GameKind::Zzmi) => s.zzmi_icon.as_ref(),
+        Some(GameKind::Efmi) => s.efmi_icon.as_ref(),
+        None => None,
     };
     let square = el()
         .size(24.0, 24.0)
@@ -233,7 +225,7 @@ pub(super) fn game_icon(s: &State, kind: GameKind, t: Theme) -> El {
     if let Some(pixels) = pixels {
         square.pixels_fit(pixels, SurfaceFit::Fit)
     } else {
-        square.child(muted(if kind == GameKind::Efmi { "E" } else { "G" }, t))
+        square.child(muted("G", t))
     }
 }
 

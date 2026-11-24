@@ -192,7 +192,7 @@ fn unpack_with_limits(
                 )
             })
     };
-    let mut temp_dir = temp()?;
+    let temp_dir = temp()?;
     let mut files = if metadata.is_dir() {
         let mut state = ExtractState::new(temp_dir.path(), max_files, max_entries, max_bytes);
         copy_directory(input, Path::new(""), &mut state)?;
@@ -203,20 +203,12 @@ fn unpack_with_limits(
             "input must be a regular archive file or directory"
         );
         let mut state = ExtractState::new(temp_dir.path(), max_files, max_entries, max_bytes);
-        match extract_archive(input, &mut state) {
-            Ok(()) => state.files,
-            Err(libarchive_error) if rar::is_rar(input)? => {
-                drop(state);
-                temp_dir = temp()?;
-                let mut retry =
-                    ExtractState::new(temp_dir.path(), max_files, max_entries, max_bytes);
-                rar::extract(input, &mut retry).with_context(|| {
-                    format!("libarchive failed ({libarchive_error:#}); UnRAR fallback failed")
-                })?;
-                retry.files
-            }
-            Err(error) => return Err(error),
+        if rar::is_rar(input)? {
+            rar::extract(input, &mut state)?;
+        } else {
+            extract_archive(input, &mut state)?;
         }
+        state.files
     };
     files.sort();
     Ok(ArchiveTree {
@@ -781,6 +773,51 @@ PK\x05\x06\0\0\0\0\x01\0\x01\0\x3a\0\0\0\x2b\0\0\0\0\0")?;
         let archive = unpack(&path, temp.path())?;
         assert_eq!(archive.files, [Path::new("café/mod.ini")]);
         assert_eq!(fs::read(archive.root().join("café/mod.ini"))?, b"x");
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_solid_rar_and_cleans_failed_limited_imports() -> anyhow::Result<()> {
+        // Upstream RARS Apache-2.0 fixture: crates/rars/tests/fixtures/rar50/solid.rar.
+        const SOLID_RAR: &[u8] = b"\
+            \x52\x61\x72\x21\x1a\x07\x01\x00\x20\xb6\xfa\x11\x0a\x01\x05\x06\
+            \x04\x05\x01\x01\x80\x80\x00\x5b\xf2\xd9\x43\x44\x02\x03\x2e\xaf\
+            \x00\x00\x9e\x00\x20\x80\x1b\x00\x09\x68\x65\x6c\x6c\x6f\x2e\x74\
+            \x78\x74\x22\x02\x00\x2c\x89\x7a\xb5\x81\x6d\x5d\x13\x34\x59\x58\
+            \x40\xd6\xce\x57\x29\x07\x6c\x0b\xe2\x47\xb2\x20\x2d\xba\xb1\xb8\
+            \x95\x7b\x91\x9c\x52\x0a\x03\x02\x34\xa8\xe1\xeb\x05\xd6\xdc\x01\
+            \xc6\xb0\x2c\x24\x04\x32\xfa\x33\xbe\x61\x5f\x80\x24\x1a\x5c\x02\
+            \x56\xdd\x30\x66\x20\x84\x08\x10\x51\x77\xfb\x5c\x6f\xbb\x6f\xbb\
+            \x3b\xc5\x02\xa2\x8b\x1d\x46\x75\xed\xf2\x58\x76\x25\xf0\x64\x46\
+            \x1b\x49\x71\x43\x02\x03\x2e\x85\x00\x00\x89\x00\x20\xc0\x1b\x00\
+            \x08\x74\x69\x6e\x79\x2e\x74\x78\x74\x22\x02\x00\x92\x0c\x14\x84\
+            \xc2\x19\x7c\x1f\xe8\x54\x9a\xef\x42\x89\xb9\x93\xc8\x8f\x5d\x01\
+            \x33\xbd\x20\xd4\xd6\x59\x5d\xef\x26\xd3\x38\xb6\x0a\x03\x02\xd0\
+            \xb1\xe1\xeb\x05\xd6\xdc\x01\x45\x1d\x02\x4f\x88\x1d\x77\x56\x51\
+            \x03\x05\x04\x00";
+        let temp = workspace_tempdir();
+        let input = temp.path().join("solid.rar");
+        fs::write(&input, SOLID_RAR)?;
+        let scratch = temp.path().join("scratch");
+        fs::create_dir(&scratch)?;
+
+        let archive = unpack(&input, &scratch)?;
+        assert_eq!(
+            archive.files,
+            [Path::new("hello.txt"), Path::new("tiny.txt")]
+        );
+        assert_eq!(fs::read(archive.root().join("hello.txt"))?, b"Hello, RAR 5.0 fixture world.\n");
+        assert_eq!(fs::read(archive.root().join("tiny.txt"))?, b"AAAAAAAA\n");
+        drop(archive);
+
+        assert!(unpack_with_limits(&input, &scratch, 10, 100, 1).is_err());
+        assert_eq!(fs::read_dir(&scratch)?.count(), 0);
+
+        let mut damaged = SOLID_RAR.to_vec();
+        damaged[0xd9] ^= 0x80;
+        fs::write(&input, damaged)?;
+        assert!(unpack(&input, &scratch).is_err());
+        assert_eq!(fs::read_dir(&scratch)?.count(), 0);
         Ok(())
     }
 

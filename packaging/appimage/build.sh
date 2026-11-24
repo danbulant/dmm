@@ -30,5 +30,6 @@ export APPIMAGE_EXTRACT_AND_RUN=1
     --executable "$binary" \
     --desktop-file "$assets/com.dmm.ModManager.desktop" \
     --icon-file "$assets/com.dmm.ModManager.svg"
+install -Dm644 "$assets/../licenses/rars.txt" "$work/DMM.AppDir/usr/share/licenses/dmm/rars.txt"
 ARCH=x86_64 "$work/appimagetool.AppImage" --no-appstream \
     --runtime-file "$work/runtime" "$work/DMM.AppDir" "$output"

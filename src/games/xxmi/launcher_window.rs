@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
+use anyhow::Result;
 #[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "windows")]
@@ -11,7 +13,7 @@ use x11rb::protocol::xproto::{AtomEnum, ClientMessageEvent, ConnectionExt, Event
 use x11rb::{CURRENT_TIME, connection::Connection};
 
 #[cfg(target_os = "linux")]
-pub(super) fn close(runner: u32, exe: &Path) -> Result<()> {
+pub fn close(runner: u32, exe: &Path) -> Result<()> {
     let exe = exe.canonicalize()?;
     let started = process_start(runner).context("The XXMI launch process has exited")?;
     let (conn, screen) = x11rb::connect(None).context("Cannot connect to the XXMI X11 window")?;
@@ -70,7 +72,7 @@ fn maps_executable(pid: u32, exe: &Path) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-pub(super) fn close(pid: u32, _: &Path) -> Result<()> {
+pub fn close(pid: u32, _: &Path) -> Result<()> {
     let status = Command::new("taskkill.exe").args(["/PID", &pid.to_string()]).status()
         .context("Could not request XXMI to close")?;
     anyhow::ensure!(status.success(), "XXMI did not accept the close request ({status})");
@@ -78,6 +80,6 @@ pub(super) fn close(pid: u32, _: &Path) -> Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-pub(super) fn close(_: u32, _: &Path) -> Result<()> {
+pub fn close(_: u32, _: &Path) -> Result<()> {
     anyhow::bail!("Close XXMI from its own window on this platform")
 }
