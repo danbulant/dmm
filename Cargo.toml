@@ -10,6 +10,7 @@ default = ["rune-ui"]
 anyhow = "1"
 blake3 = "1"
 clap = { version = "4.5", features = ["derive"] }
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"], optional = true }
 open = "5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
@@ -20,12 +21,12 @@ rune-kit = { git = "https://github.com/anomalyco/rune", rev = "21e5342b9a4cc33ee
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sevenz-rust2 = { version = "0.25", default-features = false, features = ["bzip2", "deflate", "ppmd"] }
 steamlocate = "2"
+tar = { version = "0.4", default-features = false }
 tempfile = "3"
 url = { version = "2", features = ["serde"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+zip = { version = "9.8.2", default-features = false, features = ["bzip2", "deflate-flate2", "deflate64", "lzma", "ppmd", "xz"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ring = "0.17"

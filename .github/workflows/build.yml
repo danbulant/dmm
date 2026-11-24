@@ -40,32 +40,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y desktop-file-utils libarchive-dev libfontconfig1-dev libwayland-dev libxcb1-dev libxkbcommon-dev pkg-config
-
-      - name: Locate vcpkg cache
-        if: runner.os == 'Windows'
-        id: vcpkg
-        shell: pwsh
-        run: |
-          "image=$env:ImageVersion" >> $env:GITHUB_OUTPUT
-          "VCPKG_DEFAULT_BINARY_CACHE=$env:RUNNER_TEMP\vcpkg-cache" >> $env:GITHUB_ENV
-
-      - name: Cache vcpkg packages
-        if: runner.os == 'Windows'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
-          key: vcpkg-${{ matrix.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.image }}
-          restore-keys: vcpkg-${{ matrix.os }}-${{ runner.arch }}-
-
-      - name: Install Windows libraries
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
-          vcpkg install libarchive:x64-windows --vcpkg-root "$env:VCPKG_INSTALLATION_ROOT"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "RUSTFLAGS=-Lnative=$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\lib" >> $env:GITHUB_ENV
+          sudo apt-get install -y desktop-file-utils libfontconfig1-dev libwayland-dev libxcb1-dev libxkbcommon-dev pkg-config
 
       - name: Cache Cargo dependencies and build outputs
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -76,6 +51,9 @@ jobs:
 
       - name: Build release
         run: cargo build --locked --release
+
+      - name: Test archive extraction
+        run: cargo test --locked --release --lib "archive::"
 
       - name: Package Linux build
         if: runner.os == 'Linux'
@@ -90,7 +68,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory dist | Out-Null
-          Copy-Item target/release/dmm.exe, "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows\bin\*.dll" -Destination dist
+          Copy-Item target/release/dmm.exe -Destination dist
           Copy-Item packaging/licenses -Destination dist -Recurse
           & .\dist\dmm.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

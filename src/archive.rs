@@ -1,19 +1,14 @@
+mod portable;
 mod rar;
 
-use std::borrow::Cow;
 use std::collections::HashMap;
-use std::ffi::CStr;
-#[cfg(not(windows))]
-use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::raw::{c_char, c_int};
 #[cfg(unix)]
-use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
+use std::os::unix::fs::FileTypeExt;
 #[cfg(windows)]
-use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::ptr::NonNull;
 
 use anyhow::{Context, bail, ensure};
 use tempfile::{Builder, TempDir};
@@ -25,61 +20,6 @@ const COPY_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_ENTRIES: usize = 100_000;
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_PATH_DEPTH: usize = 128;
-
-#[repr(C)]
-struct ArchiveHandle {
-    _private: [u8; 0],
-}
-
-#[repr(C)]
-struct ArchiveEntry {
-    _private: [u8; 0],
-}
-
-#[link(name = "archive")]
-unsafe extern "C" {
-    fn archive_read_new() -> *mut ArchiveHandle;
-    fn archive_read_free(archive: *mut ArchiveHandle) -> c_int;
-    fn archive_read_support_filter_none(archive: *mut ArchiveHandle) -> c_int;
-    fn archive_read_support_filter_gzip(archive: *mut ArchiveHandle) -> c_int;
-    fn archive_read_support_format_zip(archive: *mut ArchiveHandle) -> c_int;
-    fn archive_read_support_format_tar(archive: *mut ArchiveHandle) -> c_int;
-    fn archive_read_support_format_rar(archive: *mut ArchiveHandle) -> c_int;
-    fn archive_read_support_format_rar5(archive: *mut ArchiveHandle) -> c_int;
-    fn archive_read_support_format_7zip(archive: *mut ArchiveHandle) -> c_int;
-    #[cfg(not(windows))]
-    fn archive_read_open_filename(
-        archive: *mut ArchiveHandle,
-        filename: *const c_char,
-        block_size: usize,
-    ) -> c_int;
-    fn archive_read_next_header(
-        archive: *mut ArchiveHandle,
-        entry: *mut *mut ArchiveEntry,
-    ) -> c_int;
-    fn archive_read_data(archive: *mut ArchiveHandle, buffer: *mut u8, size: usize) -> isize;
-    fn archive_read_data_skip(archive: *mut ArchiveHandle) -> c_int;
-    fn archive_error_string(archive: *mut ArchiveHandle) -> *const c_char;
-    fn archive_format(archive: *mut ArchiveHandle) -> c_int;
-    fn archive_entry_pathname(entry: *mut ArchiveEntry) -> *const c_char;
-    fn archive_entry_pathname_utf8(entry: *mut ArchiveEntry) -> *const c_char;
-    fn archive_entry_strmode(entry: *mut ArchiveEntry) -> *const c_char;
-    fn archive_entry_size_is_set(entry: *mut ArchiveEntry) -> c_int;
-    fn archive_entry_size(entry: *mut ArchiveEntry) -> i64;
-    fn archive_entry_symlink(entry: *mut ArchiveEntry) -> *const c_char;
-    fn archive_entry_hardlink(entry: *mut ArchiveEntry) -> *const c_char;
-    #[cfg(windows)]
-    fn archive_read_open_filename_w(
-        archive: *mut ArchiveHandle,
-        filename: *const u16,
-        block_size: usize,
-    ) -> c_int;
-}
-
-const ARCHIVE_OK: c_int = 0;
-const ARCHIVE_EOF: c_int = 1;
-const ARCHIVE_FORMAT_BASE_MASK: c_int = 0xFF_0000;
-const ARCHIVE_FORMAT_ZIP: c_int = 0x05_0000;
 
 pub struct ArchiveTree {
     _temp_dir: TempDir,
@@ -206,7 +146,7 @@ fn unpack_with_limits(
         if rar::is_rar(input)? {
             rar::extract(input, &mut state)?;
         } else {
-            extract_archive(input, &mut state)?;
+            portable::extract(input, &mut state)?;
         }
         state.files
     };
@@ -325,8 +265,19 @@ impl<'a> ExtractState<'a> {
         Ok(())
     }
 
-    fn write_file<R: Read>(&mut self, path: &str, reader: &mut R) -> anyhow::Result<()> {
+    fn write_file(
+        &mut self,
+        path: &str,
+        reader: &mut (impl Read + ?Sized),
+        size: Option<u64>,
+    ) -> anyhow::Result<()> {
         self.begin_file()?;
+        let remaining = self.max_bytes - self.bytes;
+        let budget = size.unwrap_or(remaining);
+        ensure!(
+            budget <= remaining,
+            "archive exceeds the uncompressed-size limit"
+        );
         let destination = self.register(path, NodeKind::File)?;
         let parent = destination
             .parent()
@@ -338,21 +289,24 @@ impl<'a> ExtractState<'a> {
             .open(&destination)
             .with_context(|| format!("cannot create extracted file {}", destination.display()))?;
         let mut buffer = [0_u8; COPY_BUFFER_SIZE];
+        let mut written = 0;
         loop {
             let count = reader.read(&mut buffer)?;
             if count == 0 {
                 break;
             }
-            self.bytes = self
-                .bytes
-                .checked_add(count as u64)
-                .context("unpacked size overflow")?;
+            written += count as u64;
             ensure!(
-                self.bytes <= self.max_bytes,
-                "archive exceeds the uncompressed-size limit"
+                written <= budget,
+                "archive entry exceeds its declared size or the uncompressed-size limit"
             );
             output.write_all(&buffer[..count])?;
         }
+        ensure!(
+            size.is_none_or(|size| size == written),
+            "archive entry size does not match its declared size"
+        );
+        self.bytes += written;
         self.files.push(PathBuf::from(path));
         Ok(())
     }
@@ -364,305 +318,6 @@ impl<'a> ExtractState<'a> {
     }
 }
 
-struct ArchiveReader(NonNull<ArchiveHandle>);
-
-impl ArchiveReader {
-    fn open(path: &Path) -> anyhow::Result<Self> {
-        let raw = NonNull::new(unsafe { archive_read_new() })
-            .context("libarchive could not allocate a reader")?;
-        let reader = Self(raw);
-        for (result, format) in [
-            (
-                unsafe { archive_read_support_filter_none(raw.as_ptr()) },
-                "no compression",
-            ),
-            (
-                unsafe { archive_read_support_filter_gzip(raw.as_ptr()) },
-                "gzip",
-            ),
-            (
-                unsafe { archive_read_support_format_zip(raw.as_ptr()) },
-                "ZIP",
-            ),
-            (
-                unsafe { archive_read_support_format_tar(raw.as_ptr()) },
-                "TAR",
-            ),
-            (
-                unsafe { archive_read_support_format_rar(raw.as_ptr()) },
-                "RAR",
-            ),
-            (
-                unsafe { archive_read_support_format_rar5(raw.as_ptr()) },
-                "RAR5",
-            ),
-            (
-                unsafe { archive_read_support_format_7zip(raw.as_ptr()) },
-                "7z",
-            ),
-        ] {
-            reader.check(result, &format!("enable {format} support"))?;
-        }
-        reader.open_filename(path)?;
-        Ok(reader)
-    }
-
-    fn open_filename(&self, path: &Path) -> anyhow::Result<()> {
-        #[cfg(unix)]
-        let status = {
-            let filename = CString::new(path.as_os_str().as_bytes())
-                .context("archive path contains a NUL byte")?;
-            unsafe { archive_read_open_filename(self.0.as_ptr(), filename.as_ptr(), 10 * 1024) }
-        };
-        #[cfg(windows)]
-        let status = {
-            let mut filename = path.as_os_str().encode_wide().collect::<Vec<_>>();
-            filename.push(0);
-            unsafe { archive_read_open_filename_w(self.0.as_ptr(), filename.as_ptr(), 10 * 1024) }
-        };
-        #[cfg(not(any(unix, windows)))]
-        let status = {
-            let filename = CString::new(path.to_string_lossy().as_bytes())
-                .context("archive path contains a NUL byte")?;
-            unsafe { archive_read_open_filename(self.0.as_ptr(), filename.as_ptr(), 10 * 1024) }
-        };
-        self.check(status, "open archive")
-    }
-
-    fn next_entry(&mut self) -> anyhow::Result<Option<NonNull<ArchiveEntry>>> {
-        let mut entry = std::ptr::null_mut();
-        let status = unsafe { archive_read_next_header(self.0.as_ptr(), &mut entry) };
-        if status == ARCHIVE_EOF {
-            return Ok(None);
-        }
-        self.check(status, "read archive header")?;
-        NonNull::new(entry)
-            .map(Some)
-            .context("libarchive returned a null entry")
-    }
-
-    fn read_data(&mut self, buffer: &mut [u8]) -> anyhow::Result<usize> {
-        let count =
-            unsafe { archive_read_data(self.0.as_ptr(), buffer.as_mut_ptr(), buffer.len()) };
-        ensure!(
-            count >= 0,
-            "{}",
-            Self::integrity_guidance(self.error_message("read archive data"))
-        );
-        usize::try_from(count).context("invalid archive read length")
-    }
-
-    fn integrity_guidance(message: String) -> String {
-        let lower = message.to_ascii_lowercase();
-        if lower.contains("checksum") || lower.contains("crc") {
-            format!(
-                "{message}; archive integrity verification failed. Download the archive again; if the error persists, test it with the original archive tool and repackage only after it verifies."
-            )
-        } else {
-            message
-        }
-    }
-
-    fn skip_data(&mut self) -> anyhow::Result<()> {
-        self.check(
-            unsafe { archive_read_data_skip(self.0.as_ptr()) },
-            "skip archive entry",
-        )
-    }
-
-    fn check(&self, status: c_int, action: &str) -> anyhow::Result<()> {
-        if status == ARCHIVE_OK {
-            Ok(())
-        } else {
-            bail!("{}", Self::integrity_guidance(self.error_message(action)));
-        }
-    }
-
-    fn error_message(&self, action: &str) -> String {
-        let pointer = unsafe { archive_error_string(self.0.as_ptr()) };
-        if pointer.is_null() {
-            format!("libarchive failed to {action}")
-        } else {
-            format!(
-                "libarchive failed to {action}: {}",
-                unsafe { CStr::from_ptr(pointer) }.to_string_lossy()
-            )
-        }
-    }
-}
-
-impl Drop for ArchiveReader {
-    fn drop(&mut self) {
-        unsafe {
-            archive_read_free(self.0.as_ptr());
-        }
-    }
-}
-
-#[cfg(unix)]
-struct ArchiveLocale {
-    previous: libc::locale_t,
-    utf8: libc::locale_t,
-}
-
-#[cfg(unix)]
-impl ArchiveLocale {
-    fn utf8() -> Option<Self> {
-        // libarchive uses LC_CTYPE for pathname conversions, even when asked for UTF-8.
-        // Keep the locale thread-local so imports never change other app threads.
-        for name in [c"C.UTF-8", c"UTF-8", c"en_US.UTF-8"] {
-            let utf8 = unsafe {
-                libc::newlocale(libc::LC_CTYPE_MASK, name.as_ptr(), std::ptr::null_mut())
-            };
-            if utf8.is_null() {
-                continue;
-            }
-            let previous = unsafe { libc::uselocale(utf8) };
-            if previous.is_null() {
-                unsafe { libc::freelocale(utf8) };
-                return None;
-            }
-            return Some(Self { previous, utf8 });
-        }
-        None
-    }
-}
-
-#[cfg(unix)]
-impl Drop for ArchiveLocale {
-    fn drop(&mut self) {
-        unsafe {
-            libc::uselocale(self.previous);
-            libc::freelocale(self.utf8);
-        }
-    }
-}
-
-fn extract_archive(input: &Path, state: &mut ExtractState<'_>) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    let _locale = ArchiveLocale::utf8();
-    let mut archive = ArchiveReader::open(input)
-        .with_context(|| format!("cannot open archive {}", input.display()))?;
-    while let Some(entry) = archive.next_entry()? {
-        let entry = entry.as_ptr();
-        let pathname = unsafe { archive_entry_pathname_utf8(entry) };
-        let name = if !pathname.is_null() {
-            Cow::Borrowed(
-                unsafe { CStr::from_ptr(pathname) }
-                    .to_str()
-                    .context("archive entry pathname is not UTF-8")?,
-            )
-        } else {
-            let pathname = unsafe { archive_entry_pathname(entry) };
-            ensure!(
-                !pathname.is_null(),
-                "archive entry has no recoverable pathname"
-            );
-            let bytes = unsafe { CStr::from_ptr(pathname) }.to_bytes();
-            if let Ok(text) = std::str::from_utf8(bytes) {
-                Cow::Borrowed(text)
-            } else {
-                ensure!(
-                    unsafe { archive_format(archive.0.as_ptr()) } & ARCHIVE_FORMAT_BASE_MASK
-                        == ARCHIVE_FORMAT_ZIP,
-                    "archive entry pathname is not UTF-8"
-                );
-                Cow::Owned(decode_cp437(bytes))
-            }
-        };
-        ensure!(
-            unsafe { archive_entry_symlink(entry) }.is_null(),
-            "symbolic links are not allowed in archives"
-        );
-        ensure!(
-            unsafe { archive_entry_hardlink(entry) }.is_null(),
-            "hard links are not allowed in archives"
-        );
-        // strmode's first byte describes the type without depending on platform mode_t.
-        let mode = unsafe { archive_entry_strmode(entry) };
-        ensure!(!mode.is_null(), "missing archive entry type");
-        let file_type = unsafe { *mode } as u8;
-        if matches!(name.as_ref(), "." | "./" | ".\\") && file_type == b'd' {
-            state.record_entry()?;
-            archive.skip_data()?;
-            continue;
-        }
-        let portable = archive_portable_path(&name)
-            .with_context(|| format!("unsafe archive path {name:?}"))?;
-        match file_type {
-            b'-' => {
-                state.begin_file()?;
-                let destination = state.register(&portable, NodeKind::File)?;
-                let parent = destination
-                    .parent()
-                    .context("extracted file has no parent")?;
-                fs::create_dir_all(parent)?;
-                let mut output = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&destination)
-                    .with_context(|| {
-                        format!("cannot create extracted file {}", destination.display())
-                    })?;
-                let expected_size = if unsafe { archive_entry_size_is_set(entry) } != 0 {
-                    let size = unsafe { archive_entry_size(entry) };
-                    ensure!(size >= 0, "archive entry has a negative size");
-                    Some(u64::try_from(size)?)
-                } else {
-                    None
-                };
-                let mut entry_bytes = 0_u64;
-                let mut buffer = [0_u8; COPY_BUFFER_SIZE];
-                loop {
-                    let count = archive.read_data(&mut buffer)?;
-                    if count == 0 {
-                        break;
-                    }
-                    entry_bytes = entry_bytes
-                        .checked_add(count as u64)
-                        .context("archive entry size overflow")?;
-                    account_and_write(state, &mut output, &buffer[..count])?;
-                }
-                if let Some(expected_size) = expected_size {
-                    ensure!(
-                        entry_bytes == expected_size,
-                        "archive entry size does not match its declared size"
-                    );
-                }
-                state.files.push(PathBuf::from(portable));
-            }
-            b'd' => {
-                state.add_directory(&portable)?;
-                archive.skip_data()?;
-            }
-            _ => bail!("archive contains an unsupported special entry: {name:?}"),
-        }
-    }
-    Ok(())
-}
-
-fn decode_cp437(bytes: &[u8]) -> String {
-    let mut decoded = String::with_capacity(bytes.len());
-    for &byte in bytes {
-        if byte < 0x80 {
-            decoded.push(char::from(byte));
-        } else {
-            decoded.push(CP437[usize::from(byte - 0x80)]);
-        }
-    }
-    decoded
-}
-
-const CP437: [char; 128] = [
-    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', 'É', 'æ', 'Æ',
-    'ô', 'ö', 'ò', 'û', 'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ', 'á', 'í', 'ó', 'ú', 'ñ', 'Ñ',
-    'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡', '«', '»', '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕',
-    '╣', '║', '╗', '╝', '╜', '╛', '┐', '└', '┴', '┬', '├', '─', '┼', '╞', '╟', '╚', '╔', '╩', '╦',
-    '╠', '═', '╬', '╧', '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█', '▄', '▌', '▐',
-    '▀', 'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩', '≡', '±',
-    '≥', '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', ' ',
-];
-
 fn archive_portable_path(name: &str) -> anyhow::Result<String> {
     ensure!(
         name.len() <= MAX_PATH_BYTES,
@@ -673,23 +328,6 @@ fn archive_portable_path(name: &str) -> anyhow::Result<String> {
         name = rest;
     }
     portable_path(Path::new(name))
-}
-
-fn account_and_write(
-    state: &mut ExtractState<'_>,
-    output: &mut File,
-    bytes: &[u8],
-) -> anyhow::Result<()> {
-    state.bytes = state
-        .bytes
-        .checked_add(bytes.len() as u64)
-        .context("unpacked size overflow")?;
-    ensure!(
-        state.bytes <= state.max_bytes,
-        "archive exceeds the uncompressed-size limit"
-    );
-    output.write_all(bytes)?;
-    Ok(())
 }
 
 fn copy_directory(
@@ -721,7 +359,7 @@ fn copy_directory(
                 "directory import contains a special file"
             );
             let mut source_file = File::open(&source)?;
-            state.write_file(&portable, &mut source_file)?;
+            state.write_file(&portable, &mut source_file, None)?;
         }
     }
     Ok(())
@@ -752,9 +390,12 @@ pub(crate) fn is_reparse_or_symlink(metadata: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{archive_portable_path, portable_path, unpack, unpack_with_limits};
+    use flate2::{Compression, write::GzEncoder};
     use std::fs;
+    use std::io::Write;
     use std::path::Path;
     use tempfile::Builder;
+    use zip::{ZipWriter, write::SimpleFileOptions};
 
     fn workspace_tempdir() -> tempfile::TempDir {
         Builder::new()
@@ -768,11 +409,82 @@ mod tests {
         let temp = workspace_tempdir();
         let path = temp.path().join("legacy.zip");
         fs::write(&path, b"PK\x03\x04\x14\0\0\0\0\0\x24\x9e\x76\x5d\x83\x16\xdc\x8c\x01\0\0\0\x01\0\0\0\x0c\0\0\0caf\x82/mod.inix\
-PK\x01\x02\x14\x03\x14\0\0\0\0\0\x24\x9e\x76\x5d\x83\x16\xdc\x8c\x01\0\0\0\x01\0\0\0\x0c\0\0\0\0\0\0\0\0\0\x80\x01\0\0\0\0caf\x82/mod.ini\
+PK\x01\x02\x14\x03\x14\0\0\0\0\0\x24\x9e\x76\x5d\x83\x16\xdc\x8c\x01\0\0\0\x01\0\0\0\x0c\0\0\0\0\0\0\0\0\0\0\0\x80\x01\0\0\0\0caf\x82/mod.ini\
 PK\x05\x06\0\0\0\0\x01\0\x01\0\x3a\0\0\0\x2b\0\0\0\0\0")?;
         let archive = unpack(&path, temp.path())?;
         assert_eq!(archive.files, [Path::new("café/mod.ini")]);
         assert_eq!(fs::read(archive.root().join("café/mod.ini"))?, b"x");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_zip_duplicates_and_special_files() -> anyhow::Result<()> {
+        let temp = workspace_tempdir();
+        let path = temp.path().join("download");
+        let mut zip = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for name in ["one.ini", "two.ini"] {
+            zip.start_file(name, SimpleFileOptions::default())?;
+            zip.write_all(b"mod")?;
+        }
+        let mut duplicate = zip.finish()?.into_inner();
+        for index in 0..=duplicate.len() - b"two.ini".len() {
+            if duplicate[index..].starts_with(b"two.ini") {
+                duplicate[index..index + 7].copy_from_slice(b"one.ini");
+            }
+        }
+        fs::write(&path, duplicate)?;
+        let error = unpack(&path, temp.path()).err().unwrap();
+        assert!(format!("{error:#}").contains("duplicate entry"));
+
+        let mut zip = ZipWriter::new(fs::File::create(&path)?);
+        zip.add_symlink("link", "target", SimpleFileOptions::default())?;
+        drop(zip.finish()?);
+        let error = unpack(&path, temp.path()).err().unwrap();
+        assert!(format!("{error:#}").contains("unsupported special entry"));
+        Ok(())
+    }
+
+    #[test]
+    fn validates_tar_gzip_checksum_in_an_extensionless_download() -> anyhow::Result<()> {
+        let temp = workspace_tempdir();
+        let path = temp.path().join("download");
+        let mut tar = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(3);
+        tar.append_data(&mut header, "nested/mod.ini", b"mod".as_slice())?;
+        let mut compressed = tar.into_inner()?.finish()?;
+        fs::write(&path, &compressed)?;
+        let tree = unpack(&path, temp.path())?;
+        assert_eq!(fs::read(tree.root().join("nested/mod.ini"))?, b"mod");
+        let crc = compressed.len() - 8;
+        compressed[crc] ^= 1;
+        fs::write(&path, compressed)?;
+        assert!(unpack(&path, temp.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn extracts_both_files_from_a_solid_7z_block() -> anyhow::Result<()> {
+        const SOLID_7Z: &[u8] = b"\
+            \x37\x7a\xbc\xaf\x27\x1c\x00\x04\xb5\x1f\x36\xd3\x5d\x00\x00\x00\
+            \x00\x00\x00\x00\x20\x00\x00\x00\x00\x00\x00\x00\xd0\xc8\xf6\xbb\
+            \x01\x00\x07\x6f\x6e\x65\x0a\x74\x77\x6f\x0a\x00\x00\x00\x81\x33\
+            \x07\xae\x0f\xce\x9c\x06\xc5\x09\x2a\xae\xd3\xaa\x85\x26\x28\x13\
+            \x18\xbb\x03\x25\x67\x1c\x69\x40\x99\x0c\x9d\x35\x80\xf5\x93\xa1\
+            \x73\xc6\x5d\x34\x1e\xaf\x70\xc5\xc2\x1c\x28\x0f\xea\x65\x48\x14\
+            \xea\x82\xa6\xb3\x97\xf7\xc0\xde\x5d\xdc\xac\x79\xfe\x03\x1a\x59\
+            \x28\x1f\xd8\x9e\x41\x07\x69\x75\xd7\x09\x45\x92\x00\x17\x06\x0c\
+            \x01\x09\x51\x00\x07\x0b\x01\x00\x01\x23\x03\x01\x01\x05\x5d\x00\
+            \x10\x00\x00\x0c\x5e\x0a\x01\xe9\x69\x06\xda\x00\x00";
+        let temp = workspace_tempdir();
+        let path = temp.path().join("download");
+        fs::write(&path, SOLID_7Z)?;
+        assert!(unpack_with_limits(&path, temp.path(), 2, 2, 7).is_err());
+        let tree = unpack_with_limits(&path, temp.path(), 2, 2, 8)?;
+        assert_eq!(tree.files, [Path::new("one.ini"), Path::new("two.ini")]);
+        assert_eq!(fs::read(tree.root().join("one.ini"))?, b"one\n");
+        assert_eq!(fs::read(tree.root().join("two.ini"))?, b"two\n");
         Ok(())
     }
 
@@ -806,7 +518,10 @@ PK\x05\x06\0\0\0\0\x01\0\x01\0\x3a\0\0\0\x2b\0\0\0\0\0")?;
             archive.files,
             [Path::new("hello.txt"), Path::new("tiny.txt")]
         );
-        assert_eq!(fs::read(archive.root().join("hello.txt"))?, b"Hello, RAR 5.0 fixture world.\n");
+        assert_eq!(
+            fs::read(archive.root().join("hello.txt"))?,
+            b"Hello, RAR 5.0 fixture world.\n"
+        );
         assert_eq!(fs::read(archive.root().join("tiny.txt"))?, b"AAAAAAAA\n");
         drop(archive);
 

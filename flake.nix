@@ -25,7 +25,6 @@
       {
         devShells.default = pkgs.mkShell {
           buildInputs = [
-            pkgs.libarchive
             pkgs.libxkbcommon
             pkgs.libxcb
             pkgs.wayland
@@ -47,7 +46,6 @@
             pkgs.vulkan-loader
           ];
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
-            pkgs.libarchive
             pkgs.alsa-lib
             pkgs.fontconfig
             pkgs.freetype
