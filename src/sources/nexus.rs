@@ -22,12 +22,18 @@ fn api_url(path: &str) -> Result<Url> {
         .context("building Nexus API URL")
 }
 
+fn application_headers(request: RequestBuilder) -> RequestBuilder {
+    request
+        .header("Application-Name", "DMM")
+        .header("Application-Version", env!("CARGO_PKG_VERSION"))
+}
+
 fn graphql(client: &Client, query: &str, variables: Value) -> Result<Value> {
     graphql_request(client.post(GRAPHQL), query, variables)
 }
 
 fn graphql_request(request: RequestBuilder, query: &str, variables: Value) -> Result<Value> {
-    let response = request
+    let response = application_headers(request)
         .json(&json!({"query": query, "variables": variables}))
         .send()
         .map_err(|_| anyhow!("requesting Nexus GraphQL API failed"))?;
@@ -365,8 +371,7 @@ fn v1_files(client: &Client, key: &str, id: &RemoteMod) -> Result<Option<Vec<Mod
         path_segment(&id.game)?,
         id.id
     );
-    let response = client
-        .get(api_url(&path)?)
+    let response = application_headers(client.get(api_url(&path)?))
         .header("apikey", key)
         .send()
         .map_err(|_| anyhow!("requesting Nexus file metadata failed"))?;
@@ -403,8 +408,7 @@ pub(super) fn download(
         file.id
     );
     let url = api_url(&path)?;
-    let response = client
-        .get(url)
+    let response = application_headers(client.get(url))
         .header("apikey", key)
         .send()
         .map_err(|_| anyhow!("requesting Nexus download link failed"))?;
@@ -454,7 +458,7 @@ pub(super) fn redeem(
             }
         }
     }
-    let mut request = client.get(url);
+    let mut request = application_headers(client.get(url));
     if let Some(key) = key {
         request = request.header("apikey", key);
     }

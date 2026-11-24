@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -59,7 +60,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           ./target/release/dmm --help
-          tar -czf dmm-linux-x64.tar.gz -C packaging licenses -C ../target/release dmm
+          tar -czf dmm-linux-x64.tar.gz -C packaging licenses -C .. LICENSE.md -C target/release dmm
           bash packaging/appimage/build.sh target/release/dmm dmm-linux-x64.AppImage
           APPIMAGE_EXTRACT_AND_RUN=1 ./dmm-linux-x64.AppImage --help
 
@@ -70,6 +71,7 @@ jobs:
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item target/release/dmm.exe -Destination dist
           Copy-Item packaging/licenses -Destination dist -Recurse
+          Copy-Item LICENSE.md -Destination dist
           & .\dist\dmm.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Compress-Archive -Path dist/* -DestinationPath dmm-windows-x64.zip
@@ -90,3 +92,30 @@ jobs:
           if-no-files-found: error
           archive: false
           overwrite: true
+
+  release:
+    name: Create draft release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dmm-*
+          path: dist
+          merge-multiple: true
+          skip-decompress: true
+
+      - name: Attach builds and checksums to draft
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          assets=(dmm-linux-x64.AppImage dmm-linux-x64.tar.gz dmm-windows-x64.zip)
+          sha256sum "${assets[@]}" > SHA256SUMS
+          gh release create "$RELEASE_TAG" "${assets[@]}" SHA256SUMS \
+            --draft --verify-tag --title "$RELEASE_TAG" --notes ""

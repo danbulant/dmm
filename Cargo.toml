@@ -1,6 +1,7 @@
 [package]
 name = "dmm"
 version = "0.1.0"
+repository = "https://github.com/danbulant/dmm"
 edition = "2024"
 
 [features]

@@ -122,6 +122,26 @@ fn game_and_sort_menus_overlay_without_moving_the_shell() {
 }
 
 #[test]
+fn about_dialog_keeps_the_license_scrollable_and_github_link_visible() {
+    let mut runtime = Runtime::new(
+        State::new(PathBuf::from("unused")),
+        view,
+        (880.0, 620.0),
+        Env::new(true, 1.0),
+    );
+    runtime.frame(0.0);
+    let (x, y) = runtime.find("about-open").expect("About button is visible");
+    runtime.pointer_down(x, y);
+    runtime.pointer_up(x, y);
+    for _ in 0..30 {
+        runtime.frame(1.0 / 60.0);
+    }
+    assert_eq!(runtime.scroll_at_bottom("about-license"), Some(false));
+    let (_, y) = runtime.find("about-github").expect("GitHub button is visible");
+    assert!((0.0..620.0).contains(&y), "GitHub button is outside the window");
+}
+
+#[test]
 fn an_in_flight_search_cannot_replace_newer_filter_results() {
     let mut state = State::new(PathBuf::from("unused"));
     let (jobs, requests) = mpsc::channel();

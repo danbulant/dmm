@@ -2,7 +2,7 @@ use dmm::games::{GameKind, SUPPORTED};
 use rune::tok::{self, Theme, type_};
 use rune::{Cx, El, ScrollSpec, SurfaceFit, col, el, row, text};
 use rune_kit::shell::{Sidebar, SidebarRow, SplitView, Toolbar};
-use rune_kit::{Kit, Menu, MenuItem};
+use rune_kit::{Dialog, Kit, Menu, MenuItem};
 
 use super::browse::DetailTarget;
 use super::components::{self, button, heading, muted};
@@ -91,9 +91,53 @@ pub(super) fn view(s: &State, cx: &mut Cx<State>) -> El {
     workbench::overlays(s, t, &k, &mut layer);
     browse::details::install_overlay(s, t, &k, &mut layer);
     download_queue::overlay(s, t, &k, &mut layer);
+    if s.about_open {
+        about_dialog(s, t, &k, &mut layer);
+    }
     rune_kit::root(shell, layer).on_layout(|s: &mut State, [_, _, width, height]| {
         s.window_size = [width, height];
     })
+}
+
+fn about_dialog(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) {
+    Dialog::new("about", "About DMM")
+        .open(true)
+        .fit()
+        .width(680.0)
+        .on_close(|s: &mut State| s.about_open = false)
+        .child(
+            col()
+                .mx(16.0)
+                .mb(16.0)
+                .gap(12.0)
+                .child(muted(
+                    concat!("DMM ", env!("CARGO_PKG_VERSION"), " · GNU GPL v3"),
+                    t,
+                ))
+                .child(
+                    col()
+                        .key("about-license")
+                        .max_h((s.window_size[1] - 280.0).clamp(140.0, 400.0))
+                        .scroll(ScrollSpec {
+                            stick_bottom: false,
+                        })
+                        .child(
+                            text(include_str!("../../LICENSE.md"))
+                                .font(type_::BODY)
+                                .color(t.text)
+                                .wrap(),
+                        ),
+                )
+                .child(button(
+                    "about-github",
+                    "Open GitHub repository",
+                    t,
+                    false,
+                    true,
+                    |s, tx| components::open_page(s, tx, env!("CARGO_PKG_REPOSITORY")),
+                )),
+        )
+        .build(k, layer);
 }
 
 fn sidebar(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
@@ -154,6 +198,9 @@ fn sidebar(s: &State, t: Theme, k: &Kit, layer: &mut Vec<El>) -> El {
                 .gap(4.0)
                 .child(download_queue::sidebar(s, t, k))
                 .child(launch)
+                .child(button("about-open", "About", t, false, true, |s, _| {
+                    s.about_open = true;
+                }))
                 .child(status(s, t)),
         )
         .build(k)
